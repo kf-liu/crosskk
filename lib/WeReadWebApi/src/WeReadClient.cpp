@@ -1,5 +1,7 @@
 #include "WeReadClient.h"
 
+#include "WeReadComment.h"
+
 #ifdef ENABLE_CHINESE_VERSION
 
 #include <Arduino.h>
@@ -4521,6 +4523,199 @@ WeReadHighlight::RefreshResult deleteMineFromBookmarkList(const char* bookId, co
     return WeReadHighlight::RefreshResult::Failed;
   }
   return WeReadHighlight::RefreshResult::Updated;
+}
+
+namespace {
+
+bool commentIdSafe(const char* bookId) {
+  if (!WeReadComment::isStandardBook(bookId)) return false;
+  for (const char* cursor = bookId; *cursor; ++cursor) {
+    const unsigned char ch = static_cast<unsigned char>(*cursor);
+    if (ch <= 0x20 || ch >= 0x7F || ch == '"' || ch == '\\' || ch == '<' || ch == '>') return false;
+  }
+  return true;
+}
+
+bool rangeJsonSafe(const char* range) {
+  if (!range || !range[0]) return false;
+  int hyphens = 0;
+  for (const char* cursor = range; *cursor; ++cursor) {
+    if (*cursor == '-') {
+      ++hyphens;
+    } else if (*cursor < '0' || *cursor > '9') {
+      return false;
+    }
+  }
+  return hyphens == 1;
+}
+
+struct CommentHttpCtx {
+  int status = 0;
+  bool (*feed)(void* ctx, const uint8_t* data, size_t len) = nullptr;
+  bool (*finish)(void* ctx) = nullptr;
+  void* ctx = nullptr;
+};
+
+bool commentReset(void*) { return true; }
+
+bool commentFeed(void* raw, const uint8_t* data, const size_t len) {
+  auto* ctx = static_cast<CommentHttpCtx*>(raw);
+  return ctx && ctx->feed && ctx->feed(ctx->ctx, data, len);
+}
+
+bool commentFinish(void* raw) {
+  auto* ctx = static_cast<CommentHttpCtx*>(raw);
+  return ctx && ctx->status == 200 && ctx->finish && ctx->finish(ctx->ctx);
+}
+
+bool underlineFeed(void* raw, const uint8_t* data, const size_t len) {
+  return static_cast<WeReadComment::UnderlineParser*>(raw)->feed(data, len);
+}
+
+bool underlineFinish(void* raw) { return static_cast<WeReadComment::UnderlineParser*>(raw)->finish(); }
+
+struct ReviewHttp {
+  WeReadComment::ReviewPageParser* parser = nullptr;
+  WeReadComment::Cursor* cursor = nullptr;
+};
+
+bool reviewFeed(void* raw, const uint8_t* data, const size_t len) {
+  return static_cast<ReviewHttp*>(raw)->parser->feed(data, len);
+}
+
+bool reviewFinish(void* raw) {
+  auto* http = static_cast<ReviewHttp*>(raw);
+  return http->parser->finish(*http->cursor);
+}
+
+}  // namespace
+
+bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, WeReadComment::Range* ranges,
+                            const size_t capacity, size_t& count) {
+  count = 0;
+  if (!commentIdSafe(bookId) || !ranges || capacity == 0) return false;
+  if (!WeReadHttpClient::networkReady()) return false;
+  WeReadStore::Session session;
+  if (!WeReadStore::loadSession(session) || !session.valid()) return false;
+
+  auto parser = makeUniqueNoThrow<WeReadComment::UnderlineParser>();
+  if (!parser) return false;
+
+  constexpr size_t kCookieSize = 896;
+  constexpr size_t kUrlSize = 512;
+  constexpr size_t kReadSize = 1024;
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(kCookieSize + kUrlSize + kReadSize);
+  if (!buffer) {
+    LOG_ERR("WR", "内存不足：评论候选请求缓冲 %u 字节", static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize));
+    return false;
+  }
+  char* cookie = reinterpret_cast<char*>(buffer.get());
+  char* url = cookie + kCookieSize;
+  uint8_t* readBuffer = buffer.get() + kCookieSize + kUrlSize;
+
+  char encodedBookId[192];
+  if (!WeReadProtocol::urlEncode(bookId, encodedBookId, sizeof(encodedBookId))) return false;
+  char path[320];
+  const int pathLength = snprintf(path, sizeof(path), "/web/book/underlines?bookId=%s&chapterUid=%u", encodedBookId,
+                                  chapterUid);
+  if (pathLength <= 0 || static_cast<size_t>(pathLength) >= sizeof(path)) return false;
+  char referer[160];
+  if (!readerReferer(bookId, referer, sizeof(referer))) return false;
+
+  Error error = Error::Protocol;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!parser->begin(ranges, capacity)) return false;
+    CommentHttpCtx http;
+    http.feed = underlineFeed;
+    http.finish = underlineFinish;
+    http.ctx = parser.get();
+    ResponseSink sink{&http, commentReset, commentFeed, commentFinish, Error::Protocol};
+    error = requestOnce("GET", path, nullptr, 0, &session, referer, sink, http.status, cookie, kCookieSize, url,
+                        kUrlSize, readBuffer, kReadSize, nullptr);
+    if (error == Error::Ok) break;
+    if (attempt == 0 && parser->errorCode() == -2012 &&
+        renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
+      LOG_INF("WR", "评论候选请求已续期会话");
+      continue;
+    }
+    LOG_ERR("WR", "评论候选请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),
+            parser->errorCode());
+    return false;
+  }
+  if (error != Error::Ok) return false;
+  count = parser->count();
+  if (parser->truncated()) {
+    LOG_ERR("WR", "本章评论候选超过 %u 条，只保留前面的", static_cast<unsigned>(capacity));
+  }
+  if (!WeReadStore::saveSession(session)) LOG_ERR("WR", "评论候选已解析，但会话没有写回");
+  return true;
+}
+
+bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const char* rangeText,
+                            const uint32_t maxIdx, const uint64_t syncKey, WeReadComment::RangeFile& file,
+                            WeReadComment::Cursor& cursor) {
+  cursor = {};
+  if (!commentIdSafe(bookId) || !rangeJsonSafe(rangeText) || !file.active()) return false;
+  if (!WeReadHttpClient::networkReady()) return false;
+  WeReadStore::Session session;
+  if (!WeReadStore::loadSession(session) || !session.valid()) return false;
+
+  auto parser = makeUniqueNoThrow<WeReadComment::ReviewPageParser>();
+  if (!parser) return false;
+
+  constexpr size_t kCookieSize = 896;
+  constexpr size_t kUrlSize = 512;
+  constexpr size_t kReadSize = 1024;
+  constexpr size_t kBodySize = 384;
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(kCookieSize + kUrlSize + kReadSize + kBodySize);
+  if (!buffer) {
+    LOG_ERR("WR", "内存不足：评论翻页请求缓冲 %u 字节",
+            static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize + kBodySize));
+    return false;
+  }
+  char* cookie = reinterpret_cast<char*>(buffer.get());
+  char* url = cookie + kCookieSize;
+  uint8_t* readBuffer = buffer.get() + kCookieSize + kUrlSize;
+  char* body = reinterpret_cast<char*>(readBuffer + kReadSize);
+  const int bodyLength =
+      snprintf(body, kBodySize,
+               "{\"bookId\":\"%s\",\"chapterUid\":%u,\"reviews\":[{\"range\":\"%s\",\"maxIdx\":%u,\"count\":%u,"
+               "\"synckey\":%llu}]}",
+               bookId, chapterUid, rangeText, maxIdx, WeReadComment::kReviewPageSize,
+               static_cast<unsigned long long>(syncKey));
+  if (bodyLength <= 0 || static_cast<size_t>(bodyLength) >= kBodySize) return false;
+
+  char referer[160];
+  if (!readerReferer(bookId, referer, sizeof(referer))) return false;
+
+  Error error = Error::Protocol;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!parser->begin(&file, rangeText)) return false;
+    cursor = {};
+    ReviewHttp review;
+    review.parser = parser.get();
+    review.cursor = &cursor;
+    CommentHttpCtx http;
+    http.feed = reviewFeed;
+    http.finish = reviewFinish;
+    http.ctx = &review;
+    ResponseSink sink{&http, commentReset, commentFeed, commentFinish, Error::Protocol};
+    error = requestOnce("POST", "/web/book/readreviews", reinterpret_cast<const uint8_t*>(body),
+                        static_cast<size_t>(bodyLength), &session, referer, sink, http.status, cookie, kCookieSize, url,
+                        kUrlSize, readBuffer, kReadSize, nullptr);
+    if (error == Error::Ok) break;
+    if (attempt == 0 && cursor.errorCode == -2012 &&
+        renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
+      LOG_INF("WR", "评论翻页请求已续期会话");
+      continue;
+    }
+    LOG_ERR("WR", "评论翻页请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),
+            cursor.errorCode);
+    return false;
+  }
+  if (error != Error::Ok) return false;
+  if (!WeReadStore::saveSession(session)) LOG_ERR("WR", "评论页已解析，但会话没有写回");
+  return true;
 }
 
 }  // namespace WeReadClient

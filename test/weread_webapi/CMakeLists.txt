@@ -79,3 +79,40 @@ target_link_libraries(WeReadStoreTest PRIVATE
 )
 
 gtest_discover_tests(WeReadStoreTest PROPERTIES RUN_SERIAL TRUE)
+
+add_executable(WeReadCommentTest
+  WeReadCommentTest.cpp
+  ${REPO_ROOT}/freeink-sdk/libs/network/JsonSax/src/StreamingJsonParser.cpp
+  ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadComment.cpp
+  ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadHighlight.cpp
+  ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadProtocol.cpp
+  ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadStore.cpp
+  ${REPO_ROOT}/src/util/StringUtils.cpp
+  ${REPO_ROOT}/lib/Utf8/Utf8.cpp
+  ${crosspoint_simulator_SOURCE_DIR}/src/HalStorage.cpp
+)
+
+target_include_directories(WeReadCommentTest BEFORE PRIVATE
+  ${crosspoint_simulator_SOURCE_DIR}/src
+  ${REPO_ROOT}/src
+  ${REPO_ROOT}/lib/WeReadWebApi/src
+  ${REPO_ROOT}/lib/Epub
+  ${REPO_ROOT}/lib/JsonParser
+  ${REPO_ROOT}/freeink-sdk/libs/network/JsonSax/include
+  ${REPO_ROOT}/lib/Logging
+  ${REPO_ROOT}/lib/Memory
+  ${REPO_ROOT}/lib/Serialization
+  ${REPO_ROOT}/lib/Utf8
+)
+
+target_compile_definitions(WeReadCommentTest PRIVATE
+  CROSSPOINT_EMULATED=1
+  DESTRUCTOR_CLOSES_FILE=1
+)
+
+target_link_libraries(WeReadCommentTest PRIVATE
+  crosspoint_test_common
+  GTest::gtest_main
+)
+
+gtest_discover_tests(WeReadCommentTest PROPERTIES RUN_SERIAL TRUE)

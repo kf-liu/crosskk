@@ -714,6 +714,50 @@ no marker and remain compatible through the approximate fallback.
 Manual progress sync refreshes only an old or invalid TOC; an existing
 `/WeRead/*.epub` is retained.
 
+## 微信读书他人评论缓存（WRN1）
+
+标准微信读书书籍里，别人写过评论的片段单独缓存在
+`/.crosspoint/weread/comments/<bookId>/<chapterUid>/<start>_<end>.wrn`。
+这里的 `<bookId>` 经过文件名清理，最长 56 字节。`<start>` 和 `<end>` 是微信读书
+可见字符偏移，和划线使用同一套坐标。`bookId` 以 `MP_WXS_` 开头的公众号，以及普通
+EPUB，不写这个目录。
+
+本段不改浏览缓存 `WRC1`，也不改 `WRB1` 的 312 字节记录，更不改划线索引
+`/.crosspoint/weread/highlights/<bookId>/marks.bin`。清缓存时，`comments/` 作为
+`/.crosspoint/weread/` 下的普通目录被递归删除；`session.bin` 和
+`disclaimer.accepted` 仍保留。
+
+文件头 40 字节，小端：
+
+| 偏移 | 字段 |
+|------|------|
+| 0 | `uint32 magic`（`0x314E5257`，字节 `WRN1`） |
+| 4 | `uint16 version`（`1`） |
+| 6 | `uint16 headerSize`（`40`） |
+| 8 | `uint32 chapterUid` |
+| 12 | `uint32 rangeStart` |
+| 16 | `uint32 rangeEnd` |
+| 20 | `uint32 commentCount` |
+| 24 | `uint32 maxIdx` |
+| 28 | `uint32 flags` |
+| 32 | `uint64 syncKey` |
+
+`flags` 第 0 位表示服务端还有下一页；第 1 位表示本地已经存满 200 条，后面的评论没有写入。
+空结果不落盘。写入先写同名 `.part`，完成后再原子替换；失败时删除 `.part`，已有 `.wrn` 保持不动。
+
+每条评论紧跟在文件头或上一条之后：
+
+| 偏移 | 字段 |
+|------|------|
+| 0 | `uint16 authorLen`（不超过 47） |
+| 2 | `uint16 textLen`（不超过 2048） |
+| 4 | `uint8 flags`（第 0 位表示正文在 2048 字节处被截断） |
+| 5 | `uint8 reserved[3]` |
+| 8 | 作者字节，接着是正文 UTF-8 字节，都不补 `NUL` |
+
+阅读器按 `maxIdx` / `syncKey` 翻页，每页 20 条，直到没有下一页或达到 200 条。
+只在 Wi-Fi 已经连通时请求；失败或空结果都不覆盖已有文件。
+
 ## Reading background cache
 
 `/.crosspoint/background/reading_bg.bin` stores a versioned 1-bit framebuffer

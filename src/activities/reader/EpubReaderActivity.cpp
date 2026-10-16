@@ -1,4 +1,5 @@
 #include "EpubReaderActivity.h"
+#include "WeReadCommentOverlay.h"
 #include "WeReadHighlightOverlay.h"
 
 #include <Epub/Page.h>
@@ -311,6 +312,9 @@ EpubReaderActivity::~EpubReaderActivity() {
 }
 
 void EpubReaderActivity::onExit() {
+#ifdef ENABLE_CHINESE_VERSION
+  WeReadCommentOverlay::reset();
+#endif
   if (footnoteDepth > 0 && epub) {
     const SavedPosition& origin = savedPositions[0];
     saveProgress(origin.spineIndex, origin.pageNumber, 0);
@@ -719,7 +723,13 @@ bool EpubReaderActivity::handleWeReadHighlightTap() {
   int y = 0;
   if (!mappedInput.wasScreenTapped(x, y)) return false;
   char bookmarkId[32] = {};
-  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId))) return false;
+  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId))) {
+    if (WeReadCommentOverlay::openAt(x, y)) {
+      requestUpdate();
+      return true;
+    }
+    return false;
+  }
   strncpy(highlightBookmarkId_, bookmarkId, sizeof(highlightBookmarkId_) - 1);
   highlightBookmarkId_[sizeof(highlightBookmarkId_) - 1] = '\0';
   const char* removeLabel = tr(STR_WEREAD_HIGHLIGHT_REMOVE);
@@ -1120,6 +1130,18 @@ void EpubReaderActivity::loop() {
 #ifdef ENABLE_CHINESE_VERSION
   if (maybeOfferCompleteChineseFont()) return;
   refreshWeReadHighlightsIfNeeded();
+  if (wereadBookId_[0] && epub && section && section->currentPage >= 0) {
+    const int page = section->currentPage;
+    uint32_t pageStart = 0;
+    if (const auto start = section->getVisibleTextOffsetForPage(static_cast<uint16_t>(page))) pageStart = *start;
+    uint32_t pageEnd = UINT32_MAX;
+    if (page + 1 < static_cast<int>(section->pageCount)) {
+      if (const auto next = section->getVisibleTextOffsetForPage(static_cast<uint16_t>(page + 1))) pageEnd = *next;
+    }
+    if (WeReadCommentOverlay::syncPage(wereadBookId_, *epub, currentSpineIndex, page, pageStart, pageEnd)) {
+      requestUpdate();
+    }
+  }
 #endif
 
   READING_STATS.tickActiveSession();
@@ -1164,7 +1186,11 @@ void EpubReaderActivity::loop() {
   if (!updateChapterBuild()) return;
 
 #ifdef ENABLE_CHINESE_VERSION
-  // 评论面板打开时，这一帧的按键和触摸都归面板，不翻页。
+  if (WeReadCommentOverlay::panelOpen()) {
+    if (WeReadCommentOverlay::handlePanel(mappedInput, renderer)) requestUpdate();
+    return;
+  }
+  // 划线操作面板打开时，这一帧的按键和触摸都归面板，不翻页。
   if (handleWeReadHighlightSheet()) return;
   if (handleWeReadHighlightSelect()) return;
 #endif
@@ -2457,7 +2483,9 @@ void EpubReaderActivity::renderBook() {
   }
 
 #ifdef ENABLE_CHINESE_VERSION
-  if (highlightSheetOpen_ && overlayPopup.isActive()) {
+  if (WeReadCommentOverlay::panelOpen()) {
+    WeReadCommentOverlay::drawPanel(renderer);
+  } else if (highlightSheetOpen_ && overlayPopup.isActive()) {
     overlayPopup.processRender(renderer, mappedInput);
   } else if (highlightSelectPhase_ == HighlightSelectPhase::AwaitStart ||
              highlightSelectPhase_ == HighlightSelectPhase::AwaitEnd) {
@@ -2848,6 +2876,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
         WeReadHighlightOverlay::drawSelection(renderer, fontId, *page, orientedMarginLeft, orientedMarginTop,
                                               wereadBookId_, *epub, currentSpineIndex, selectionStart, selectionEnd);
       }
+      WeReadCommentOverlay::drawForBook(renderer, fontId, *page, orientedMarginLeft, orientedMarginTop, wereadBookId_,
+                                        *epub, currentSpineIndex);
     }
 #endif
   };

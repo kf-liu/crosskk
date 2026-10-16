@@ -10,6 +10,12 @@
 #include "WeReadProtocol.h"
 #include "WeReadStore.h"
 
+namespace WeReadComment {
+struct Range;
+struct Cursor;
+class RangeFile;
+}  // namespace WeReadComment
+
 namespace WeReadClient {
 
 struct OperationTestPeer;
@@ -504,5 +510,11 @@ class Operation {
   std::string finalPartPath_;
 };
 static_assert(sizeof(Operation) <= 8 * 1024, "WeRead operation exceeds its fixed heap budget");
+
+// 别人写过评论的片段。只在已经连上的 Wi-Fi 上请求，不打开网络。
+bool fetchCommentUnderlines(const char* bookId, uint32_t chapterUid, WeReadComment::Range* ranges, size_t capacity,
+                            size_t& count);
+bool fetchCommentReviewPage(const char* bookId, uint32_t chapterUid, const char* rangeText, uint32_t maxIdx,
+                            uint64_t syncKey, WeReadComment::RangeFile& file, WeReadComment::Cursor& cursor);
 
 }  // namespace WeReadClient

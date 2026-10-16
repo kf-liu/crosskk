@@ -1,0 +1,831 @@
+#include "WeReadComment.h"
+
+#include <Logging.h>
+#include <Memory.h>
+#include <StreamingJsonParser.h>
+
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <string>
+
+#include "../../../src/util/StringUtils.h"
+#include "WeReadHighlight.h"
+#include "WeReadProtocol.h"
+#include "WeReadStore.h"
+
+namespace WeReadComment {
+namespace {
+
+constexpr char kRoot[] = "/.crosspoint/weread/comments";
+constexpr uint8_t kTextTruncated = 1U << 0;
+
+bool parseUnsigned(const char* text, const char* end, uint32_t& value, const char** next) {
+  if (!text || text == end || *text < '0' || *text > '9') return false;
+  uint32_t parsed = 0;
+  const char* cursor = text;
+  while (cursor != end && *cursor >= '0' && *cursor <= '9') {
+    const uint32_t digit = static_cast<uint32_t>(*cursor - '0');
+    if (parsed > (UINT32_MAX - digit) / 10) return false;
+    parsed = parsed * 10 + digit;
+    ++cursor;
+  }
+  if (cursor == text) return false;
+  value = parsed;
+  if (next) *next = cursor;
+  return true;
+}
+
+uint32_t parseUint32(const char* value, const size_t len) {
+  uint32_t parsed = 0;
+  const char* next = nullptr;
+  if (!parseUnsigned(value, value + len, parsed, &next) || next != value + len) return 0;
+  return parsed;
+}
+
+uint64_t parseUint64(const char* value, const size_t len) {
+  if (!value || len == 0) return 0;
+  uint64_t result = 0;
+  for (size_t i = 0; i < len; ++i) {
+    if (value[i] < '0' || value[i] > '9') return 0;
+    const uint64_t digit = static_cast<uint64_t>(value[i] - '0');
+    if (result > (UINT64_MAX - digit) / 10) return 0;
+    result = result * 10 + digit;
+  }
+  return result;
+}
+
+bool blank(const char* text, const size_t len) {
+  if (!text || len == 0) return true;
+  for (size_t i = 0; i < len; ++i) {
+    const unsigned char ch = static_cast<unsigned char>(text[i]);
+    if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') return false;
+  }
+  return true;
+}
+
+const char* baseName(const char* name) {
+  const char* base = name ? name : "";
+  for (const char* cursor = base; *cursor; ++cursor) {
+    if (*cursor == '/') base = cursor + 1;
+  }
+  return base;
+}
+
+bool parseRangeFileName(const char* name, uint32_t& start, uint32_t& end) {
+  const char* file = baseName(name);
+  const char* dot = strrchr(file, '.');
+  if (!dot || strcmp(dot, ".wrn") != 0) return false;
+  const char* sep = strchr(file, '_');
+  if (!sep || sep > dot) return false;
+  const char* tail = nullptr;
+  return parseUnsigned(file, sep, start, &tail) && tail == sep && parseUnsigned(sep + 1, dot, end, &tail) &&
+         tail == dot && end > start;
+}
+
+bool chapterDirectory(const char* bookId, const uint32_t chapterUid, std::string& directory, const bool create) {
+  if (!isStandardBook(bookId)) return false;
+  const std::string book = StringUtils::sanitizeFilename(bookId, 56);
+  if (book.empty()) return false;
+  char chapter[16];
+  const int length = snprintf(chapter, sizeof(chapter), "%u", chapterUid);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(chapter)) return false;
+  directory = std::string(kRoot) + "/" + book + "/" + chapter;
+  if (!create) return true;
+  const std::string bookDir = std::string(kRoot) + "/" + book;
+  return Storage.ensureDirectoryExists(kRoot) && Storage.ensureDirectoryExists(bookDir.c_str()) &&
+         Storage.ensureDirectoryExists(directory.c_str());
+}
+
+bool copyBlob(HalFile& input, HalFile& output, size_t bytes) {
+  uint8_t buffer[128];
+  while (bytes > 0) {
+    const size_t chunk = bytes < sizeof(buffer) ? bytes : sizeof(buffer);
+    if (input.read(buffer, chunk) != static_cast<int>(chunk) || output.write(buffer, chunk) != chunk) return false;
+    bytes -= chunk;
+  }
+  return true;
+}
+
+enum class Frame : uint8_t { Root, Reviews, Group, PageReviews, Item, Review, Author, Skip };
+enum class Expect : uint8_t {
+  None,
+  Error,
+  Range,
+  Reviews,
+  HasMore,
+  MaxIdx,
+  SyncKey,
+  PageReviews,
+  Review,
+  Content,
+  Author,
+  AuthorName
+};
+
+}  // namespace
+
+bool isStandardBook(const char* bookId) { return bookId && bookId[0] && strncmp(bookId, "MP_WXS_", 7) != 0; }
+
+std::string rangePath(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end) {
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, false) || end <= start) return "";
+  char file[40];
+  const int length = snprintf(file, sizeof(file), "%u_%u.wrn", start, end);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(file)) return "";
+  return directory + "/" + file;
+}
+
+bool RangeFile::begin(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
+                      const bool copyExisting) {
+  abort();
+  if (end <= start) return false;
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, true)) return false;
+  char file[40];
+  const int length = snprintf(file, sizeof(file), "%u_%u.wrn", start, end);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(file)) return false;
+  finalPath_ = directory + "/" + file;
+  partPath_ = finalPath_ + ".part";
+  if (Storage.exists(partPath_.c_str())) Storage.remove(partPath_.c_str());
+  if (!Storage.openFileForWrite("WR", partPath_, file_)) return false;
+
+  Header header;
+  header.chapterUid = chapterUid;
+  header.rangeStart = start;
+  header.rangeEnd = end;
+  if (file_.write(&header, sizeof(header)) != sizeof(header)) {
+    abort();
+    return false;
+  }
+
+  chapterUid_ = chapterUid;
+  start_ = start;
+  end_ = end;
+  count_ = 0;
+  capped_ = false;
+  active_ = true;
+
+  if (!copyExisting || !Storage.exists(finalPath_.c_str())) return true;
+  HalFile existing;
+  Header previous;
+  if (!Storage.openFileForRead("WR", finalPath_, existing) ||
+      existing.read(&previous, sizeof(previous)) != static_cast<int>(sizeof(previous)) || previous.magic != kMagic ||
+      previous.version != kVersion || previous.headerSize != kHeaderSize || previous.chapterUid != chapterUid ||
+      previous.rangeStart != start || previous.rangeEnd != end || previous.commentCount > kMaxStoredComments) {
+    return true;
+  }
+  for (uint32_t i = 0; i < previous.commentCount; ++i) {
+    CommentHead head;
+    if (existing.read(&head, sizeof(head)) != static_cast<int>(sizeof(head)) || head.authorLen > kMaxAuthorBytes ||
+        head.textLen > kMaxCommentBytes ||
+        file_.write(&head, sizeof(head)) != sizeof(head) || !copyBlob(existing, file_, head.authorLen + head.textLen)) {
+      abort();
+      return false;
+    }
+    ++count_;
+  }
+  return true;
+}
+
+bool RangeFile::add(const char* author, const char* text, const size_t textLen, const bool truncated) {
+  if (!active_ || !text || textLen == 0 || textLen > kMaxCommentBytes) return false;
+  if (count_ >= kMaxStoredComments) {
+    capped_ = true;
+    return true;
+  }
+  const size_t authorLen = author ? strnlen(author, kMaxAuthorBytes) : 0;
+  CommentHead head;
+  head.authorLen = static_cast<uint16_t>(authorLen);
+  head.textLen = static_cast<uint16_t>(textLen);
+  head.flags = truncated ? kTextTruncated : 0;
+  if (file_.write(&head, sizeof(head)) != sizeof(head)) return false;
+  if (authorLen > 0 && file_.write(author, authorLen) != authorLen) return false;
+  if (file_.write(text, textLen) != textLen) return false;
+  ++count_;
+  return true;
+}
+
+bool RangeFile::finish(const uint32_t maxIdx, const uint64_t syncKey, const bool hasMore) {
+  if (!active_ || count_ == 0) {
+    abort();
+    return false;
+  }
+  Header header;
+  header.chapterUid = chapterUid_;
+  header.rangeStart = start_;
+  header.rangeEnd = end_;
+  header.commentCount = count_;
+  header.maxIdx = maxIdx;
+  header.syncKey = syncKey;
+  if (hasMore) header.flags |= kFlagHasMore;
+  if (capped_) header.flags |= kFlagCapped;
+  if (!file_.seek(0) || file_.write(&header, sizeof(header)) != sizeof(header)) {
+    abort();
+    return false;
+  }
+  file_.flush();
+  file_.close();
+  active_ = false;
+  if (!WeReadStore::atomicReplace(partPath_, finalPath_)) {
+    Storage.remove(partPath_.c_str());
+    return false;
+  }
+  return true;
+}
+
+RangeFile::~RangeFile() { abort(); }
+
+void RangeFile::abort() {
+  if (file_.isOpen()) file_.close();
+  active_ = false;
+  count_ = 0;
+  capped_ = false;
+  if (!partPath_.empty() && Storage.exists(partPath_.c_str())) Storage.remove(partPath_.c_str());
+  partPath_.clear();
+}
+
+bool loadChapter(const char* bookId, const uint32_t chapterUid, Range* ranges, const size_t capacity, size_t& count,
+                 bool& truncated) {
+  count = 0;
+  truncated = false;
+  if (!ranges || capacity == 0 || !isStandardBook(bookId)) return false;
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, false)) return false;
+  if (!Storage.exists(directory.c_str())) return true;
+
+  HalFile folder = Storage.open(directory.c_str());
+  if (!folder || !folder.isDirectory()) return true;
+  while (true) {
+    HalFile entry = folder.openNextFile();
+    if (!entry) break;
+    char name[64];
+    const size_t nameLen = entry.getName(name, sizeof(name));
+    if (nameLen == 0 || nameLen >= sizeof(name)) continue;
+    name[nameLen] = '\0';
+    uint32_t start = 0;
+    uint32_t end = 0;
+    if (!parseRangeFileName(name, start, end)) continue;
+    const std::string path = directory + "/" + baseName(name);
+    HalFile file;
+    Header header;
+    if (!Storage.openFileForRead("WR", path, file) ||
+        file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
+        header.version != kVersion || header.headerSize != sizeof(header) || header.chapterUid != chapterUid ||
+        header.rangeStart != start || header.rangeEnd != end || header.commentCount == 0 ||
+        header.commentCount > kMaxStoredComments) {
+      continue;
+    }
+    if (count >= capacity) {
+      truncated = true;
+      continue;
+    }
+    ranges[count].start = start;
+    ranges[count].end = end;
+    ++count;
+  }
+  return true;
+}
+
+bool readComment(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
+                 const uint32_t index, char* text, const size_t textSize, StoredComment& comment) {
+  comment = {};
+  if (!text || textSize < 2) return false;
+  text[0] = '\0';
+  const std::string path = rangePath(bookId, chapterUid, start, end);
+  if (path.empty()) return false;
+  HalFile file;
+  Header header;
+  if (!Storage.openFileForRead("WR", path, file) ||
+      file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
+      header.version != kVersion || header.headerSize != sizeof(header) || header.commentCount == 0 ||
+      header.commentCount > kMaxStoredComments || index >= header.commentCount) {
+    return false;
+  }
+  for (uint32_t i = 0; i <= index; ++i) {
+    CommentHead head;
+    if (file.read(&head, sizeof(head)) != static_cast<int>(sizeof(head)) || head.authorLen > kMaxAuthorBytes ||
+        head.textLen > kMaxCommentBytes) {
+      return false;
+    }
+    if (i != index) {
+      if (!file.seekCur(static_cast<int64_t>(head.authorLen) + head.textLen)) return false;
+      continue;
+    }
+    if (head.authorLen > 0 &&
+        file.read(comment.author, head.authorLen) != static_cast<int>(head.authorLen)) {
+      return false;
+    }
+    comment.author[head.authorLen] = '\0';
+    const size_t take = head.textLen < textSize - 1 ? head.textLen : textSize - 1;
+    if (file.read(text, take) != static_cast<int>(take)) return false;
+    text[take] = '\0';
+    comment.index = index;
+    comment.count = header.commentCount;
+    comment.maxIdx = header.maxIdx;
+    comment.syncKey = header.syncKey;
+    comment.hasMore = (header.flags & kFlagHasMore) != 0;
+    comment.textLen = static_cast<uint16_t>(take);
+    return true;
+  }
+  return false;
+}
+
+namespace {
+
+bool pushFrame(Frame* stack, uint8_t& depth, const Frame frame) {
+  if (depth >= 16) return false;
+  stack[depth++] = frame;
+  return true;
+}
+
+Frame popFrame(Frame* stack, uint8_t& depth) {
+  if (depth == 0) return Frame::Skip;
+  return stack[--depth];
+}
+
+Frame parentFrame(const Frame* stack, const uint8_t depth) { return depth == 0 ? Frame::Skip : stack[depth - 1]; }
+
+struct UnderlineState {
+  std::unique_ptr<StreamingJsonParser> parser;
+  Range* ranges = nullptr;
+  size_t capacity = 0;
+  size_t count = 0;
+  bool truncated = false;
+  bool failed = false;
+  bool rootClosed = false;
+  int errorCode = 0;
+  Frame stack[16] = {};
+  uint8_t depth = 0;
+  Expect expect = Expect::None;
+  char rangeText[32] = {};
+};
+
+void acceptUnderline(UnderlineState& state) {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  if (!WeReadHighlight::parseRange(state.rangeText, start, end)) return;
+  for (size_t i = 0; i < state.count; ++i) {
+    if (state.ranges[i].start == start && state.ranges[i].end == end) return;
+  }
+  if (state.count >= state.capacity) {
+    state.truncated = true;
+    return;
+  }
+  state.ranges[state.count].start = start;
+  state.ranges[state.count].end = end;
+  ++state.count;
+}
+
+void underlineKey(void* raw, const char* key, size_t) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  const Frame frame = parentFrame(state.stack, state.depth);
+  state.expect = Expect::None;
+  if (!key) return;
+  if (frame == Frame::Root && (strcmp(key, "errCode") == 0 || strcmp(key, "errcode") == 0)) {
+    state.expect = Expect::Error;
+  } else if (frame == Frame::Root && strcmp(key, "underlines") == 0) {
+    state.expect = Expect::Reviews;
+  } else if (frame == Frame::Item && strcmp(key, "range") == 0) {
+    state.expect = Expect::Range;
+  }
+}
+
+void underlineString(void* raw, const char* value, size_t len) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  if (state.expect == Expect::Range) {
+    WeReadProtocol::decodeJsonString(value, len, state.rangeText, sizeof(state.rangeText));
+  }
+  state.expect = Expect::None;
+}
+
+void underlineNumber(void* raw, const char* value, size_t len) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  if (state.expect == Expect::Error) state.errorCode = static_cast<int>(parseUint32(value, len));
+  if (state.expect == Expect::Error && value && len > 0 && value[0] == '-') {
+    state.errorCode = -static_cast<int>(parseUint32(value + 1, len - 1));
+  }
+  state.expect = Expect::None;
+}
+
+void underlineIgnore(void* raw) { static_cast<UnderlineState*>(raw)->expect = Expect::None; }
+
+void underlineObjectStart(void* raw) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  Frame next = Frame::Skip;
+  if (state.depth == 0) next = Frame::Root;
+  else if (parentFrame(state.stack, state.depth) == Frame::Reviews) next = Frame::Item;
+  if (!pushFrame(state.stack, state.depth, next)) state.failed = true;
+  if (next == Frame::Item) state.rangeText[0] = '\0';
+  state.expect = Expect::None;
+}
+
+void underlineObjectEnd(void* raw) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  const Frame ended = popFrame(state.stack, state.depth);
+  if (ended == Frame::Item) acceptUnderline(state);
+  if (ended == Frame::Root) state.rootClosed = true;
+  state.expect = Expect::None;
+}
+
+void underlineArrayStart(void* raw) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  const Frame next = state.expect == Expect::Reviews ? Frame::Reviews : Frame::Skip;
+  if (!pushFrame(state.stack, state.depth, next)) state.failed = true;
+  state.expect = Expect::None;
+}
+
+void underlineArrayEnd(void* raw) {
+  auto& state = *static_cast<UnderlineState*>(raw);
+  popFrame(state.stack, state.depth);
+  state.expect = Expect::None;
+}
+
+struct ReviewState {
+  std::unique_ptr<StreamingJsonParser> parser;
+  RangeFile* file = nullptr;
+  char expectedRange[32] = {};
+  char rangeText[32] = {};
+  char author[kMaxAuthorBytes + 1] = {};
+  char content[kMaxCommentBytes] = {};
+  uint16_t contentLen = 0;
+  bool contentTruncated = false;
+  bool skipGroup = false;
+  bool failed = false;
+  bool rootClosed = false;
+  bool hasMore = false;
+  bool groupHasMore = false;
+  int errorCode = 0;
+  uint32_t maxIdx = 0;
+  uint32_t groupMaxIdx = 0;
+  uint64_t syncKey = 0;
+  uint64_t groupSyncKey = 0;
+  uint32_t added = 0;
+  Frame stack[16] = {};
+  uint8_t depth = 0;
+  Expect expect = Expect::None;
+};
+
+void clearReviewItem(ReviewState& state) {
+  state.author[0] = '\0';
+  state.content[0] = '\0';
+  state.contentLen = 0;
+  state.contentTruncated = false;
+}
+
+void appendContent(ReviewState& state, const char* value, const size_t len) {
+  if (!value || state.skipGroup || state.contentTruncated) return;
+  for (size_t i = 0; i < len; ++i) {
+    if (state.contentLen + 1 >= kMaxCommentBytes) {
+      while (state.contentLen > 0 && (static_cast<unsigned char>(state.content[state.contentLen - 1]) & 0xC0) == 0x80) {
+        --state.contentLen;
+      }
+      if (state.contentLen > 0 && (static_cast<unsigned char>(state.content[state.contentLen - 1]) & 0x80) != 0) {
+        --state.contentLen;
+      }
+      state.content[state.contentLen] = '\0';
+      state.contentTruncated = true;
+      return;
+    }
+    state.content[state.contentLen++] = value[i];
+  }
+  state.content[state.contentLen] = '\0';
+}
+
+void commitReview(ReviewState& state) {
+  if (state.skipGroup || state.failed || !state.file) {
+    clearReviewItem(state);
+    return;
+  }
+  if (blank(state.content, state.contentLen)) {
+    clearReviewItem(state);
+    return;
+  }
+  const uint32_t before = state.file->count();
+  if (!state.file->add(state.author, state.content, state.contentLen, state.contentTruncated)) {
+    state.failed = true;
+  } else if (state.file->count() > before) {
+    ++state.added;
+  }
+  clearReviewItem(state);
+}
+
+void reviewKey(void* raw, const char* key, size_t) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  const Frame frame = parentFrame(state.stack, state.depth);
+  state.expect = Expect::None;
+  if (!key) return;
+  if (frame == Frame::Root && (strcmp(key, "errCode") == 0 || strcmp(key, "errcode") == 0)) {
+    state.expect = Expect::Error;
+  } else if (frame == Frame::Root && strcmp(key, "reviews") == 0) {
+    state.expect = Expect::Reviews;
+  } else if (frame == Frame::Group && strcmp(key, "range") == 0) {
+    state.expect = Expect::Range;
+  } else if (frame == Frame::Group && strcmp(key, "hasMore") == 0) {
+    state.expect = Expect::HasMore;
+  } else if (frame == Frame::Group && strcmp(key, "maxIdx") == 0) {
+    state.expect = Expect::MaxIdx;
+  } else if (frame == Frame::Group && (strcmp(key, "synckey") == 0 || strcmp(key, "syncKey") == 0)) {
+    state.expect = Expect::SyncKey;
+  } else if (frame == Frame::Group && strcmp(key, "pageReviews") == 0) {
+    state.expect = Expect::PageReviews;
+  } else if ((frame == Frame::Item || frame == Frame::Review) && strcmp(key, "review") == 0) {
+    state.expect = Expect::Review;
+  } else if (frame == Frame::Review && strcmp(key, "content") == 0) {
+    state.expect = Expect::Content;
+  } else if (frame == Frame::Review && strcmp(key, "author") == 0) {
+    state.expect = Expect::Author;
+  } else if (frame == Frame::Author &&
+             (strcmp(key, "name") == 0 || strcmp(key, "nick") == 0 || strcmp(key, "userName") == 0)) {
+    state.expect = Expect::AuthorName;
+  }
+}
+
+void reviewString(void* raw, const char* value, size_t len) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  if (state.expect == Expect::Range) {
+    WeReadProtocol::decodeJsonString(value, len, state.rangeText, sizeof(state.rangeText));
+    state.skipGroup = state.rangeText[0] && strcmp(state.rangeText, state.expectedRange) != 0;
+  } else if (state.expect == Expect::Content) {
+    appendContent(state, value, len);
+  } else if (state.expect == Expect::AuthorName) {
+    WeReadProtocol::decodeJsonString(value, len, state.author, sizeof(state.author));
+  }
+  state.expect = Expect::None;
+}
+
+void reviewChunk(void* raw, const char* value, const size_t len, const bool final) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  if (state.expect == Expect::Content) appendContent(state, value, len);
+  if (final) state.expect = Expect::None;
+}
+
+void reviewNumber(void* raw, const char* value, size_t len) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  if (state.expect == Expect::Error) {
+    if (value && len > 0 && value[0] == '-') state.errorCode = -static_cast<int>(parseUint32(value + 1, len - 1));
+    else state.errorCode = static_cast<int>(parseUint32(value, len));
+  } else if (state.expect == Expect::HasMore && !state.skipGroup) {
+    state.groupHasMore = !(len == 1 && value && value[0] == '0');
+  } else if (state.expect == Expect::MaxIdx && !state.skipGroup) {
+    state.groupMaxIdx = parseUint32(value, len);
+  } else if (state.expect == Expect::SyncKey && !state.skipGroup) {
+    state.groupSyncKey = parseUint64(value, len);
+  }
+  state.expect = Expect::None;
+}
+
+void reviewBool(void* raw, const bool value) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  if (state.expect == Expect::HasMore && !state.skipGroup) state.groupHasMore = value;
+  state.expect = Expect::None;
+}
+
+void reviewNull(void* raw) { static_cast<ReviewState*>(raw)->expect = Expect::None; }
+
+void reviewObjectStart(void* raw) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  Frame next = Frame::Skip;
+  if (state.depth == 0) next = Frame::Root;
+  else if (state.expect == Expect::Review) next = Frame::Review;
+  else if (state.expect == Expect::Author) next = Frame::Author;
+  else if (parentFrame(state.stack, state.depth) == Frame::Reviews) next = Frame::Group;
+  else if (parentFrame(state.stack, state.depth) == Frame::PageReviews) next = Frame::Item;
+  if (!pushFrame(state.stack, state.depth, next)) state.failed = true;
+  if (next == Frame::Group) {
+    state.rangeText[0] = '\0';
+    state.skipGroup = false;
+    state.groupHasMore = false;
+    state.groupMaxIdx = 0;
+    state.groupSyncKey = 0;
+  }
+  if (next == Frame::Item) clearReviewItem(state);
+  state.expect = Expect::None;
+}
+
+void reviewObjectEnd(void* raw) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  const Frame ended = popFrame(state.stack, state.depth);
+  if (ended == Frame::Group && !state.skipGroup) {
+    state.hasMore = state.groupHasMore;
+    state.maxIdx = state.groupMaxIdx;
+    state.syncKey = state.groupSyncKey;
+  }
+  if (ended == Frame::Item) commitReview(state);
+  if (ended == Frame::Root) state.rootClosed = true;
+  state.expect = Expect::None;
+}
+
+void reviewArrayStart(void* raw) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  Frame next = Frame::Skip;
+  if (state.expect == Expect::Reviews) next = Frame::Reviews;
+  else if (state.expect == Expect::PageReviews) next = Frame::PageReviews;
+  if (!pushFrame(state.stack, state.depth, next)) state.failed = true;
+  state.expect = Expect::None;
+}
+
+void reviewArrayEnd(void* raw) {
+  auto& state = *static_cast<ReviewState*>(raw);
+  popFrame(state.stack, state.depth);
+  state.expect = Expect::None;
+}
+
+JsonCallbacks underlineCallbacks(UnderlineState* state) {
+  JsonCallbacks callbacks{};
+  callbacks.ctx = state;
+  callbacks.onKey = underlineKey;
+  callbacks.onString = underlineString;
+  callbacks.onNumber = underlineNumber;
+  callbacks.onBool = [](void* raw, bool) { underlineIgnore(raw); };
+  callbacks.onNull = [](void* raw) { underlineIgnore(raw); };
+  callbacks.onObjectStart = underlineObjectStart;
+  callbacks.onObjectEnd = underlineObjectEnd;
+  callbacks.onArrayStart = underlineArrayStart;
+  callbacks.onArrayEnd = underlineArrayEnd;
+  return callbacks;
+}
+
+JsonCallbacks reviewCallbacks(ReviewState* state) {
+  JsonCallbacks callbacks{};
+  callbacks.ctx = state;
+  callbacks.onKey = reviewKey;
+  callbacks.onString = reviewString;
+  callbacks.onNumber = reviewNumber;
+  callbacks.onBool = reviewBool;
+  callbacks.onNull = reviewNull;
+  callbacks.onObjectStart = reviewObjectStart;
+  callbacks.onObjectEnd = reviewObjectEnd;
+  callbacks.onArrayStart = reviewArrayStart;
+  callbacks.onArrayEnd = reviewArrayEnd;
+  callbacks.onStringChunk = reviewChunk;
+  return callbacks;
+}
+
+}  // namespace
+
+UnderlineParser::UnderlineParser() : state_(nullptr) {
+  auto state = makeUniqueNoThrow<UnderlineState>();
+  if (!state) {
+    LOG_ERR("WR", "内存不足：划线候选解析状态 %u 字节", static_cast<unsigned>(sizeof(UnderlineState)));
+    return;
+  }
+  state->parser = makeUniqueNoThrow<StreamingJsonParser>(underlineCallbacks(state.get()));
+  if (!state->parser) {
+    LOG_ERR("WR", "内存不足：评论候选 JSON 解析器 %u 字节", static_cast<unsigned>(sizeof(StreamingJsonParser)));
+    return;
+  }
+  state_ = state.release();
+}
+
+UnderlineParser::~UnderlineParser() { delete static_cast<UnderlineState*>(state_); }
+
+bool UnderlineParser::begin(Range* ranges, const size_t capacity) {
+  auto* state = static_cast<UnderlineState*>(state_);
+  if (!state || !state->parser || !ranges || capacity == 0) return false;
+  state->parser->reset();
+  state->ranges = ranges;
+  state->capacity = capacity;
+  state->count = 0;
+  state->truncated = false;
+  state->failed = false;
+  state->rootClosed = false;
+  state->errorCode = 0;
+  state->depth = 0;
+  state->expect = Expect::None;
+  state->rangeText[0] = '\0';
+  return true;
+}
+
+bool UnderlineParser::feed(const uint8_t* data, const size_t len) {
+  auto* state = static_cast<UnderlineState*>(state_);
+  if (!state || !state->parser || state->failed || (!data && len != 0)) return false;
+  state->parser->feed(reinterpret_cast<const char*>(data), len);
+  if (state->parser->hasError()) state->failed = true;
+  return !state->failed;
+}
+
+bool UnderlineParser::finish() {
+  auto* state = static_cast<UnderlineState*>(state_);
+  if (!state || !state->parser) return false;
+  return state->rootClosed && !state->failed && !state->parser->hasError() && state->errorCode == 0;
+}
+
+size_t UnderlineParser::count() const {
+  auto* state = static_cast<UnderlineState*>(state_);
+  return state ? state->count : 0;
+}
+bool UnderlineParser::truncated() const {
+  auto* state = static_cast<UnderlineState*>(state_);
+  return state && state->truncated;
+}
+int UnderlineParser::errorCode() const {
+  auto* state = static_cast<UnderlineState*>(state_);
+  return state ? state->errorCode : 0;
+}
+
+ReviewPageParser::ReviewPageParser() : state_(nullptr) {
+  // 正文缓冲 2KB，加上解析器，不能放进 8KB 阅读栈。请求结束即释放。
+  auto state = makeUniqueNoThrow<ReviewState>();
+  if (!state) {
+    LOG_ERR("WR", "内存不足：评论页解析状态 %u 字节", static_cast<unsigned>(sizeof(ReviewState)));
+    return;
+  }
+  state->parser = makeUniqueNoThrow<StreamingJsonParser>(reviewCallbacks(state.get()));
+  if (!state->parser) {
+    LOG_ERR("WR", "内存不足：评论页 JSON 解析器 %u 字节", static_cast<unsigned>(sizeof(StreamingJsonParser)));
+    return;
+  }
+  state_ = state.release();
+}
+
+ReviewPageParser::~ReviewPageParser() { delete static_cast<ReviewState*>(state_); }
+
+bool ReviewPageParser::begin(RangeFile* file, const char* rangeText) {
+  auto* state = static_cast<ReviewState*>(state_);
+  if (!state || !state->parser || !file || !rangeText || !rangeText[0]) return false;
+  state->parser->reset();
+  state->file = file;
+  strncpy(state->expectedRange, rangeText, sizeof(state->expectedRange) - 1);
+  state->expectedRange[sizeof(state->expectedRange) - 1] = '\0';
+  state->rangeText[0] = '\0';
+  clearReviewItem(*state);
+  state->skipGroup = false;
+  state->failed = false;
+  state->rootClosed = false;
+  state->hasMore = false;
+  state->groupHasMore = false;
+  state->errorCode = 0;
+  state->maxIdx = 0;
+  state->groupMaxIdx = 0;
+  state->syncKey = 0;
+  state->groupSyncKey = 0;
+  state->added = 0;
+  state->depth = 0;
+  state->expect = Expect::None;
+  return true;
+}
+
+bool ReviewPageParser::feed(const uint8_t* data, const size_t len) {
+  auto* state = static_cast<ReviewState*>(state_);
+  if (!state || !state->parser || state->failed || (!data && len != 0)) return false;
+  state->parser->feed(reinterpret_cast<const char*>(data), len);
+  if (state->parser->hasError()) state->failed = true;
+  return !state->failed;
+}
+
+bool ReviewPageParser::finish(Cursor& cursor) {
+  cursor = {};
+  auto* state = static_cast<ReviewState*>(state_);
+  if (!state || !state->parser) return false;
+  cursor.maxIdx = state->maxIdx;
+  cursor.syncKey = state->syncKey;
+  cursor.hasMore = state->hasMore;
+  cursor.errorCode = state->errorCode;
+  cursor.added = state->added;
+  return state->rootClosed && !state->failed && !state->parser->hasError() && state->errorCode == 0;
+}
+
+CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
+                           const uint32_t startMaxIdx, const uint64_t startSyncKey, const bool copyExisting,
+                           const ReviewPageFetch fetch, void* ctx) {
+  if (!fetch || end <= start) return CollectResult::Failed;
+  RangeFile file;
+  if (!file.begin(bookId, chapterUid, start, end, copyExisting)) return CollectResult::Failed;
+
+  Cursor cursor;
+  cursor.maxIdx = startMaxIdx;
+  cursor.syncKey = startSyncKey;
+  bool hasMore = false;
+  for (int page = 0; page < kMaxReviewPages && file.count() < kMaxStoredComments; ++page) {
+    const uint32_t before = file.count();
+    const uint32_t requestMax = cursor.maxIdx;
+    const uint64_t requestSync = cursor.syncKey;
+    Cursor pageCursor;
+    if (!fetch(ctx, requestMax, requestSync, file, pageCursor) || pageCursor.errorCode != 0) {
+      file.abort();
+      return CollectResult::Failed;
+    }
+    if (pageCursor.hasMore && pageCursor.maxIdx == requestMax && pageCursor.syncKey == requestSync &&
+        file.count() == before) {
+      LOG_ERR("WR", "评论翻页游标没有前进：maxIdx=%u", requestMax);
+      file.abort();
+      return CollectResult::Failed;
+    }
+    cursor = pageCursor;
+    hasMore = pageCursor.hasMore;
+    if (!hasMore) break;
+  }
+  if (file.capped()) hasMore = true;
+  if (file.count() == 0) {
+    file.abort();
+    return CollectResult::Empty;
+  }
+  if (!file.finish(cursor.maxIdx, cursor.syncKey, hasMore || file.capped())) {
+    file.abort();
+    return CollectResult::Failed;
+  }
+  return CollectResult::Stored;
+}
+
+}  // namespace WeReadComment
