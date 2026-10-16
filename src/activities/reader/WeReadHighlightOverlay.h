@@ -1,0 +1,16 @@
+#pragma once
+
+#include <cstddef>
+
+class Epub;
+class GfxRenderer;
+class Page;
+
+namespace WeReadHighlightOverlay {
+
+// Draws solid underlines for the current user's WeRead highlights that intersect this page.
+// The chapter index is read from SD once per page; grayscale passes reuse that result.
+void drawForBook(GfxRenderer& renderer, int fontId, const Page& page, int xOffset, int yOffset, const char* bookId,
+                 const Epub& epub, int spineIndex);
+
+}  // namespace WeReadHighlightOverlay

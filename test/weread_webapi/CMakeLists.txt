@@ -40,6 +40,7 @@ add_executable(WeReadStoreTest
   WeReadStoreTest.cpp
   ${REPO_ROOT}/freeink-sdk/libs/network/JsonSax/src/StreamingJsonParser.cpp
   ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadBrowse.cpp
+  ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadHighlight.cpp
   ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadProtocol.cpp
   ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadStore.cpp
   ${REPO_ROOT}/lib/WeReadWebApi/src/WeReadXhtmlCodec.cpp

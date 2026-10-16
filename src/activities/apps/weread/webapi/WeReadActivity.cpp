@@ -1515,10 +1515,11 @@ void WeReadActivity::performLogout() {
   }
   const bool shelfCleared = WeReadStore::clearShelf();
   const bool browseCacheCleared = WeReadBrowse::clearAllCaches();
+  const bool highlightsCleared = WeReadHighlight::clearAll();
   shelfCount_ = 0;
   shelfSelected_.store(0);
   shelfFrameInvalidated_.store(true);
-  if (!shelfCleared || !browseCacheCleared) {
+  if (!shelfCleared || !browseCacheCleared || !highlightsCleared) {
     state_.store(State::LogoutCacheWarning);
     requestUpdate();
     return;

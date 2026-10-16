@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "WeReadBrowse.h"
+#include "WeReadHighlight.h"
 #include "WeReadStore.h"
 #include "WeReadXhtmlCodec.h"
 
@@ -1455,6 +1456,55 @@ TEST_F(WeReadStoreTest, BrowseParserCapsTheFinalReviewPageAtTenRecords) {
   EXPECT_EQ(header.count, 10U);
   EXPECT_NE(header.flags & WeReadBrowse::kPageResponseTruncated, 0U);
   EXPECT_NE(header.flags & WeReadBrowse::kPageHasMore, 0U);
+}
+
+TEST_F(WeReadStoreTest, StoresMyHighlightRangesAndReplacesThemOnTheNextSnapshot) {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  uint32_t chapterUid = 0;
+  EXPECT_FALSE(WeReadHighlight::parseRange("10", start, end));
+  EXPECT_TRUE(WeReadHighlight::parseRange("10-18", start, end));
+  EXPECT_EQ(start, 10U);
+  EXPECT_EQ(end, 18U);
+  EXPECT_FALSE(WeReadHighlight::parseRange("18-10", start, end));
+  EXPECT_TRUE(WeReadHighlight::parseChapterUid("301", chapterUid));
+  EXPECT_EQ(chapterUid, 301U);
+  EXPECT_FALSE(WeReadHighlight::parseChapterUid("c2", chapterUid));
+  EXPECT_TRUE(WeReadHighlight::rangesOverlap(10, 18, 17, 20));
+  EXPECT_FALSE(WeReadHighlight::rangesOverlap(10, 18, 18, 20));
+
+  WeReadBrowse::CacheManifest manifest;
+  beginBrowseCache(manifest);
+  WeReadBrowse::ResponseParser parser(kBrowseBook, manifest.activeSlot, WeReadBrowse::Kind::MyHighlights, 0);
+  parser.setHighlightOwner("vid");
+  ASSERT_TRUE(parser.reset());
+  const char* json =
+      R"({"synckey":9,"updated":[{"bookmarkId":"m1","chapterUid":301,"range":"10-18","type":1,"bookVersion":4,"markText":"第一句"},{"bookmarkId":"m2","chapterUid":302,"range":"0-2","type":0,"markText":"书签"},{"bookmarkId":"m3","chapterUid":"301","range":"40-44","type":1,"markText":"第二句"}],"removed":[],"chapters":[{"chapterUid":999,"title":"章"}]})";
+  ASSERT_TRUE(parser.feed(reinterpret_cast<const uint8_t*>(json), strlen(json)));
+  ASSERT_TRUE(parser.finish());
+
+  WeReadHighlight::Range ranges[4];
+  size_t count = 0;
+  bool truncated = true;
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
+  EXPECT_FALSE(truncated);
+  ASSERT_EQ(count, 2U);
+  EXPECT_EQ(ranges[0].start, 10U);
+  EXPECT_EQ(ranges[0].end, 18U);
+  EXPECT_EQ(ranges[1].start, 40U);
+  EXPECT_EQ(ranges[1].end, 44U);
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 302, ranges, 4, count, truncated));
+  EXPECT_EQ(count, 0U);
+
+  WeReadBrowse::ResponseParser replacement(kBrowseBook, manifest.activeSlot, WeReadBrowse::Kind::MyHighlights, 0);
+  ASSERT_TRUE(replacement.reset());
+  const char* empty = R"({"updated":[]})";
+  ASSERT_TRUE(replacement.feed(reinterpret_cast<const uint8_t*>(empty), strlen(empty)));
+  ASSERT_TRUE(replacement.finish());
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
+  EXPECT_EQ(count, 0U);
+  EXPECT_TRUE(WeReadHighlight::clearAll());
+  EXPECT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
 }
 
 }  // namespace

@@ -2310,7 +2310,8 @@ Error Operation::pollLogin() {
   if (accountChanged) {
     const bool shelfCleared = WeReadStore::clearShelf();
     const bool browseCachesCleared = WeReadBrowse::clearAllCaches();
-    if (!shelfCleared || !browseCachesCleared) return Error::SdCard;
+    const bool highlightsCleared = WeReadHighlight::clearAll();
+    if (!shelfCleared || !browseCachesCleared || !highlightsCleared) return Error::SdCard;
   }
   if (accountChanged && kind_ == Kind::Browse) {
     browseCacheActive_ = false;
@@ -2714,6 +2715,7 @@ Error Operation::fetchBrowseOnce() {
     LOG_ERR("WR", "OOM: browse parser (%zu bytes)", sizeof(WeReadBrowse::ResponseParser));
     return Error::OutOfMemory;
   }
+  parser->setHighlightOwner(session_.vid);
   ResponseSink sink{
       parser.get(),
       [](void* raw) { return static_cast<WeReadBrowse::ResponseParser*>(raw)->reset(); },

@@ -1,4 +1,5 @@
 #include "EpubReaderActivity.h"
+#include "WeReadHighlightOverlay.h"
 
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
@@ -2364,6 +2365,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   const auto renderPage = [&] {
     GfxRenderer::SyntheticBoldScope syntheticBold(renderer, SETTINGS.fakeBold);
     page->render(renderer, fontId, orientedMarginLeft, orientedMarginTop);
+#ifdef ENABLE_CHINESE_VERSION
+    if (wereadBookId_[0] && epub) {
+      WeReadHighlightOverlay::drawForBook(renderer, fontId, *page, orientedMarginLeft, orientedMarginTop, wereadBookId_,
+                                          *epub, currentSpineIndex);
+    }
+#endif
   };
 
   struct PxcSlotGuard {

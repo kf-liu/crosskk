@@ -390,9 +390,21 @@ JsonCallbacks ResponseParser::callbacks(ResponseParser* parser) {
           onObjectStart, onObjectEnd, onArrayStart, onArrayEnd, onStringChunk};
 }
 
+void ResponseParser::setHighlightOwner(const char* vid) {
+  ownerVid_[0] = '\0';
+  if (!vid || !vid[0]) return;
+  strncpy(ownerVid_, vid, sizeof(ownerVid_) - 1);
+}
+
 bool ResponseParser::reset() {
   writer_.abort();
+  highlightWriter_.abort();
   current_ = {};
+  bookmarkId_[0] = '\0';
+  rangeText_[0] = '\0';
+  markType_ = 0;
+  markTypeSeen_ = false;
+  markBookVersion_ = 0;
   filter_ = {};
   filter_.owner = this;
   field_ = Field::None;
@@ -418,7 +430,11 @@ bool ResponseParser::reset() {
   skipRecord_ = false;
   parser_.reset();
   decoder_.reset();
-  return bookId_[0] && slot_ <= 1 && maxRecords_ > 0 && writer_.begin(bookId_, slot_, kind_, page_);
+  const bool browseReady = bookId_[0] && slot_ <= 1 && maxRecords_ > 0 && writer_.begin(bookId_, slot_, kind_, page_);
+  bool highlightReady = true;
+  if (browseReady && kind_ == Kind::MyHighlights) highlightReady = highlightWriter_.begin(bookId_);
+  if (!highlightReady) writer_.abort();
+  return browseReady && highlightReady;
 }
 
 bool ResponseParser::feed(const uint8_t* data, const size_t len) {
@@ -434,15 +450,22 @@ bool ResponseParser::feed(const uint8_t* data, const size_t len) {
 bool ResponseParser::finish() {
   if (errorCode_ != 0 && rootClosed_ && !parser_.hasError()) {
     writer_.abort();
+    highlightWriter_.abort();
     return true;
   }
   const bool emptyObject = !sawAnyKey_ && !sawRecords_;
   if (inRecord_ || !rootClosed_ || (!sawRecords_ && !emptyObject) || parser_.hasError() || textFailed_) {
     writer_.abort();
+    highlightWriter_.abort();
     return false;
   }
   count_ = writer_.count();
   responseTruncated_ = responseTruncated_ || writer_.pageTruncated();
+  if (kind_ == Kind::MyHighlights && !highlightWriter_.finish(nextSyncKey_, markBookVersion_, ownerVid_)) {
+    writer_.abort();
+    storageFailed_ = true;
+    return false;
+  }
   if (writer_.finish(hasMore_, nextMaxIdx_, nextSyncKey_, responseTruncated_)) return true;
   storageFailed_ = true;
   return false;
@@ -482,6 +505,14 @@ void ResponseParser::onKey(void* raw, const char* key, size_t) {
     self.field_ = Field::CreateTime;
   } else if (strcmp(key, "idx") == 0) {
     self.field_ = Field::Idx;
+  } else if (self.inRecord_ && strcmp(key, "bookmarkId") == 0) {
+    self.field_ = Field::BookmarkId;
+  } else if (self.inRecord_ && strcmp(key, "range") == 0) {
+    self.field_ = Field::Range;
+  } else if (self.inRecord_ && strcmp(key, "bookVersion") == 0) {
+    self.field_ = Field::BookVersion;
+  } else if (self.inRecord_ && strcmp(key, "type") == 0) {
+    self.field_ = Field::MarkType;
   } else {
     self.field_ = Field::None;
   }
@@ -605,6 +636,21 @@ void ResponseParser::acceptValue(const char* value, const size_t len) {
       case Field::Idx:
         current_.idx = WeReadProtocol::parseUint32OrZero(value, len);
         break;
+      case Field::BookmarkId:
+        copyDecoded(bookmarkId_, value, len);
+        break;
+      case Field::Range:
+        copyDecoded(rangeText_, value, len);
+        break;
+      case Field::BookVersion:
+        markBookVersion_ = WeReadProtocol::parseUint32OrZero(value, len);
+        break;
+      case Field::MarkType: {
+        const uint32_t type = WeReadProtocol::parseUint32OrZero(value, len);
+        markType_ = static_cast<uint8_t>(std::min<uint32_t>(type, UINT8_MAX));
+        markTypeSeen_ = true;
+        break;
+      }
       default:
         break;
     }
@@ -741,6 +787,10 @@ bool ResponseParser::emitNewline() {
 
 void ResponseParser::startRecord() {
   current_ = {};
+  bookmarkId_[0] = '\0';
+  rangeText_[0] = '\0';
+  markType_ = 0;
+  markTypeSeen_ = false;
   textSelected_ = false;
   textComplete_ = false;
   skipRecord_ = writer_.count() >= maxRecords_;
@@ -757,6 +807,20 @@ void ResponseParser::startRecord() {
 }
 
 void ResponseParser::finishRecord() {
+  if (kind_ == Kind::MyHighlights && markTypeSeen_ && markType_ == 1 && bookmarkId_[0] && rangeText_[0]) {
+    WeReadHighlight::Mark mark;
+    uint32_t chapterUid = 0;
+    if (WeReadHighlight::parseChapterUid(current_.chapterUid, chapterUid) &&
+        WeReadHighlight::parseRange(rangeText_, mark.rangeStart, mark.rangeEnd)) {
+      mark.chapterUid = chapterUid;
+      mark.flags = WeReadHighlight::Mine;
+      strncpy(mark.bookmarkId, bookmarkId_, sizeof(mark.bookmarkId) - 1);
+      if (!highlightWriter_.append(mark)) {
+        storageFailed_ = true;
+        textFailed_ = true;
+      }
+    }
+  }
   if (skipRecord_) {
     inRecord_ = false;
     recordDepth_ = -1;

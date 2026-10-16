@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 
+#include "WeReadHighlight.h"
 #include "WeReadProtocol.h"
 #include "WeReadStore.h"
 
@@ -126,6 +127,7 @@ class ResponseParser {
  public:
   ResponseParser(const char* bookId, uint8_t slot, Kind kind, uint32_t page, uint32_t maxRecords = kMaxRecords);
 
+  void setHighlightOwner(const char* vid);
   bool reset();
   bool feed(const uint8_t* data, size_t len);
   bool finish();
@@ -154,6 +156,10 @@ class ResponseParser {
     Rating,
     CreateTime,
     Idx,
+    BookmarkId,
+    Range,
+    BookVersion,
+    MarkType,
   };
 
   struct TextFilter {
@@ -221,6 +227,13 @@ class ResponseParser {
   bool textComplete_ = false;
   bool textFailed_ = false;
   bool skipRecord_ = false;
+  bool markTypeSeen_ = false;
+  uint8_t markType_ = 0;
+  uint32_t markBookVersion_ = 0;
+  char ownerVid_[64] = {};
+  char bookmarkId_[32] = {};
+  char rangeText_[32] = {};
+  WeReadHighlight::Writer highlightWriter_;
 };
 
 }  // namespace WeReadBrowse
