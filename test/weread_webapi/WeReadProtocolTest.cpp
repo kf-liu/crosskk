@@ -69,6 +69,15 @@ struct OperationTestPeer {
   static ProgressAction progressAction(const ProgressSyncMode mode, const bool samePosition) {
     return Operation::progressAction(mode, samePosition);
   }
+  using ProgressReportPlan = Operation::ProgressReportPlan;
+  static ProgressReportPlan progressReportPlan(const ProgressAction action, const uint32_t readingSeconds) {
+    return Operation::progressReportPlan(action, readingSeconds);
+  }
+  static bool isPublicAccountBookId(const char* bookId) { return Operation::isPublicAccountBookId(bookId); }
+  static bool readingTimeWasTransmitted(const Error error) { return Operation::readingTimeWasTransmitted(error); }
+  static bool retryAutomaticProgressReport(const bool carriedTime, const Error error) {
+    return Operation::retryAutomaticProgressReport(carriedTime, error);
+  }
   static ProgressSyncOutcome progressVerification(const bool samePosition, const bool remoteHasAppId,
                                                   const bool sameAppId, const bool remoteHasUpdateTime,
                                                   const uint32_t remoteUpdateTime, const uint32_t uploadStartedAt) {
@@ -600,6 +609,33 @@ TEST(WeReadClientState, RequiresDirectionSelectionOnlyWhenComparedPositionsDiffe
   EXPECT_EQ(action(Mode::ApplyRemote, false), Action::ApplyRemote);
   EXPECT_EQ(action(Mode::UploadLocal, true), Action::AlreadySynced);
   EXPECT_EQ(action(Mode::UploadLocal, false), Action::UploadLocal);
+}
+
+TEST(WeReadClientState, AttachesReadingTimeToOneProgressReport) {
+  using Action = WeReadClient::OperationTestPeer::ProgressAction;
+  using Plan = WeReadClient::OperationTestPeer::ProgressReportPlan;
+  using Error = WeReadClient::Error;
+  const auto plan = WeReadClient::OperationTestPeer::progressReportPlan;
+  const auto retry = WeReadClient::OperationTestPeer::retryAutomaticProgressReport;
+
+  EXPECT_EQ(plan(Action::AlreadySynced, 0), Plan::Finish);
+  EXPECT_EQ(plan(Action::AlreadySynced, 12), Plan::UploadLocal);
+  EXPECT_EQ(plan(Action::ApplyRemote, 0), Plan::Finish);
+  EXPECT_EQ(plan(Action::ApplyRemote, 12), Plan::UploadRemote);
+  EXPECT_EQ(plan(Action::UploadLocal, 0), Plan::UploadLocal);
+  EXPECT_EQ(plan(Action::SelectDirection, 12), Plan::Ask);
+
+  EXPECT_TRUE(WeReadClient::OperationTestPeer::isPublicAccountBookId("MP_WXS_article"));
+  EXPECT_FALSE(WeReadClient::OperationTestPeer::isPublicAccountBookId("3300000001"));
+  EXPECT_FALSE(WeReadClient::OperationTestPeer::isPublicAccountBookId(nullptr));
+
+  EXPECT_TRUE(WeReadClient::OperationTestPeer::readingTimeWasTransmitted(Error::Network));
+  EXPECT_TRUE(WeReadClient::OperationTestPeer::readingTimeWasTransmitted(Error::Ok));
+  EXPECT_FALSE(WeReadClient::OperationTestPeer::readingTimeWasTransmitted(Error::Clock));
+  EXPECT_FALSE(retry(true, Error::Network));
+  EXPECT_FALSE(retry(true, Error::Protocol));
+  EXPECT_TRUE(retry(false, Error::Network));
+  EXPECT_FALSE(retry(false, Error::Protocol));
 }
 
 TEST(WeReadClientState, RequiresAReadBackBeforeReportingProgressUpload) {

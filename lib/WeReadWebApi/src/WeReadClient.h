@@ -49,9 +49,12 @@ struct ProgressSyncInput {
   float localFraction = 0.0f;
   uint32_t localTocIndex = 0;
   uint32_t localOffset = 0;
+  // Whole seconds from the reading session that ended as sync opened. Zero
+  // means this upload carries no reading time.
+  uint32_t readingSeconds = 0;
   LocalOffsetBasis localOffsetBasis = LocalOffsetBasis::None;
 };
-static_assert(sizeof(ProgressSyncInput) == 16);
+static_assert(sizeof(ProgressSyncInput) == 20);
 
 enum class ProgressSyncMode : uint8_t {
   Compare,
@@ -111,6 +114,8 @@ class Operation {
   const char* qrUrl() const { return url_; }
   const char* finalPath() const { return outputPath_.c_str(); }
   const ProgressSyncResult& progressSyncResult() const { return progressSyncResult_; }
+  // True after a timed report was accepted or its delivery could not be confirmed.
+  bool readingTimeConsumed() const { return readingTimeConsumed_; }
   bool active() const;
   bool needsCoverConversionScratch() const { return coverConversionNeedsScratch(phase_, progressStage_); }
 
@@ -122,6 +127,13 @@ class Operation {
     SelectDirection,
     ApplyRemote,
     UploadLocal,
+  };
+
+  enum class ProgressReportPlan : uint8_t {
+    Finish,
+    Ask,
+    UploadLocal,
+    UploadRemote,
   };
 
   enum class CoverCacheAction : uint8_t {
@@ -292,6 +304,55 @@ class Operation {
     }
     return ProgressAction::SelectDirection;
   }
+  static constexpr bool isPublicAccountBookId(const char* bookId) {
+    if (!bookId) return false;
+    constexpr char kPrefix[] = "MP_WXS_";
+    for (size_t i = 0; i < sizeof(kPrefix) - 1; ++i) {
+      if (bookId[i] != kPrefix[i]) return false;
+    }
+    return true;
+  }
+  // Reading time rides on one progress report. Matching positions still upload
+  // when there are seconds to send; choosing the cloud reports that remote
+  // position so the seconds cannot move it backwards.
+  static constexpr ProgressReportPlan progressReportPlan(const ProgressAction action, const uint32_t readingSeconds) {
+    switch (action) {
+      case ProgressAction::SelectDirection:
+        return ProgressReportPlan::Ask;
+      case ProgressAction::UploadLocal:
+        return ProgressReportPlan::UploadLocal;
+      case ProgressAction::AlreadySynced:
+        return readingSeconds > 0 ? ProgressReportPlan::UploadLocal : ProgressReportPlan::Finish;
+      case ProgressAction::ApplyRemote:
+        return readingSeconds > 0 ? ProgressReportPlan::UploadRemote : ProgressReportPlan::Finish;
+    }
+    return ProgressReportPlan::Ask;
+  }
+  // A timed report that left the device, or whose result is unclear, is not
+  // posted again. An untimed progress report may still retry a dropped connection.
+  static constexpr bool readingTimeWasTransmitted(const Error error) {
+    switch (error) {
+      case Error::Ok:
+      case Error::SdCard:
+      case Error::Network:
+      case Error::Protocol:
+      case Error::SessionExpired:
+        return true;
+      case Error::Cancelled:
+      case Error::LoginFailed:
+      case Error::Integrity:
+      case Error::Unavailable:
+      case Error::Clock:
+      case Error::OutOfMemory:
+      case Error::WholeBookOnly:
+        return false;
+    }
+    return false;
+  }
+  static constexpr bool retryAutomaticProgressReport(const bool carriedTime, const Error error) {
+    if (carriedTime && readingTimeWasTransmitted(error) && error != Error::Ok && error != Error::SdCard) return false;
+    return error == Error::Network;
+  }
   static constexpr ProgressSyncOutcome progressVerification(const bool samePosition, const bool remoteHasAppId,
                                                             const bool sameAppId, const bool remoteHasUpdateTime,
                                                             const uint32_t remoteUpdateTime,
@@ -349,6 +410,7 @@ class Operation {
   float normalizedRemoteProgress() const;
   bool sameRemotePosition() const;
   bool remoteAppIdMatchesLocal() const;
+  bool bindRemoteChapterForReport();
   void persistInitialProgress();
   Error decideProgress();
   Error fetchReaderOnce();
@@ -418,6 +480,8 @@ class Operation {
   uint64_t shardBytes_ = 0;  // Received shard bytes, including retry attempts; excludes reader metadata.
   int responseStatus_ = 0;
   uint32_t progressUploadStartedAt_ = 0;
+  bool reportRemoteOutcome_ = false;
+  bool readingTimeConsumed_ = false;
   char previousVid_[64] = {};
   char loginUid_[128] = {};
   char psvts_[128] = {};

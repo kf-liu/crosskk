@@ -55,6 +55,7 @@ class WeReadProgressSyncActivity final : public Activity {
   uint16_t localPageCount_ = 0;
   float remoteFraction_ = 0.0f;
   bool uploadConflict_ = false;
+  // Set only when this screen starts Wi-Fi. An already-connected network is left up.
   bool wifiActivated_ = false;
   std::atomic<bool> fullRefreshPending_{true};
 

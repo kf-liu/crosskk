@@ -179,11 +179,13 @@ and includes the whole seconds recorded by the local reading session that ended
 when manual sync was opened. When the remote position is selected, its exact
 chapter and offset are reported before being applied locally, so reporting time
 cannot move cloud progress backwards. Upload is accepted only after a read-back
-verifies the chapter and offset. A timed report is not automatically repeated
-after an ambiguous network failure; the current sync screen retains it for an
-explicit Retry, but no pending time is persisted after leaving the screen. An
-expired session directs the user back to **Apps → WeRead** to sign in; it does
-not open a QR flow from the reader.
+verifies the chapter and offset. A timed report is not sent again when the
+network result is unclear, including an explicit retry on the current screen;
+that retry uploads progress without the seconds. No pending time is persisted
+after leaving the screen. The sync screen opens Wi-Fi only when the user asked
+to sync and nothing is already connected, and it disconnects only the connection
+it opened. An expired session directs the user back to **Apps → WeRead** to
+sign in; it does not open a QR flow from the reader.
 
 For a new standard-book cache, the downloader fetches cloud progress after the
 `WRT2` catalog and before any chapter or image. This request is best effort:

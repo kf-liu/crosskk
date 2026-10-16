@@ -95,19 +95,32 @@ void WeReadProgressSyncActivity::onEnter() {
     return;
   }
 
+  // The reader has already ended its session. Keep whole seconds for this one
+  // upload; they are not written anywhere if the screen is left.
+  const auto& snapshot = READING_STATS.getLastSessionSnapshot();
+  if (snapshot.valid && snapshot.path == epubPath_) {
+    input_.readingSeconds = snapshot.sessionMs / 1000u;
+  }
+  LOG_INF("WRSync", "session reading seconds=%u", static_cast<unsigned>(input_.readingSeconds));
+
+  // Offline reading never starts Wi-Fi by itself. This screen opens a network
+  // only because the user asked to sync, and only when nothing is connected.
   NetworkStartup::prepare(renderer);
-  wifiActivated_ = true;
   if (WiFi.status() == WL_CONNECTED) {
+    wifiActivated_ = false;
     state_ = State::Starting;
     requestUpdate();
     return;
   }
+  wifiActivated_ = true;
   launchWifiSelection();
 }
 
 void WeReadProgressSyncActivity::onExit() {
   operation_.reset();
   Activity::onExit();
+  // A connection that was already up belongs to the reader. Rebooting here
+  // would drop it, so only the session this screen started is torn down.
   if (!wifiActivated_) return;
   WiFi.disconnect(false);
   delay(30);
@@ -178,6 +191,7 @@ void WeReadProgressSyncActivity::advanceSync() {
       return;
     case WeReadClient::Operation::Event::Failed:
       error_ = operation_.error();
+      if (operation_.readingTimeConsumed()) input_.readingSeconds = 0;
       state_ = error_ == WeReadClient::Error::SessionExpired ? State::LoginRequired : State::Failed;
       requestUpdate();
       return;
@@ -188,6 +202,7 @@ void WeReadProgressSyncActivity::advanceSync() {
   const auto result = operation_.progressSyncResult();
   outcome_ = result.outcome;
   LOG_INF("WRSync", "sync complete: outcome=%u", static_cast<unsigned>(outcome_));
+  if (operation_.readingTimeConsumed()) input_.readingSeconds = 0;
   operation_.reset();
   if (outcome_ == WeReadClient::ProgressSyncOutcome::SelectionRequired) {
     remoteFraction_ = result.remote.percent / 100.0f;
