@@ -348,14 +348,19 @@ void EpubReaderActivity::refreshWeReadHighlightsIfNeeded() {
   }
 }
 
-bool EpubReaderActivity::handleWeReadHighlightTap() {
-  if (wereadBookId_[0] == '\0' || !epub) return false;
-  int x = 0;
-  int y = 0;
-  if (!mappedInput.wasScreenTapped(x, y)) return false;
-  char bookmarkId[32] = {};
-  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId))) return false;
-  switch (WeReadHighlight::deleteMine(wereadBookId_, bookmarkId)) {
+bool EpubReaderActivity::handleWeReadHighlightSheet() {
+  if (!highlightSheetOpen_) return false;
+  overlayPopup.handleInput(mappedInput, [this] { requestUpdate(); });
+  if (!overlayPopup.isActive()) {
+    highlightSheetOpen_ = false;
+    highlightBookmarkId_[0] = '\0';
+  }
+  return true;
+}
+
+void EpubReaderActivity::removeOpenWeReadHighlight() {
+  if (wereadBookId_[0] == '\0' || highlightBookmarkId_[0] == '\0') return;
+  switch (WeReadHighlight::deleteMine(wereadBookId_, highlightBookmarkId_)) {
     case WeReadHighlight::RefreshResult::Updated:
       WeReadHighlightOverlay::invalidate();
       highlightNotice_ = HighlightNotice::Removed;
@@ -366,6 +371,24 @@ bool EpubReaderActivity::handleWeReadHighlightTap() {
       break;
   }
   highlightNoticeTime_ = millis();
+}
+
+bool EpubReaderActivity::handleWeReadHighlightTap() {
+  if (wereadBookId_[0] == '\0' || !epub || highlightSheetOpen_) return false;
+  int x = 0;
+  int y = 0;
+  if (!mappedInput.wasScreenTapped(x, y)) return false;
+  char bookmarkId[32] = {};
+  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId))) return false;
+  strncpy(highlightBookmarkId_, bookmarkId, sizeof(highlightBookmarkId_) - 1);
+  highlightBookmarkId_[sizeof(highlightBookmarkId_) - 1] = '\0';
+  const char* removeLabel = tr(STR_WEREAD_HIGHLIGHT_REMOVE);
+  const char* const options[] = {removeLabel};
+  overlayPopup.showMessage(tr(STR_WEREAD_HIGHLIGHT_COMMENTS), tr(STR_WEREAD_HIGHLIGHT_NO_COMMENTS), options, 1, 0,
+                           [this](int index) {
+                             if (index == 0) removeOpenWeReadHighlight();
+                           });
+  highlightSheetOpen_ = overlayPopup.isActive();
   requestUpdate();
   return true;
 }
@@ -795,6 +818,11 @@ void EpubReaderActivity::loop() {
 
   if (!updateChapterBuild()) return;
 
+#ifdef ENABLE_CHINESE_VERSION
+  // 评论面板打开时，这一帧的按键和触摸都归面板，不翻页。
+  if (handleWeReadHighlightSheet()) return;
+#endif
+
   const bool atEndOfBook = currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount();
   clearEndOfBookOptionsIfNeeded();
 
@@ -969,7 +997,7 @@ void EpubReaderActivity::loop() {
   }
 
 #ifdef ENABLE_CHINESE_VERSION
-  // 点在划线上只删除这一条，不翻页、也不打开阅读菜单。
+  // 点在划线上先看评论。取消划线是面板里的按钮，点了才删。
   if (!atEndOfBook && !endOfBookMenuOpen && handleWeReadHighlightTap()) return;
 #endif
 
@@ -2058,7 +2086,9 @@ void EpubReaderActivity::renderBook() {
   }
 
 #ifdef ENABLE_CHINESE_VERSION
-  if (highlightNotice_ != HighlightNotice::None) {
+  if (highlightSheetOpen_ && overlayPopup.isActive()) {
+    overlayPopup.processRender(renderer, mappedInput);
+  } else if (highlightNotice_ != HighlightNotice::None) {
     GUI.drawPopup(renderer, highlightNotice_ == HighlightNotice::Removed ? tr(STR_WEREAD_HIGHLIGHT_REMOVED)
                                                                         : tr(STR_WEREAD_HIGHLIGHT_REMOVE_FAILED));
   }

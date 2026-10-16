@@ -103,9 +103,13 @@ class EpubReaderActivity final : public ReaderActivity {
   enum class HighlightNotice : uint8_t { None, Removed, Failed };
   HighlightNotice highlightNotice_ = HighlightNotice::None;
   unsigned long highlightNoticeTime_ = 0;
+  bool highlightSheetOpen_ = false;
+  char highlightBookmarkId_[32] = {};
   bool maybeOfferCompleteChineseFont();
   void refreshWeReadHighlightsIfNeeded();
+  bool handleWeReadHighlightSheet();
   bool handleWeReadHighlightTap();
+  void removeOpenWeReadHighlight();
 #endif
 
   // Toolbar reader menu (SETTINGS.readerMenuStyle == READER_MENU_TOOLBAR): drawn
