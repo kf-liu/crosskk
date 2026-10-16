@@ -100,8 +100,12 @@ class EpubReaderActivity final : public ReaderActivity {
   char wereadBookId_[64] = {};
   bool clearInitialProgressAfterSave_ = false;
   bool highlightRefreshAttempted_ = false;
+  enum class HighlightNotice : uint8_t { None, Removed, Failed };
+  HighlightNotice highlightNotice_ = HighlightNotice::None;
+  unsigned long highlightNoticeTime_ = 0;
   bool maybeOfferCompleteChineseFont();
   void refreshWeReadHighlightsIfNeeded();
+  bool handleWeReadHighlightTap();
 #endif
 
   // Toolbar reader menu (SETTINGS.readerMenuStyle == READER_MENU_TOOLBAR): drawn

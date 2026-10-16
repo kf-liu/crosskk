@@ -32,6 +32,8 @@ STR_BOOK: "Buch"
 STR_BOOKMARK_ADDED: "Lesezeichen hinzugefügt."
 STR_BOOKMARK_OPTION: "Lesezeichen"
 STR_BOOKMARK_REMOVED: "Lesezeichen entfernt."
+STR_WEREAD_HIGHLIGHT_REMOVED: "Highlight removed."
+STR_WEREAD_HIGHLIGHT_REMOVE_FAILED: "Couldn't remove the highlight."
 STR_BOOKMARKS: "Lesezeichen"
 
 STR_CROSSPOINT: "CrossMux"

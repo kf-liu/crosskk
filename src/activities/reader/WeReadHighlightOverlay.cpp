@@ -31,13 +31,25 @@ uint32_t visibleCodepoints(const char* text) {
   return count;
 }
 
+struct HitSegment {
+  uint8_t markIndex = 0;
+  int16_t x = 0;
+  int16_t y = 0;
+  int16_t w = 0;
+  int16_t h = 0;
+};
+
+constexpr size_t kMaxHitSegments = 96;
+
 struct PageMarks {
   char bookId[64] = {};
   int spineIndex = -1;
   uint32_t pageOffset = 0;
   size_t count = 0;
+  size_t segmentCount = 0;
   bool valid = false;
-  WeReadHighlight::Range ranges[WeReadHighlight::kMaxChapterRanges] = {};
+  WeReadHighlight::ChapterMark marks[WeReadHighlight::kMaxChapterRanges] = {};
+  HitSegment segments[kMaxHitSegments] = {};
 };
 
 PageMarks& pageMarks() {
@@ -56,6 +68,7 @@ void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, c
   PageMarks& marks = pageMarks();
   marks.valid = false;
   marks.count = 0;
+  marks.segmentCount = 0;
   marks.spineIndex = spineIndex;
   marks.pageOffset = pageOffset;
   marks.bookId[0] = '\0';
@@ -79,8 +92,8 @@ void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, c
   if (!WeReadHighlight::parseChapterUid(chapter.chapterUid, chapterUid)) return;
 
   bool truncated = false;
-  if (!WeReadHighlight::loadChapter(bookId, chapterUid, marks.ranges, WeReadHighlight::kMaxChapterRanges, marks.count,
-                                    truncated)) {
+  if (!WeReadHighlight::loadChapterMarks(bookId, chapterUid, marks.marks, WeReadHighlight::kMaxChapterRanges,
+                                         marks.count, truncated)) {
     marks.count = 0;
     return;
   }
@@ -91,7 +104,8 @@ void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, c
 }
 
 void drawRanges(GfxRenderer& renderer, const int fontId, const Page& page, const int xOffset, const int yOffset,
-                const WeReadHighlight::Range* ranges, const size_t rangeCount) {
+                PageMarks& marks) {
+  marks.segmentCount = 0;
   const int ascender = renderer.getFontAscenderSize(fontId);
   uint32_t offset = page.visibleTextOffset;
   for (const auto& element : page.elements) {
@@ -100,23 +114,33 @@ void drawRanges(GfxRenderer& renderer, const int fontId, const Page& page, const
     const TextBlock& block = *line.getBlock();
     if (!block.valid()) continue;
     const int lineY = line.yPos + yOffset + block.getRubyShift(ascender) + ascender + 2;
+    const int top = line.yPos + yOffset;
     const int8_t tracking = block.getBlockStyle().characterSpacing;
     for (uint16_t wordIndex = 0; wordIndex < block.wordCount(); ++wordIndex) {
       const char* word = block.wordText(wordIndex);
       const uint32_t length = visibleCodepoints(word);
       const uint32_t wordEnd = offset + length;
-      bool covered = false;
-      for (size_t rangeIndex = 0; rangeIndex < rangeCount; ++rangeIndex) {
-        if (WeReadHighlight::rangesOverlap(offset, wordEnd, ranges[rangeIndex].start, ranges[rangeIndex].end)) {
-          covered = true;
+      int coveredIndex = -1;
+      for (size_t rangeIndex = 0; rangeIndex < marks.count; ++rangeIndex) {
+        if (WeReadHighlight::rangesOverlap(offset, wordEnd, marks.marks[rangeIndex].start,
+                                           marks.marks[rangeIndex].end)) {
+          coveredIndex = static_cast<int>(rangeIndex);
           break;
         }
       }
-      if (covered && length > 0) {
+      if (coveredIndex >= 0 && length > 0) {
         const int width = renderer.getTextAdvanceX(fontId, word, block.wordStyle(wordIndex), tracking);
         if (width > 0) {
           const int x = line.xPos + xOffset + block.wordXpos(wordIndex);
           renderer.drawLine(x, lineY, x + width - 1, lineY, 1, true);
+          if (marks.segmentCount < kMaxHitSegments && top < lineY + 4) {
+            HitSegment& segment = marks.segments[marks.segmentCount++];
+            segment.markIndex = static_cast<uint8_t>(coveredIndex);
+            segment.x = static_cast<int16_t>(x);
+            segment.y = static_cast<int16_t>(top);
+            segment.w = static_cast<int16_t>(width);
+            segment.h = static_cast<int16_t>(lineY + 4 - top);
+          }
         }
       }
       offset = wordEnd;
@@ -134,7 +158,23 @@ void drawForBook(GfxRenderer& renderer, const int fontId, const Page& page, cons
     loadPageMarks(bookId, epub, spineIndex, page.visibleTextOffset);
   }
   if (!marks.valid || marks.count == 0) return;
-  drawRanges(renderer, fontId, page, xOffset, yOffset, marks.ranges, marks.count);
+  drawRanges(renderer, fontId, page, xOffset, yOffset, marks);
+}
+
+bool hitBookmark(const int x, const int y, char* bookmarkId, const size_t bookmarkIdSize) {
+  if (!bookmarkId || bookmarkIdSize < 2) return false;
+  bookmarkId[0] = '\0';
+  const PageMarks& marks = pageMarks();
+  if (!marks.valid) return false;
+  for (size_t i = 0; i < marks.segmentCount; ++i) {
+    const HitSegment& segment = marks.segments[i];
+    if (segment.markIndex >= marks.count || segment.w <= 0 || segment.h <= 0) continue;
+    if (x < segment.x || x >= segment.x + segment.w || y < segment.y || y >= segment.y + segment.h) continue;
+    strncpy(bookmarkId, marks.marks[segment.markIndex].bookmarkId, bookmarkIdSize - 1);
+    bookmarkId[bookmarkIdSize - 1] = '\0';
+    return bookmarkId[0] != '\0';
+  }
+  return false;
 }
 
 void invalidate() { pageMarks().valid = false; }

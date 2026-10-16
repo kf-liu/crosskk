@@ -347,6 +347,28 @@ void EpubReaderActivity::refreshWeReadHighlightsIfNeeded() {
       break;
   }
 }
+
+bool EpubReaderActivity::handleWeReadHighlightTap() {
+  if (wereadBookId_[0] == '\0' || !epub) return false;
+  int x = 0;
+  int y = 0;
+  if (!mappedInput.wasScreenTapped(x, y)) return false;
+  char bookmarkId[32] = {};
+  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId))) return false;
+  switch (WeReadHighlight::deleteMine(wereadBookId_, bookmarkId)) {
+    case WeReadHighlight::RefreshResult::Updated:
+      WeReadHighlightOverlay::invalidate();
+      highlightNotice_ = HighlightNotice::Removed;
+      break;
+    case WeReadHighlight::RefreshResult::Failed:
+    case WeReadHighlight::RefreshResult::Skipped:
+      highlightNotice_ = HighlightNotice::Failed;
+      break;
+  }
+  highlightNoticeTime_ = millis();
+  requestUpdate();
+  return true;
+}
 #endif
 
 bool EpubReaderActivity::loadBook() {
@@ -799,6 +821,14 @@ void EpubReaderActivity::loop() {
     requestUpdate();
   }
 
+#ifdef ENABLE_CHINESE_VERSION
+  if (highlightNotice_ != HighlightNotice::None &&
+      (millis() - highlightNoticeTime_) >= ReaderUtils::BOOKMARK_MESSAGE_DURATION_MS) {
+    highlightNotice_ = HighlightNotice::None;
+    requestUpdate();
+  }
+#endif
+
   if (showDictionaryMessage && (millis() - dictionaryMessageTime) >= ReaderUtils::BOOKMARK_MESSAGE_DURATION_MS) {
     showDictionaryMessage = false;
     requestUpdate();
@@ -937,6 +967,11 @@ void EpubReaderActivity::loop() {
         break;
     }
   }
+
+#ifdef ENABLE_CHINESE_VERSION
+  // 点在划线上只删除这一条，不翻页、也不打开阅读菜单。
+  if (!atEndOfBook && !endOfBookMenuOpen && handleWeReadHighlightTap()) return;
+#endif
 
   // Link taps take priority over the reader-menu and page-turn zones.
   if (!atEndOfBook && !currentPageLinks.empty() && SETTINGS.touchReaderControls && mappedInput.hasTouch()) {
@@ -2021,6 +2056,13 @@ void EpubReaderActivity::renderBook() {
   if (showBookmarkMessage) {
     GUI.drawPopup(renderer, bookmarkRemoved ? tr(STR_BOOKMARK_REMOVED) : tr(STR_BOOKMARK_ADDED));
   }
+
+#ifdef ENABLE_CHINESE_VERSION
+  if (highlightNotice_ != HighlightNotice::None) {
+    GUI.drawPopup(renderer, highlightNotice_ == HighlightNotice::Removed ? tr(STR_WEREAD_HIGHLIGHT_REMOVED)
+                                                                        : tr(STR_WEREAD_HIGHLIGHT_REMOVE_FAILED));
+  }
+#endif
 
   if (showDictionaryMessage) {
     GUI.drawPopup(renderer, tr(STR_DICT_NO_DICT_SET));

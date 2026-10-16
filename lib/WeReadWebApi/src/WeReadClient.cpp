@@ -4325,11 +4325,112 @@ WeReadHighlight::RefreshResult refreshMineFromBookmarkList(const char* bookId) {
   return WeReadHighlight::RefreshResult::Updated;
 }
 
+namespace {
+
+struct DeleteBuf {
+  uint8_t* data = nullptr;
+  size_t capacity = 0;
+  size_t len = 0;
+  bool overflow = false;
+  int status = 0;
+};
+
+bool bookmarkIdIsJsonSafe(const char* bookmarkId) {
+  if (!bookmarkId || !bookmarkId[0]) return false;
+  size_t length = 0;
+  for (const char* cursor = bookmarkId; *cursor; ++cursor, ++length) {
+    if (length >= 31) return false;
+    const unsigned char ch = static_cast<unsigned char>(*cursor);
+    if (ch < 0x20 || ch == '"' || ch == '\\') return false;
+  }
+  return true;
+}
+
+bool deleteReset(void* raw) {
+  auto* buf = static_cast<DeleteBuf*>(raw);
+  if (!buf) return false;
+  buf->len = 0;
+  buf->overflow = false;
+  return true;
+}
+
+bool deleteFeed(void* raw, const uint8_t* data, const size_t len) {
+  auto* buf = static_cast<DeleteBuf*>(raw);
+  if (!buf || buf->overflow || (!data && len != 0)) return false;
+  if (len > buf->capacity - buf->len) {
+    buf->overflow = true;
+    return false;
+  }
+  if (len > 0) memcpy(buf->data + buf->len, data, len);
+  buf->len += len;
+  return true;
+}
+
+bool deleteFinish(void* raw) {
+  auto* buf = static_cast<DeleteBuf*>(raw);
+  return buf && !buf->overflow && buf->status == 200;
+}
+
+}  // namespace
+
+WeReadHighlight::RefreshResult deleteMineFromBookmarkList(const char* bookId, const char* bookmarkId) {
+  if (!bookId || !bookId[0] || !bookmarkIdIsJsonSafe(bookmarkId)) return WeReadHighlight::RefreshResult::Failed;
+  if (!WeReadHttpClient::networkReady()) return WeReadHighlight::RefreshResult::Skipped;
+  WeReadStore::Session session;
+  if (!WeReadStore::loadSession(session) || !session.valid()) return WeReadHighlight::RefreshResult::Skipped;
+
+  char body[64];
+  const int bodyLength = snprintf(body, sizeof(body), "{\"bookmarkId\":\"%s\"}", bookmarkId);
+  if (bodyLength <= 0 || static_cast<size_t>(bodyLength) >= sizeof(body)) return WeReadHighlight::RefreshResult::Failed;
+
+  constexpr size_t kCookieSize = 896;
+  constexpr size_t kUrlSize = 512;
+  constexpr size_t kReadSize = 1024;
+  constexpr size_t kResponseSize = 1024;
+  // 与拉取划线相同：这些缓冲不进 8KB 阅读栈，请求结束就释放。
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(kCookieSize + kUrlSize + kReadSize + kResponseSize);
+  if (!buffer) {
+    LOG_ERR("WR", "OOM: %u-byte highlight delete buffers",
+            static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize + kResponseSize));
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  char* cookie = reinterpret_cast<char*>(buffer.get());
+  char* url = cookie + kCookieSize;
+  uint8_t* readBuffer = buffer.get() + kCookieSize + kUrlSize;
+  uint8_t* response = readBuffer + kReadSize;
+  cookie[0] = '\0';
+  url[0] = '\0';
+
+  DeleteBuf ctx;
+  ctx.data = response;
+  ctx.capacity = kResponseSize;
+  ResponseSink sink{&ctx, deleteReset, deleteFeed, deleteFinish, Error::Protocol};
+  const Error error = requestOnce("POST", "/web/book/removeBookmark", reinterpret_cast<const uint8_t*>(body),
+                                  static_cast<size_t>(bodyLength), &session, nullptr, sink, ctx.status, cookie,
+                                  kCookieSize, url, kUrlSize, readBuffer, kReadSize, nullptr);
+  if (error != Error::Ok || !WeReadHighlight::removalSucceeded(response, ctx.len)) {
+    LOG_ERR("WR", "highlight delete failed: status=%d error=%u", ctx.status, static_cast<unsigned>(error));
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  if (!WeReadStore::saveSession(session)) {
+    LOG_ERR("WR", "highlight delete succeeded but failed to save the session");
+  }
+  if (!WeReadHighlight::removeMine(bookId, bookmarkId)) {
+    LOG_ERR("WR", "highlight deleted on the server but the local index was kept");
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  return WeReadHighlight::RefreshResult::Updated;
+}
+
 }  // namespace WeReadClient
 
 namespace WeReadHighlight {
 
 RefreshResult refreshMine(const char* bookId) { return WeReadClient::refreshMineFromBookmarkList(bookId); }
+
+RefreshResult deleteMine(const char* bookId, const char* bookmarkId) {
+  return WeReadClient::deleteMineFromBookmarkList(bookId, bookmarkId);
+}
 
 }  // namespace WeReadHighlight
 

@@ -110,6 +110,80 @@ bool loadChapter(const char* bookId, const uint32_t chapterUid, Range* ranges, c
   return true;
 }
 
+bool loadChapterMarks(const char* bookId, const uint32_t chapterUid, ChapterMark* marks, const size_t capacity,
+                      size_t& count, bool& truncated) {
+  count = 0;
+  truncated = false;
+  if (!marks || capacity == 0) return false;
+  const std::string path = indexPath(bookId);
+  if (path.empty() || !Storage.exists(path.c_str())) return true;
+
+  HalFile file;
+  Header header;
+  if (!Storage.openFileForRead("WR", path, file) ||
+      file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
+      header.version != kVersion || header.recordSize != sizeof(Mark) || header.count > kMaxRecords ||
+      file.fileSize64() != sizeof(Header) + static_cast<uint64_t>(header.count) * sizeof(Mark)) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < header.count; ++i) {
+    Mark mark;
+    if (file.read(&mark, sizeof(mark)) != static_cast<int>(sizeof(mark))) return false;
+    if (mark.chapterUid != chapterUid || (mark.flags & Mine) == 0 || mark.rangeEnd <= mark.rangeStart ||
+        !mark.bookmarkId[0]) {
+      continue;
+    }
+    if (count >= capacity) {
+      truncated = true;
+      continue;
+    }
+    strncpy(marks[count].bookmarkId, mark.bookmarkId, sizeof(marks[count].bookmarkId) - 1);
+    marks[count].bookmarkId[sizeof(marks[count].bookmarkId) - 1] = '\0';
+    marks[count].start = mark.rangeStart;
+    marks[count].end = mark.rangeEnd;
+    ++count;
+  }
+  return true;
+}
+
+bool removeMine(const char* bookId, const char* bookmarkId) {
+  if (!bookId || !bookId[0] || !bookmarkId || !bookmarkId[0]) return false;
+  const std::string path = indexPath(bookId);
+  HalFile file;
+  Header header;
+  if (path.empty() || !Storage.openFileForRead("WR", path, file) ||
+      file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
+      header.version != kVersion || header.recordSize != sizeof(Mark) || header.count > kMaxRecords ||
+      file.fileSize64() != sizeof(Header) + static_cast<uint64_t>(header.count) * sizeof(Mark)) {
+    return false;
+  }
+
+  Writer writer;
+  if (!writer.begin(bookId)) return false;
+  bool removed = false;
+  for (uint32_t i = 0; i < header.count; ++i) {
+    Mark mark;
+    if (file.read(&mark, sizeof(mark)) != static_cast<int>(sizeof(mark))) {
+      writer.abort();
+      return false;
+    }
+    if (!removed && strcmp(mark.bookmarkId, bookmarkId) == 0) {
+      removed = true;
+      continue;
+    }
+    if (!writer.append(mark)) {
+      writer.abort();
+      return false;
+    }
+  }
+  if (!removed) {
+    writer.abort();
+    return false;
+  }
+  return writer.finish(header.syncKey, header.bookVersion, header.ownerVid);
+}
+
 bool Writer::begin(const char* bookId) {
   abort();
   std::string directory;
@@ -445,6 +519,109 @@ void BookmarkListImporter::finishRecord(State& state) {
   }
   state.inRecord = false;
   state.recordDepth = -1;
+}
+
+namespace {
+
+struct RemovalParse {
+  int depth = 0;
+  int errorCode = 0;
+  bool sawSucc = false;
+  bool succ = false;
+  bool rootClosed = false;
+  enum class Field : uint8_t { None, Error, Succ } field = Field::None;
+};
+
+void removalKey(void* raw, const char* key, size_t) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  if (key && (strcmp(key, "errcode") == 0 || strcmp(key, "errCode") == 0)) {
+    state.field = RemovalParse::Field::Error;
+  } else if (key && strcmp(key, "succ") == 0) {
+    state.field = RemovalParse::Field::Succ;
+  } else {
+    state.field = RemovalParse::Field::None;
+  }
+}
+
+void removalNumber(void* raw, const char* value, const size_t len) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  if (state.field == RemovalParse::Field::Error) {
+    char number[24] = {};
+    if (value && len < sizeof(number)) {
+      memcpy(number, value, len);
+      state.errorCode = atoi(number);
+    }
+  } else if (state.field == RemovalParse::Field::Succ) {
+    state.sawSucc = true;
+    state.succ = WeReadProtocol::parseUint32OrZero(value, len) != 0;
+  }
+  state.field = RemovalParse::Field::None;
+}
+
+void removalBool(void* raw, const bool value) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  if (state.field == RemovalParse::Field::Succ) {
+    state.sawSucc = true;
+    state.succ = value;
+  }
+  state.field = RemovalParse::Field::None;
+}
+
+void removalIgnore(void* raw) { static_cast<RemovalParse*>(raw)->field = RemovalParse::Field::None; }
+
+void removalObjectStart(void* raw) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  ++state.depth;
+  state.field = RemovalParse::Field::None;
+}
+
+void removalObjectEnd(void* raw) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  if (state.depth == 1) state.rootClosed = true;
+  if (state.depth > 0) --state.depth;
+  state.field = RemovalParse::Field::None;
+}
+
+void removalArrayStart(void* raw) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  ++state.depth;
+  state.field = RemovalParse::Field::None;
+}
+
+void removalArrayEnd(void* raw) {
+  auto& state = *static_cast<RemovalParse*>(raw);
+  if (state.depth > 0) --state.depth;
+  state.field = RemovalParse::Field::None;
+}
+
+}  // namespace
+
+bool removalSucceeded(const uint8_t* json, const size_t len) {
+  if (!json && len != 0) return false;
+  auto state = makeUniqueNoThrow<RemovalParse>();
+  if (!state) {
+    LOG_ERR("WR", "OOM: highlight removal parser");
+    return false;
+  }
+  JsonCallbacks callbacks{};
+  callbacks.ctx = state.get();
+  callbacks.onKey = &removalKey;
+  callbacks.onString = &removalNumber;
+  callbacks.onNumber = &removalNumber;
+  callbacks.onBool = &removalBool;
+  callbacks.onNull = &removalIgnore;
+  callbacks.onObjectStart = &removalObjectStart;
+  callbacks.onObjectEnd = &removalObjectEnd;
+  callbacks.onArrayStart = &removalArrayStart;
+  callbacks.onArrayEnd = &removalArrayEnd;
+  // 词法缓冲 2KB，不放进调用方栈。解析完即释放。
+  auto parser = makeUniqueNoThrow<StreamingJsonParser>(callbacks);
+  if (!parser) {
+    LOG_ERR("WR", "OOM: highlight removal JSON parser (%zu bytes)", sizeof(StreamingJsonParser));
+    return false;
+  }
+  parser->feed(reinterpret_cast<const char*>(json), len);
+  return !parser->hasError() && state->rootClosed && state->errorCode == 0 && state->sawSucc && state->succ;
 }
 
 bool replaceMineFromBookmarkList(const char* bookId, const char* ownerVid, const uint8_t* json, const size_t len) {

@@ -1543,4 +1543,31 @@ TEST_F(WeReadStoreTest, ReplacesHighlightIndexFromBookmarkListAndKeepsItWhenTheP
   EXPECT_TRUE(WeReadHighlight::clearAll());
 }
 
+TEST_F(WeReadStoreTest, RemovesOneHighlightAndKeepsTheRest) {
+  const char* json =
+      R"({"updated":[{"bookmarkId":"m1","chapterUid":301,"range":"10-18","type":1},{"bookmarkId":"m3","chapterUid":301,"range":"40-44","type":1}]})";
+  ASSERT_TRUE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid", reinterpret_cast<const uint8_t*>(json),
+                                                           strlen(json)));
+  EXPECT_FALSE(WeReadHighlight::removeMine(kBrowseBook, "missing"));
+  ASSERT_TRUE(WeReadHighlight::removeMine(kBrowseBook, "m1"));
+
+  WeReadHighlight::ChapterMark marks[4];
+  size_t count = 0;
+  bool truncated = true;
+  ASSERT_TRUE(WeReadHighlight::loadChapterMarks(kBrowseBook, 301, marks, 4, count, truncated));
+  ASSERT_EQ(count, 1U);
+  EXPECT_STREQ(marks[0].bookmarkId, "m3");
+  EXPECT_EQ(marks[0].start, 40U);
+  EXPECT_EQ(marks[0].end, 44U);
+
+  const char* ok = R"({"data":{"succ":1}})";
+  EXPECT_TRUE(
+      WeReadHighlight::removalSucceeded(reinterpret_cast<const uint8_t*>(ok), strlen(ok)));
+  const char* expired = R"({"errcode":-2012})";
+  EXPECT_FALSE(WeReadHighlight::removalSucceeded(reinterpret_cast<const uint8_t*>(expired), strlen(expired)));
+  const char* rejected = R"({"data":{"succ":0}})";
+  EXPECT_FALSE(WeReadHighlight::removalSucceeded(reinterpret_cast<const uint8_t*>(rejected), strlen(rejected)));
+  EXPECT_TRUE(WeReadHighlight::clearAll());
+}
+
 }  // namespace

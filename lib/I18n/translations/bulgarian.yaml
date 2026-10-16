@@ -300,6 +300,8 @@ STR_REMAP_FRONT_BUTTONS: "Преназначаване на предните б�
 STR_BOOKMARKS: "Отметки"
 STR_BOOKMARK_ADDED: "Отметката е добавена."
 STR_BOOKMARK_REMOVED: "Отметката е премахната."
+STR_WEREAD_HIGHLIGHT_REMOVED: "Highlight removed."
+STR_WEREAD_HIGHLIGHT_REMOVE_FAILED: "Couldn't remove the highlight."
 STR_OPDS_BROWSER: "OPDS браузър"
 STR_SEARCH: "Търсене"
 STR_COVER_CUSTOM: "Корица + Персонализиран"

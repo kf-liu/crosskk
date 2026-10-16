@@ -45,6 +45,12 @@ struct Range {
   uint32_t end = 0;
 };
 
+struct ChapterMark {
+  char bookmarkId[32] = {};
+  uint32_t start = 0;
+  uint32_t end = 0;
+};
+
 bool parseRange(const char* text, uint32_t& start, uint32_t& end);
 bool parseChapterUid(const char* text, uint32_t& chapterUid);
 bool rangesOverlap(uint32_t start, uint32_t end, uint32_t otherStart, uint32_t otherEnd);
@@ -93,10 +99,19 @@ bool replaceMineFromBookmarkList(const char* bookId, const char* ownerVid, const
 // 已有网络且已登录时拉取一次「我的划线」。不打开 Wi-Fi。失败时保留上一份 marks.bin。
 RefreshResult refreshMine(const char* bookId);
 
+// 从已有索引里去掉一条划线。找不到或写失败时不替换原文件。
+bool removeMine(const char* bookId, const char* bookmarkId);
+// 解析 removeBookmark 的响应。succ 为 1 且没有错误码才算成功。
+bool removalSucceeded(const uint8_t* json, size_t len);
+// 已有网络时删除服务器上的划线，成功后再改本地索引。不打开 Wi-Fi。
+RefreshResult deleteMine(const char* bookId, const char* bookmarkId);
+
 std::string indexPath(const char* bookId);
 bool clearAll();
 bool loadChapter(const char* bookId, uint32_t chapterUid, Range* ranges, size_t capacity, size_t& count,
                  bool& truncated);
+bool loadChapterMarks(const char* bookId, uint32_t chapterUid, ChapterMark* marks, size_t capacity, size_t& count,
+                      bool& truncated);
 
 class Writer {
  public:
