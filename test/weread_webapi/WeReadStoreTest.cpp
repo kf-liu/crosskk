@@ -327,6 +327,58 @@ TEST_F(WeReadStoreTest, MapsGeneratedVisibleOffsetsToRawXhtmlUtf16Coordinates) {
   EXPECT_FALSE(WeReadXhtmlCodec::nativeToVisibleOffset(path, 51, rejected));
 }
 
+TEST_F(WeReadStoreTest, AlignsRenderedWordsAcrossParagraphWhitespace) {
+  const std::string bookDir = WeReadStore::bookDirectory("align-words-book");
+  ASSERT_TRUE(Storage.ensureDirectoryExists((bookDir + "/chapters").c_str()));
+  const std::string path = WeReadStore::chapterPath(bookDir, 0);
+  std::ofstream chapter(hostPath(path.c_str()), std::ios::binary);
+  ASSERT_TRUE(chapter.good());
+  // Two newlines and two spaces sit between the paragraphs. The reader counts
+  // them as visible offsets and does not store them in page words.
+  chapter << "<html><body><!--wr-co:0-->\n  <p><!--wr-co:10-->你好&amp;</p><!--wr-co:14-->\n"
+             "<!--wr-co:16-->\n  <p><!--wr-co:30-->世界</p><!--wr-co:34--></body></html>";
+  chapter.close();
+
+  struct Ctx {
+    const char* words[3];
+    size_t count = 0;
+    size_t index = 0;
+    uint32_t starts[3] = {};
+    uint16_t spans[3] = {};
+  } ctx;
+  ctx.words[0] = "你好";
+  ctx.words[1] = "&";
+  ctx.words[2] = "世界";
+  ctx.count = 3;
+  auto nextWord = [](void* raw) -> const char* {
+    auto* job = static_cast<Ctx*>(raw);
+    if (job->index >= job->count) return nullptr;
+    return job->words[job->index++];
+  };
+  auto onWord = [](const uint32_t start, const uint16_t span, void* raw) {
+    auto* job = static_cast<Ctx*>(raw);
+    const size_t at = job->index - 1;
+    job->starts[at] = start;
+    job->spans[at] = span;
+  };
+  ASSERT_TRUE(WeReadXhtmlCodec::alignRenderedWords(path, 0, nextWord, onWord, &ctx));
+  EXPECT_EQ(ctx.index, 3U);
+  EXPECT_EQ(ctx.starts[0], 3U);
+  EXPECT_EQ(ctx.spans[0], 2U);
+  EXPECT_EQ(ctx.starts[1], 5U);
+  EXPECT_EQ(ctx.spans[1], 1U);
+  EXPECT_EQ(ctx.starts[2], 10U);
+  EXPECT_EQ(ctx.spans[2], 2U);
+
+  Ctx second;
+  second.words[0] = "世界";
+  second.count = 1;
+  ASSERT_TRUE(WeReadXhtmlCodec::alignRenderedWords(path, 10, nextWord, onWord, &second));
+  EXPECT_EQ(second.index, 1U);
+  EXPECT_EQ(second.starts[0], 10U);
+  EXPECT_EQ(second.spans[0], 2U);
+}
+
 TEST_F(WeReadStoreTest, KeepsUtf8CodepointsIntactAcrossSanitizerReadBoundaries) {
   const std::string bookDir = WeReadStore::bookDirectory("utf8-boundary-book");
   ASSERT_TRUE(Storage.ensureDirectoryExists((bookDir + "/chapters").c_str()));

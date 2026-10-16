@@ -20,6 +20,85 @@ bool isUtf8Continuation(const uint8_t value) { return (value & 0xC0) == 0x80; }
 
 uint32_t utf16Width(const uint8_t utf8Lead) { return utf8Lead >= 0xF0 && utf8Lead <= 0xF4 ? 2U : 1U; }
 
+uint8_t utf8SequenceLength(const uint8_t lead) {
+  if (lead < 0x80) return 1;
+  if ((lead & 0xE0) == 0xC0) return 2;
+  if ((lead & 0xF0) == 0xE0) return 3;
+  if (lead >= 0xF0 && lead <= 0xF4) return 4;
+  return 1;
+}
+
+uint32_t decodeUtf8(const uint8_t* bytes, const uint8_t length) {
+  if (!bytes || length == 0) return 0xFFFD;
+  if (length == 1) return bytes[0];
+  if (length == 2) return (static_cast<uint32_t>(bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
+  if (length == 3) {
+    return (static_cast<uint32_t>(bytes[0] & 0x0F) << 12) | (static_cast<uint32_t>(bytes[1] & 0x3F) << 6) |
+           (bytes[2] & 0x3F);
+  }
+  if (length == 4) {
+    return (static_cast<uint32_t>(bytes[0] & 0x07) << 18) | (static_cast<uint32_t>(bytes[1] & 0x3F) << 12) |
+           (static_cast<uint32_t>(bytes[2] & 0x3F) << 6) | (bytes[3] & 0x3F);
+  }
+  return 0xFFFD;
+}
+
+bool decodeEntityCodepoint(const char* token, uint32_t& codepoint) {
+  if (!token || !token[0]) return false;
+  if (strcmp(token, "amp") == 0) {
+    codepoint = '&';
+    return true;
+  }
+  if (strcmp(token, "lt") == 0) {
+    codepoint = '<';
+    return true;
+  }
+  if (strcmp(token, "gt") == 0) {
+    codepoint = '>';
+    return true;
+  }
+  if (strcmp(token, "quot") == 0) {
+    codepoint = '"';
+    return true;
+  }
+  if (strcmp(token, "apos") == 0) {
+    codepoint = '\'';
+    return true;
+  }
+  if (strcmp(token, "nbsp") == 0) {
+    codepoint = 0x00A0;
+    return true;
+  }
+  const bool hex = token[0] == '#' && (token[1] == 'x' || token[1] == 'X');
+  const bool decimal = token[0] == '#' && token[1] >= '0' && token[1] <= '9';
+  if (!hex && !decimal) return false;
+  uint32_t value = 0;
+  for (const char* cursor = token + (hex ? 2 : 1); *cursor; ++cursor) {
+    uint32_t digit = 0;
+    if (hex) {
+      if (*cursor >= '0' && *cursor <= '9') {
+        digit = static_cast<uint32_t>(*cursor - '0');
+      } else if (*cursor >= 'a' && *cursor <= 'f') {
+        digit = static_cast<uint32_t>(*cursor - 'a' + 10);
+      } else if (*cursor >= 'A' && *cursor <= 'F') {
+        digit = static_cast<uint32_t>(*cursor - 'A' + 10);
+      } else {
+        return false;
+      }
+      if (value > 0x10FFFF / 16) return false;
+      value = value * 16 + digit;
+    } else {
+      if (*cursor < '0' || *cursor > '9') return false;
+      digit = static_cast<uint32_t>(*cursor - '0');
+      if (value > (0x10FFFF - digit) / 10) return false;
+      value = value * 10 + digit;
+    }
+  }
+  if (value == 0 || value > 0x10FFFF) return false;
+  codepoint = value;
+  return true;
+}
+
 bool equalsIgnoreCase(const char* value, const size_t length, const char* expected) {
   if (!value || !expected || strlen(expected) != length) return false;
   for (size_t i = 0; i < length; ++i) {
@@ -339,6 +418,11 @@ class SourceOffsetResolver {
   SourceOffsetResolver(const uint32_t* targets, uint32_t* outputs, const size_t count)
       : direction_(SourceOffsetDirection::NativeToVisible), targets_(targets), outputs_(outputs), count_(count) {}
 
+  void setCodepointHandler(void (*handler)(uint32_t codepoint, uint32_t visibleOffset, void* context), void* context) {
+    onCodepoint_ = handler;
+    codepointContext_ = context;
+  }
+
   bool feed(const uint8_t* data, const size_t length) {
     if (!data) return false;
     for (size_t i = 0; i < length && !invalid_; ++i) consume(data[i]);
@@ -381,6 +465,13 @@ class SourceOffsetResolver {
     found_ = true;
   }
 
+  void abandonUtf8() {
+    if (onCodepoint_ && utf8Expected_ > 1 && utf8Filled_ < utf8Expected_) {
+      onCodepoint_(0xFFFD, utf8VisibleOffset_, codepointContext_);
+    }
+    utf8Expected_ = 0;
+  }
+
   void consume(const uint8_t value) {
     switch (state_) {
       case State::Text:
@@ -397,6 +488,7 @@ class SourceOffsetResolver {
 
   void consumeText(const uint8_t value) {
     if (value == '<') {
+      abandonUtf8();
       previousWasCarriageReturn_ = false;
       state_ = State::Tag;
       tokenLength_ = 0;
@@ -405,13 +497,23 @@ class SourceOffsetResolver {
     }
     if (!insideBody_) return;
     if (value == '&') {
+      abandonUtf8();
       previousWasCarriageReturn_ = false;
       state_ = State::Entity;
       tokenLength_ = 0;
       tokenOverflow_ = false;
       return;
     }
-    if (isUtf8Continuation(value)) return;
+    if (isUtf8Continuation(value)) {
+      if (onCodepoint_ && utf8Expected_ > 1 && utf8Filled_ < utf8Expected_ && utf8Filled_ < sizeof(utf8Bytes_)) {
+        utf8Bytes_[utf8Filled_++] = value;
+        if (utf8Filled_ == utf8Expected_) {
+          onCodepoint_(decodeUtf8(utf8Bytes_, utf8Filled_), utf8VisibleOffset_, codepointContext_);
+          utf8Expected_ = 0;
+        }
+      }
+      return;
+    }
     if (value == '\n' && previousWasCarriageReturn_) {
       if (hasMarker_) {
         if (direction_ == SourceOffsetDirection::NativeToVisible) {
@@ -422,7 +524,20 @@ class SourceOffsetResolver {
       previousWasCarriageReturn_ = false;
       return;
     }
+    abandonUtf8();
+    const uint32_t visibleAt = visibleOffset_;
     onVisibleCodepoint(utf16Width(value));
+    if (onCodepoint_) {
+      const uint8_t length = utf8SequenceLength(value);
+      if (length <= 1) {
+        onCodepoint_(value, visibleAt, codepointContext_);
+      } else {
+        utf8Bytes_[0] = value;
+        utf8Filled_ = 1;
+        utf8Expected_ = length;
+        utf8VisibleOffset_ = visibleAt;
+      }
+    }
     previousWasCarriageReturn_ = value == '\r';
   }
 
@@ -445,7 +560,13 @@ class SourceOffsetResolver {
       token_[tokenLength_] = '\0';
       // Entities are bounded by source markers, so only advance the visible
       // coordinate. The following marker supplies the next native offset.
+      const uint32_t visibleAt = visibleOffset_;
       onVisibleCodepoint(0);
+      if (onCodepoint_) {
+        uint32_t codepoint = 0xFFFD;
+        if (!decodeEntityCodepoint(token_, codepoint)) codepoint = 0xFFFD;
+        onCodepoint_(codepoint, visibleAt, codepointContext_);
+      }
       state_ = State::Text;
       return;
     }
@@ -548,6 +669,12 @@ class SourceOffsetResolver {
   bool found_ = false;
   bool invalid_ = false;
   bool previousWasCarriageReturn_ = false;
+  void (*onCodepoint_)(uint32_t codepoint, uint32_t visibleOffset, void* context) = nullptr;
+  void* codepointContext_ = nullptr;
+  uint8_t utf8Bytes_[4] = {};
+  uint8_t utf8Expected_ = 0;
+  uint8_t utf8Filled_ = 0;
+  uint32_t utf8VisibleOffset_ = 0;
 };
 
 bool resolveSourceOffset(const std::string& path, const SourceOffsetDirection direction, const uint32_t input,
@@ -575,6 +702,158 @@ bool mapSortedNativeOffsets(const std::string& path, const uint32_t* sorted, uin
     if (countRead <= 0 || !resolver.feed(buffer.data(), static_cast<size_t>(countRead))) return false;
   }
   return resolver.finishMapped();
+}
+
+enum class AlignPhase : uint8_t { BeforePage, BetweenWords, InWord, Failed, Done };
+
+struct AlignJob {
+  uint32_t pageStart = 0;
+  const char* (*nextWord)(void*) = nullptr;
+  void (*onWord)(uint32_t, uint16_t, void*) = nullptr;
+  void* context = nullptr;
+  AlignPhase phase = AlignPhase::BeforePage;
+  const unsigned char* word = nullptr;
+  uint32_t wordStart = 0;
+  uint16_t span = 0;
+};
+
+bool peekWord(const AlignJob& job, uint32_t& codepoint) {
+  if (!job.word || !*job.word) return false;
+  const uint8_t length = utf8SequenceLength(*job.word);
+  uint8_t bytes[4] = {};
+  for (uint8_t i = 0; i < length; ++i) {
+    if (!job.word[i]) return false;
+    bytes[i] = job.word[i];
+  }
+  codepoint = decodeUtf8(bytes, length);
+  return codepoint != 0;
+}
+
+void consumeWordCodepoint(AlignJob& job) {
+  if (!job.word || !*job.word) return;
+  const uint8_t length = utf8SequenceLength(*job.word);
+  for (uint8_t i = 0; i < length && *job.word; ++i) ++job.word;
+}
+
+bool isRenderedGap(const uint32_t codepoint) {
+  return codepoint == ' ' || codepoint == '\t' || codepoint == '\n' || codepoint == '\r';
+}
+
+bool sameRenderedCodepoint(const uint32_t wordCodepoint, const uint32_t fileCodepoint) {
+  if (wordCodepoint == fileCodepoint) return true;
+  // The reader stores a no-break space as an ordinary space word.
+  return wordCodepoint == ' ' && (fileCodepoint == 0x00A0 || fileCodepoint == 0x202F);
+}
+
+bool isUncountedMark(const uint32_t codepoint) { return codepoint == 0x2003 || codepoint == 0x00AD; }
+
+void finishAlignedWord(AlignJob& job) {
+  if (job.onWord) job.onWord(job.wordStart, job.span, job.context);
+  job.word = nullptr;
+  job.span = 0;
+}
+
+bool startAlignedWord(AlignJob& job) {
+  if (!job.nextWord) return false;
+  const char* word = job.nextWord(job.context);
+  while (word && !word[0]) word = job.nextWord(job.context);
+  if (!word) return false;
+  job.word = reinterpret_cast<const unsigned char*>(word);
+  job.span = 0;
+  return true;
+}
+
+void acceptAlignCodepoint(AlignJob& job, const uint32_t codepoint, const uint32_t offset) {
+  for (int spin = 0; spin < 4; ++spin) {
+    switch (job.phase) {
+      case AlignPhase::BeforePage:
+      case AlignPhase::Failed:
+      case AlignPhase::Done:
+        return;
+      case AlignPhase::BetweenWords:
+        if (isRenderedGap(codepoint)) return;
+        if (!startAlignedWord(job)) {
+          job.phase = AlignPhase::Done;
+          return;
+        }
+        job.phase = AlignPhase::InWord;
+        continue;
+      case AlignPhase::InWord: {
+        uint32_t pending = 0;
+        while (peekWord(job, pending) && isUncountedMark(pending) && !sameRenderedCodepoint(pending, codepoint)) {
+          consumeWordCodepoint(job);
+        }
+        if (!peekWord(job, pending)) {
+          finishAlignedWord(job);
+          job.phase = AlignPhase::BetweenWords;
+          continue;
+        }
+        consumeWordCodepoint(job);
+        if (!sameRenderedCodepoint(pending, codepoint)) {
+          job.phase = AlignPhase::Failed;
+          return;
+        }
+        if (job.span == 0) job.wordStart = offset;
+        if (job.span == UINT16_MAX) {
+          job.phase = AlignPhase::Failed;
+          return;
+        }
+        ++job.span;
+        if (!peekWord(job, pending)) {
+          finishAlignedWord(job);
+          job.phase = AlignPhase::BetweenWords;
+        }
+        return;
+      }
+    }
+  }
+  job.phase = AlignPhase::Failed;
+}
+
+void onAlignCodepoint(const uint32_t codepoint, const uint32_t offset, void* raw) {
+  auto* job = static_cast<AlignJob*>(raw);
+  if (!job) return;
+  switch (job->phase) {
+    case AlignPhase::BeforePage:
+      if (offset < job->pageStart) return;
+      if (offset > job->pageStart) {
+        job->phase = AlignPhase::Failed;
+        return;
+      }
+      job->phase = AlignPhase::BetweenWords;
+      acceptAlignCodepoint(*job, codepoint, offset);
+      return;
+    case AlignPhase::BetweenWords:
+    case AlignPhase::InWord:
+      acceptAlignCodepoint(*job, codepoint, offset);
+      return;
+    case AlignPhase::Failed:
+    case AlignPhase::Done:
+      return;
+  }
+}
+
+bool alignRenderedWordsInFile(const std::string& path, const uint32_t pageVisibleStart,
+                              const char* (*nextWord)(void* context),
+                              void (*onWord)(uint32_t start, uint16_t span, void* context), void* context) {
+  if (path.empty() || !nextWord || !onWord) return false;
+  HalFile file;
+  if (!Storage.openFileForRead("WR", path, file)) return false;
+  AlignJob job;
+  job.pageStart = pageVisibleStart;
+  job.nextWord = nextWord;
+  job.onWord = onWord;
+  job.context = context;
+  // A target that never matches keeps the resolver counting every visible codepoint.
+  SourceOffsetResolver resolver(SourceOffsetDirection::VisibleToNative, UINT32_MAX);
+  resolver.setCodepointHandler(onAlignCodepoint, &job);
+  // One reader render task. The 128-byte read buffer stays off the 8KB stack.
+  static std::array<uint8_t, 128> buffer{};
+  while (file.available() && job.phase != AlignPhase::Failed && job.phase != AlignPhase::Done) {
+    const int countRead = file.read(buffer.data(), buffer.size());
+    if (countRead <= 0 || !resolver.feed(buffer.data(), static_cast<size_t>(countRead))) return false;
+  }
+  return job.phase != AlignPhase::Failed;
 }
 
 }  // namespace
@@ -733,6 +1012,12 @@ bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffse
   if (!mapSortedNativeOffsets(path, ordered, mapped, count)) return false;
   for (size_t i = 0; i < count; ++i) visibleOffsets[order[i]] = mapped[i];
   return true;
+}
+
+bool alignRenderedWords(const std::string& path, const uint32_t pageVisibleStart,
+                        const char* (*nextWord)(void* context),
+                        void (*onWord)(uint32_t start, uint16_t span, void* context), void* context) {
+  return alignRenderedWordsInFile(path, pageVisibleStart, nextWord, onWord, context);
 }
 
 }  // namespace WeReadXhtmlCodec

@@ -21,4 +21,12 @@ bool nativeToVisibleOffset(const std::string& path, uint32_t nativeOffset, uint3
 bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffsets, uint32_t* visibleOffsets,
                             size_t count);
 
+// Page words omit the ASCII whitespace the reader still counts in visible offsets.
+// Walks the chapter once. nextWord returns the next rendered word, or nullptr at
+// the end of the page. onWord reports that word's visible start and length.
+// Returns false when the chapter cannot be read. A later mismatch stops the walk;
+// words already reported stay aligned.
+bool alignRenderedWords(const std::string& path, uint32_t pageVisibleStart, const char* (*nextWord)(void* context),
+                        void (*onWord)(uint32_t start, uint16_t span, void* context), void* context);
+
 }  // namespace WeReadXhtmlCodec

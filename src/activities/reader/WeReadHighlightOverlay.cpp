@@ -17,20 +17,32 @@
 namespace WeReadHighlightOverlay {
 namespace {
 
-uint32_t visibleCodepoints(const char* text) {
+uint32_t countCodepoints(const char* text) {
   if (!text) return 0;
   const unsigned char* cursor = reinterpret_cast<const unsigned char*>(text);
   uint32_t count = 0;
-  bool leadingIndent = true;
   while (*cursor) {
-    const uint32_t codepoint = utf8NextCodepoint(&cursor);
-    if (codepoint == 0) break;
-    if (leadingIndent && codepoint == 0x2003) continue;
-    leadingIndent = false;
-    if (codepoint == 0x00AD) continue;
+    if (utf8NextCodepoint(&cursor) == 0) break;
     ++count;
   }
   return count;
+}
+
+bool copyCodepoints(const char* text, const uint32_t skip, const uint32_t take, char* dest, const size_t destSize) {
+  if (!text || !dest || destSize == 0) return false;
+  const unsigned char* cursor = reinterpret_cast<const unsigned char*>(text);
+  for (uint32_t i = 0; i < skip; ++i) {
+    if (!*cursor || utf8NextCodepoint(&cursor) == 0) return false;
+  }
+  const unsigned char* begin = cursor;
+  for (uint32_t i = 0; i < take; ++i) {
+    if (!*cursor || utf8NextCodepoint(&cursor) == 0) return false;
+  }
+  const size_t bytes = static_cast<size_t>(cursor - begin);
+  if (bytes + 1 > destSize) return false;
+  memcpy(dest, begin, bytes);
+  dest[bytes] = '\0';
+  return true;
 }
 
 struct HitSegment {
@@ -50,6 +62,7 @@ struct PageMarks {
   size_t count = 0;
   size_t segmentCount = 0;
   bool valid = false;
+  char chapterPath[128] = {};
   WeReadHighlight::ChapterMark marks[WeReadHighlight::kMaxChapterRanges] = {};
   HitSegment segments[kMaxHitSegments] = {};
 };
@@ -77,6 +90,11 @@ bool mapMarksToPageOffsets(const char* bookId, const uint32_t tocIndex, PageMark
     nativeOffsets[i * 2 + 1] = marks.marks[i].end;
   }
   const std::string path = WeReadStore::chapterPath(WeReadStore::bookDirectory(bookId), tocIndex);
+  if (path.size() >= sizeof(marks.chapterPath)) {
+    marks.chapterPath[0] = '\0';
+  } else {
+    memcpy(marks.chapterPath, path.c_str(), path.size() + 1);
+  }
   if (!WeReadXhtmlCodec::nativeOffsetsToVisible(path, nativeOffsets, visibleOffsets, count * 2)) {
     LOG_ERR("WR", "Highlight ranges could not be mapped onto the chapter");
     return false;
@@ -103,6 +121,7 @@ void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, c
   marks.spineIndex = spineIndex;
   marks.pageOffset = pageOffset;
   marks.bookId[0] = '\0';
+  marks.chapterPath[0] = '\0';
   strncpy(marks.bookId, bookId, sizeof(marks.bookId) - 1);
   if (spineIndex < 0 || spineIndex >= epub.getSpineItemsCount()) return;
 
@@ -138,49 +157,143 @@ void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, c
   marks.valid = true;
 }
 
+struct DrawWalk {
+  GfxRenderer* renderer = nullptr;
+  PageMarks* marks = nullptr;
+  const Page* page = nullptr;
+  int fontId = 0;
+  int xOffset = 0;
+  int yOffset = 0;
+  int ascender = 0;
+  size_t elementIndex = 0;
+  uint16_t wordIndex = 0;
+  const PageLine* line = nullptr;
+  const TextBlock* block = nullptr;
+  const char* word = nullptr;
+  bool accepted = false;
+  uint32_t cursor = 0;
+};
+
+void paintWord(DrawWalk& walk, const uint16_t wordIndex, const uint32_t start, const uint32_t span) {
+  if (!walk.renderer || !walk.marks || !walk.line || !walk.block || !walk.word || span == 0) return;
+  const uint32_t wordEnd = start + span;
+  int coveredIndex = -1;
+  uint32_t overlapStart = start;
+  uint32_t overlapEnd = wordEnd;
+  for (size_t rangeIndex = 0; rangeIndex < walk.marks->count; ++rangeIndex) {
+    const WeReadHighlight::ChapterMark& mark = walk.marks->marks[rangeIndex];
+    if (!WeReadHighlight::rangesOverlap(start, wordEnd, mark.start, mark.end)) continue;
+    coveredIndex = static_cast<int>(rangeIndex);
+    overlapStart = start > mark.start ? start : mark.start;
+    overlapEnd = wordEnd < mark.end ? wordEnd : mark.end;
+    break;
+  }
+  if (coveredIndex < 0 || overlapEnd <= overlapStart) return;
+
+  const int8_t tracking = walk.block->getBlockStyle().characterSpacing;
+  const EpdFontFamily::Style style = walk.block->wordStyle(wordIndex);
+  int prefixWidth = 0;
+  int sliceWidth = 0;
+  const bool wholeWord = overlapStart == start && overlapEnd == wordEnd;
+  if (wholeWord || countCodepoints(walk.word) != span) {
+    sliceWidth = walk.renderer->getTextAdvanceX(walk.fontId, walk.word, style, tracking);
+  } else {
+    // One reader render task. Two slice buffers stay off the 8KB stack.
+    static char prefix[208];
+    static char covered[208];
+    const uint32_t skip = overlapStart - start;
+    const uint32_t take = overlapEnd - start;
+    if (!copyCodepoints(walk.word, 0, skip, prefix, sizeof(prefix)) ||
+        !copyCodepoints(walk.word, 0, take, covered, sizeof(covered))) {
+      sliceWidth = walk.renderer->getTextAdvanceX(walk.fontId, walk.word, style, tracking);
+    } else {
+      prefixWidth = prefix[0] ? walk.renderer->getTextAdvanceX(walk.fontId, prefix, style, tracking) : 0;
+      const int coveredWidth = walk.renderer->getTextAdvanceX(walk.fontId, covered, style, tracking);
+      sliceWidth = coveredWidth - prefixWidth;
+    }
+  }
+  if (sliceWidth <= 0) return;
+
+  const int lineY = walk.line->yPos + walk.yOffset + walk.block->getRubyShift(walk.ascender) + walk.ascender + 2;
+  const int top = walk.line->yPos + walk.yOffset;
+  const int x = walk.line->xPos + walk.xOffset + walk.block->wordXpos(wordIndex) + prefixWidth;
+  walk.renderer->drawLine(x, lineY, x + sliceWidth - 1, lineY, 1, true);
+  if (walk.marks->segmentCount < kMaxHitSegments && top < lineY + 4) {
+    HitSegment& segment = walk.marks->segments[walk.marks->segmentCount++];
+    segment.markIndex = static_cast<uint8_t>(coveredIndex);
+    segment.x = static_cast<int16_t>(x);
+    segment.y = static_cast<int16_t>(top);
+    segment.w = static_cast<int16_t>(sliceWidth);
+    segment.h = static_cast<int16_t>(lineY + 4 - top);
+  }
+}
+
+const char* pullWord(void* raw) {
+  auto* walk = static_cast<DrawWalk*>(raw);
+  if (!walk || !walk->page) return nullptr;
+  walk->accepted = false;
+  while (walk->elementIndex < walk->page->elements.size()) {
+    const auto& element = walk->page->elements[walk->elementIndex];
+    if (!element || element->getTag() != TAG_PageLine) {
+      ++walk->elementIndex;
+      walk->wordIndex = 0;
+      continue;
+    }
+    walk->line = static_cast<const PageLine*>(element.get());
+    walk->block = walk->line->getBlock().get();
+    if (!walk->block || !walk->block->valid() || walk->wordIndex >= walk->block->wordCount()) {
+      ++walk->elementIndex;
+      walk->wordIndex = 0;
+      walk->line = nullptr;
+      walk->block = nullptr;
+      continue;
+    }
+    walk->word = walk->block->wordText(walk->wordIndex);
+    ++walk->wordIndex;
+    return walk->word;
+  }
+  walk->word = nullptr;
+  walk->line = nullptr;
+  walk->block = nullptr;
+  return nullptr;
+}
+
+void acceptWord(const uint32_t start, const uint16_t span, void* raw) {
+  auto* walk = static_cast<DrawWalk*>(raw);
+  if (!walk || walk->wordIndex == 0) return;
+  walk->accepted = true;
+  if (span == 0) return;
+  walk->cursor = start + span;
+  paintWord(*walk, static_cast<uint16_t>(walk->wordIndex - 1), start, span);
+}
+
+void paintFallback(DrawWalk& walk) {
+  if (!walk.word || walk.wordIndex == 0) return;
+  const uint32_t span = countCodepoints(walk.word);
+  paintWord(walk, static_cast<uint16_t>(walk.wordIndex - 1), walk.cursor, span);
+  walk.cursor += span;
+  walk.accepted = true;
+}
+
 void drawRanges(GfxRenderer& renderer, const int fontId, const Page& page, const int xOffset, const int yOffset,
                 PageMarks& marks) {
   marks.segmentCount = 0;
-  const int ascender = renderer.getFontAscenderSize(fontId);
-  uint32_t offset = page.visibleTextOffset;
-  for (const auto& element : page.elements) {
-    if (element->getTag() != TAG_PageLine) continue;
-    const auto& line = static_cast<const PageLine&>(*element);
-    const TextBlock& block = *line.getBlock();
-    if (!block.valid()) continue;
-    const int lineY = line.yPos + yOffset + block.getRubyShift(ascender) + ascender + 2;
-    const int top = line.yPos + yOffset;
-    const int8_t tracking = block.getBlockStyle().characterSpacing;
-    for (uint16_t wordIndex = 0; wordIndex < block.wordCount(); ++wordIndex) {
-      const char* word = block.wordText(wordIndex);
-      const uint32_t length = visibleCodepoints(word);
-      const uint32_t wordEnd = offset + length;
-      int coveredIndex = -1;
-      for (size_t rangeIndex = 0; rangeIndex < marks.count; ++rangeIndex) {
-        if (WeReadHighlight::rangesOverlap(offset, wordEnd, marks.marks[rangeIndex].start,
-                                           marks.marks[rangeIndex].end)) {
-          coveredIndex = static_cast<int>(rangeIndex);
-          break;
-        }
-      }
-      if (coveredIndex >= 0 && length > 0) {
-        const int width = renderer.getTextAdvanceX(fontId, word, block.wordStyle(wordIndex), tracking);
-        if (width > 0) {
-          const int x = line.xPos + xOffset + block.wordXpos(wordIndex);
-          renderer.drawLine(x, lineY, x + width - 1, lineY, 1, true);
-          if (marks.segmentCount < kMaxHitSegments && top < lineY + 4) {
-            HitSegment& segment = marks.segments[marks.segmentCount++];
-            segment.markIndex = static_cast<uint8_t>(coveredIndex);
-            segment.x = static_cast<int16_t>(x);
-            segment.y = static_cast<int16_t>(top);
-            segment.w = static_cast<int16_t>(width);
-            segment.h = static_cast<int16_t>(lineY + 4 - top);
-          }
-        }
-      }
-      offset = wordEnd;
-    }
+  DrawWalk walk;
+  walk.renderer = &renderer;
+  walk.marks = &marks;
+  walk.page = &page;
+  walk.fontId = fontId;
+  walk.xOffset = xOffset;
+  walk.yOffset = yOffset;
+  walk.ascender = renderer.getFontAscenderSize(fontId);
+  walk.cursor = page.visibleTextOffset;
+  // Paragraph breaks are visible offsets but not stored in page words. Aligning
+  // each word to the chapter keeps a highlight from sliding by those gaps.
+  if (marks.chapterPath[0]) {
+    WeReadXhtmlCodec::alignRenderedWords(marks.chapterPath, page.visibleTextOffset, pullWord, acceptWord, &walk);
   }
+  if (walk.word && !walk.accepted) paintFallback(walk);
+  while (pullWord(&walk)) paintFallback(walk);
 }
 
 }  // namespace
