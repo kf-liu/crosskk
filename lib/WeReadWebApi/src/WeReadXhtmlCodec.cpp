@@ -334,7 +334,10 @@ enum class SourceOffsetDirection : uint8_t {
 class SourceOffsetResolver {
  public:
   SourceOffsetResolver(const SourceOffsetDirection direction, const uint32_t target)
-      : direction_(direction), target_(target) {}
+      : direction_(direction), target_(target), targets_(&target_), outputs_(&result_), count_(1) {}
+
+  SourceOffsetResolver(const uint32_t* targets, uint32_t* outputs, const size_t count)
+      : direction_(SourceOffsetDirection::NativeToVisible), targets_(targets), outputs_(outputs), count_(count) {}
 
   bool feed(const uint8_t* data, const size_t length) {
     if (!data) return false;
@@ -350,12 +353,18 @@ class SourceOffsetResolver {
           if (visibleOffset_ == target_) setResult(nativeOffset_);
           break;
         case SourceOffsetDirection::NativeToVisible:
-          if (target_ <= nativeOffset_) setResult(visibleOffset_);
+          while (index_ < count_ && targets_[index_] <= nativeOffset_) recordVisible(visibleOffset_);
           break;
       }
     }
     if (!found_) return false;
     result = result_;
+    return true;
+  }
+
+  bool finishMapped() {
+    if (invalid_ || state_ != State::Text || !hasMarker_) return false;
+    while (index_ < count_ && targets_[index_] <= nativeOffset_) recordVisible(visibleOffset_);
     return true;
   }
 
@@ -405,9 +414,8 @@ class SourceOffsetResolver {
     if (isUtf8Continuation(value)) return;
     if (value == '\n' && previousWasCarriageReturn_) {
       if (hasMarker_) {
-        if (direction_ == SourceOffsetDirection::NativeToVisible && target_ <= nativeOffset_) {
-          setResult(visibleOffset_);
-          return;
+        if (direction_ == SourceOffsetDirection::NativeToVisible) {
+          while (index_ < count_ && targets_[index_] <= nativeOffset_) recordVisible(visibleOffset_);
         }
         ++nativeOffset_;
       }
@@ -489,7 +497,15 @@ class SourceOffsetResolver {
     nativeOffset_ = value;
     lastMarkerOffset_ = value;
     hasMarker_ = true;
-    if (direction_ == SourceOffsetDirection::NativeToVisible && target_ <= value) setResult(visibleOffset_);
+    if (direction_ == SourceOffsetDirection::NativeToVisible) {
+      while (index_ < count_ && targets_[index_] <= value) recordVisible(visibleOffset_);
+    }
+  }
+
+  void recordVisible(const uint32_t visible) {
+    if (!outputs_ || index_ >= count_) return;
+    outputs_[index_++] = visible;
+    if (index_ >= count_) found_ = true;
   }
 
   void onVisibleCodepoint(const uint32_t width) {
@@ -502,9 +518,9 @@ class SourceOffsetResolver {
           }
           break;
         case SourceOffsetDirection::NativeToVisible:
-          if (target_ <= nativeOffset_ || target_ < nativeOffset_ + width) {
-            setResult(visibleOffset_);
-            return;
+          while (index_ < count_ &&
+                 (targets_[index_] <= nativeOffset_ || targets_[index_] < nativeOffset_ + width)) {
+            recordVisible(visibleOffset_);
           }
           break;
       }
@@ -515,6 +531,10 @@ class SourceOffsetResolver {
 
   SourceOffsetDirection direction_;
   uint32_t target_ = 0;
+  const uint32_t* targets_ = nullptr;
+  uint32_t* outputs_ = nullptr;
+  size_t count_ = 0;
+  size_t index_ = 0;
   uint32_t visibleOffset_ = 0;
   uint32_t nativeOffset_ = 0;
   uint32_t lastMarkerOffset_ = 0;
@@ -541,6 +561,20 @@ bool resolveSourceOffset(const std::string& path, const SourceOffsetDirection di
     if (count <= 0 || !resolver.feed(buffer.data(), static_cast<size_t>(count))) return false;
   }
   return resolver.finish(output);
+}
+
+constexpr size_t kMaxNativeOffsetBatch = 256;
+
+bool mapSortedNativeOffsets(const std::string& path, const uint32_t* sorted, uint32_t* outputs, const size_t count) {
+  HalFile file;
+  if (!Storage.openFileForRead("WR", path, file)) return false;
+  SourceOffsetResolver resolver(sorted, outputs, count);
+  std::array<uint8_t, 128> buffer{};
+  while (file.available()) {
+    const int countRead = file.read(buffer.data(), buffer.size());
+    if (countRead <= 0 || !resolver.feed(buffer.data(), static_cast<size_t>(countRead))) return false;
+  }
+  return resolver.finishMapped();
 }
 
 }  // namespace
@@ -676,6 +710,29 @@ bool visibleToNativeOffset(const std::string& path, const uint32_t visibleOffset
 
 bool nativeToVisibleOffset(const std::string& path, const uint32_t nativeOffset, uint32_t& visibleOffset) {
   return resolveSourceOffset(path, SourceOffsetDirection::NativeToVisible, nativeOffset, visibleOffset);
+}
+
+bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffsets, uint32_t* visibleOffsets,
+                            const size_t count) {
+  if (!nativeOffsets || !visibleOffsets || count > kMaxNativeOffsetBatch) return false;
+  if (count == 0) return true;
+  for (size_t i = 0; i < count; ++i) visibleOffsets[i] = UINT32_MAX;
+
+  // One reader render task. Kept off the 8KB stack: 256 offsets are about 1.5KB.
+  static uint32_t ordered[kMaxNativeOffsetBatch];
+  static uint32_t mapped[kMaxNativeOffsetBatch];
+  static uint16_t order[kMaxNativeOffsetBatch];
+  for (size_t i = 0; i < count; ++i) order[i] = static_cast<uint16_t>(i);
+  std::sort(order, order + count, [&](const uint16_t left, const uint16_t right) {
+    return nativeOffsets[left] < nativeOffsets[right];
+  });
+  for (size_t i = 0; i < count; ++i) {
+    ordered[i] = nativeOffsets[order[i]];
+    mapped[i] = UINT32_MAX;
+  }
+  if (!mapSortedNativeOffsets(path, ordered, mapped, count)) return false;
+  for (size_t i = 0; i < count; ++i) visibleOffsets[order[i]] = mapped[i];
+  return true;
 }
 
 }  // namespace WeReadXhtmlCodec

@@ -316,6 +316,12 @@ TEST_F(WeReadStoreTest, MapsGeneratedVisibleOffsetsToRawXhtmlUtf16Coordinates) {
     ASSERT_TRUE(WeReadXhtmlCodec::nativeToVisibleOffset(path, mapping.native, visible));
     EXPECT_EQ(visible, mapping.visible) << "native=" << mapping.native;
   }
+  uint32_t batch[3] = {};
+  const uint32_t batchNative[] = {20, 11, 50};
+  ASSERT_TRUE(WeReadXhtmlCodec::nativeOffsetsToVisible(path, batchNative, batch, 3));
+  EXPECT_EQ(batch[0], 2U);
+  EXPECT_EQ(batch[1], 1U);
+  EXPECT_EQ(batch[2], 6U);
   uint32_t rejected = 0;
   EXPECT_FALSE(WeReadXhtmlCodec::visibleToNativeOffset(path, 7, rejected));
   EXPECT_FALSE(WeReadXhtmlCodec::nativeToVisibleOffset(path, 51, rejected));

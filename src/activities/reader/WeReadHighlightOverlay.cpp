@@ -7,10 +7,12 @@
 #include <Logging.h>
 #include <Utf8.h>
 
+#include <cstdint>
 #include <cstring>
 
 #include "WeReadHighlight.h"
 #include "WeReadStore.h"
+#include "WeReadXhtmlCodec.h"
 
 namespace WeReadHighlightOverlay {
 namespace {
@@ -59,9 +61,38 @@ PageMarks& pageMarks() {
   return marks;
 }
 
-bool samePage(const PageMarks& marks, const char* bookId, const int spineIndex, const uint32_t pageOffset) {
-  return marks.valid && marks.spineIndex == spineIndex && marks.pageOffset == pageOffset &&
-         strncmp(marks.bookId, bookId, sizeof(marks.bookId)) == 0;
+bool sameChapter(const PageMarks& marks, const char* bookId, const int spineIndex) {
+  return marks.valid && marks.spineIndex == spineIndex && strncmp(marks.bookId, bookId, sizeof(marks.bookId)) == 0;
+}
+
+// Bookmark ranges are wr-co offsets in the chapter file. Page text uses the smaller visible
+// offset. Convert once per chapter; the buffers stay off the 8KB reader stack.
+bool mapMarksToPageOffsets(const char* bookId, const uint32_t tocIndex, PageMarks& marks) {
+  if (marks.count == 0) return true;
+  static uint32_t nativeOffsets[WeReadHighlight::kMaxChapterRanges * 2];
+  static uint32_t visibleOffsets[WeReadHighlight::kMaxChapterRanges * 2];
+  const size_t count = marks.count;
+  for (size_t i = 0; i < count; ++i) {
+    nativeOffsets[i * 2] = marks.marks[i].start;
+    nativeOffsets[i * 2 + 1] = marks.marks[i].end;
+  }
+  const std::string path = WeReadStore::chapterPath(WeReadStore::bookDirectory(bookId), tocIndex);
+  if (!WeReadXhtmlCodec::nativeOffsetsToVisible(path, nativeOffsets, visibleOffsets, count * 2)) {
+    LOG_ERR("WR", "Highlight ranges could not be mapped onto the chapter");
+    return false;
+  }
+  size_t kept = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const uint32_t start = visibleOffsets[i * 2];
+    const uint32_t end = visibleOffsets[i * 2 + 1];
+    if (start == UINT32_MAX || end == UINT32_MAX || end <= start) continue;
+    marks.marks[kept] = marks.marks[i];
+    marks.marks[kept].start = start;
+    marks.marks[kept].end = end;
+    ++kept;
+  }
+  marks.count = kept;
+  return true;
 }
 
 void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, const uint32_t pageOffset) {
@@ -99,6 +130,10 @@ void loadPageMarks(const char* bookId, const Epub& epub, const int spineIndex, c
   }
   if (truncated) {
     LOG_DBG("WR", "Highlight overlay kept %u ranges for chapter %u", static_cast<unsigned>(marks.count), chapterUid);
+  }
+  if (!mapMarksToPageOffsets(bookId, tocIndex, marks)) {
+    marks.count = 0;
+    return;
   }
   marks.valid = true;
 }
@@ -154,7 +189,7 @@ void drawForBook(GfxRenderer& renderer, const int fontId, const Page& page, cons
                  const char* bookId, const Epub& epub, const int spineIndex) {
   if (!bookId || !bookId[0]) return;
   PageMarks& marks = pageMarks();
-  if (!samePage(marks, bookId, spineIndex, page.visibleTextOffset)) {
+  if (!sameChapter(marks, bookId, spineIndex)) {
     loadPageMarks(bookId, epub, spineIndex, page.visibleTextOffset);
   }
   if (!marks.valid || marks.count == 0) return;
