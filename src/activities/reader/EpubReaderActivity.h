@@ -99,7 +99,9 @@ class EpubReaderActivity final : public ReaderActivity {
   std::atomic<uint32_t> pendingMissingChineseCodepoint_{0};
   char wereadBookId_[64] = {};
   bool clearInitialProgressAfterSave_ = false;
+  bool highlightRefreshAttempted_ = false;
   bool maybeOfferCompleteChineseFont();
+  void refreshWeReadHighlightsIfNeeded();
 #endif
 
   // Toolbar reader menu (SETTINGS.readerMenuStyle == READER_MENU_TOOLBAR): drawn

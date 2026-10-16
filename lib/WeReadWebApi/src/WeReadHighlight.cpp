@@ -1,10 +1,15 @@
 #include "WeReadHighlight.h"
 
 #include <Logging.h>
+#include <Memory.h>
+#include <StreamingJsonParser.h>
 
+#include "WeReadProtocol.h"
 #include "WeReadStore.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #include "../../../src/util/StringUtils.h"
 
@@ -164,6 +169,292 @@ void Writer::abort() {
   if (!partPath_.empty() && Storage.exists(partPath_.c_str())) Storage.remove(partPath_.c_str());
   count_ = 0;
   truncated_ = false;
+}
+
+namespace {
+
+uint64_t parseUint64(const char* value, const size_t len) {
+  if (!value || len == 0) return 0;
+  uint64_t result = 0;
+  for (size_t i = 0; i < len; ++i) {
+    if (value[i] < '0' || value[i] > '9') return 0;
+    const uint64_t digit = static_cast<uint64_t>(value[i] - '0');
+    if (result > (UINT64_MAX - digit) / 10) return 0;
+    result = result * 10 + digit;
+  }
+  return result;
+}
+
+void copyField(char* destination, const size_t capacity, const char* value, const size_t len) {
+  WeReadProtocol::decodeJsonString(value, len, destination, capacity);
+}
+
+}  // namespace
+
+struct BookmarkListImporter::State {
+  std::unique_ptr<StreamingJsonParser> parser;
+  Writer writer;
+  int depth = 0;
+  int recordsDepth = -1;
+  int recordDepth = -1;
+  bool inRecords = false;
+  bool inRecord = false;
+  bool sawRecords = false;
+  bool sawAnyKey = false;
+  bool rootClosed = false;
+  bool failed = false;
+  int errorCode = 0;
+  uint32_t bookVersion = 0;
+  uint64_t syncKey = 0;
+  bool typeSeen = false;
+  uint8_t type = 0;
+  enum class Field : uint8_t {
+    None,
+    SyncKey,
+    ErrorCode,
+    Records,
+    BookmarkId,
+    ChapterUid,
+    Range,
+    Type,
+    BookVersion,
+  } field = Field::None;
+  char ownerVid[64] = {};
+  char bookmarkId[32] = {};
+  char chapterUid[24] = {};
+  char rangeText[32] = {};
+};
+
+BookmarkListImporter::BookmarkListImporter() : state_(nullptr) {
+  // State 含 2KB JSON 词法缓冲，不能放进阅读任务栈。一次拉取结束即释放。
+  auto state = makeUniqueNoThrow<State>();
+  if (!state) {
+    LOG_ERR("WR", "OOM: highlight importer state (%zu bytes)", sizeof(State));
+    return;
+  }
+  JsonCallbacks callbacks{};
+  callbacks.ctx = state.get();
+  callbacks.onKey = &BookmarkListImporter::onKey;
+  callbacks.onString = &BookmarkListImporter::onString;
+  callbacks.onNumber = &BookmarkListImporter::onNumber;
+  callbacks.onBool = &BookmarkListImporter::onBool;
+  callbacks.onNull = &BookmarkListImporter::onNull;
+  callbacks.onObjectStart = &BookmarkListImporter::onObjectStart;
+  callbacks.onObjectEnd = &BookmarkListImporter::onObjectEnd;
+  callbacks.onArrayStart = &BookmarkListImporter::onArrayStart;
+  callbacks.onArrayEnd = &BookmarkListImporter::onArrayEnd;
+  state->parser = makeUniqueNoThrow<StreamingJsonParser>(callbacks);
+  if (!state->parser) {
+    LOG_ERR("WR", "OOM: highlight JSON parser (%zu bytes)", sizeof(StreamingJsonParser));
+    return;
+  }
+  state_ = state.release();
+}
+
+BookmarkListImporter::~BookmarkListImporter() {
+  if (!state_) return;
+  if (state_->writer.active()) state_->writer.abort();
+  delete state_;
+}
+
+bool BookmarkListImporter::begin(const char* bookId, const char* ownerVid) {
+  if (!state_ || !state_->parser) return false;
+  if (ownerVid && ownerVid[0]) {
+    strncpy(state_->ownerVid, ownerVid, sizeof(state_->ownerVid) - 1);
+    state_->ownerVid[sizeof(state_->ownerVid) - 1] = '\0';
+  } else {
+    state_->ownerVid[0] = '\0';
+  }
+  state_->depth = 0;
+  state_->recordsDepth = -1;
+  state_->recordDepth = -1;
+  state_->inRecords = false;
+  state_->inRecord = false;
+  state_->sawRecords = false;
+  state_->sawAnyKey = false;
+  state_->rootClosed = false;
+  state_->failed = false;
+  state_->errorCode = 0;
+  state_->bookVersion = 0;
+  state_->syncKey = 0;
+  state_->typeSeen = false;
+  state_->type = 0;
+  state_->field = State::Field::None;
+  state_->bookmarkId[0] = '\0';
+  state_->chapterUid[0] = '\0';
+  state_->rangeText[0] = '\0';
+  state_->parser->reset();
+  return state_->writer.begin(bookId);
+}
+
+bool BookmarkListImporter::feed(const uint8_t* data, const size_t len) {
+  if (!state_ || !state_->parser || state_->failed) return false;
+  if (!data && len != 0) return false;
+  state_->parser->feed(reinterpret_cast<const char*>(data), len);
+  return !state_->parser->hasError() && !state_->failed;
+}
+
+bool BookmarkListImporter::finish() {
+  if (!state_ || !state_->parser || !state_->writer.active()) return false;
+  const bool emptyObject = !state_->sawAnyKey && !state_->sawRecords;
+  if (state_->errorCode != 0 || state_->inRecord || !state_->rootClosed || (!state_->sawRecords && !emptyObject) ||
+      state_->parser->hasError() || state_->failed) {
+    state_->writer.abort();
+    return false;
+  }
+  return state_->writer.finish(state_->syncKey, state_->bookVersion, state_->ownerVid);
+}
+
+void BookmarkListImporter::abort() {
+  if (state_) state_->writer.abort();
+}
+
+int BookmarkListImporter::errorCode() const { return state_ ? state_->errorCode : 0; }
+
+void BookmarkListImporter::onKey(void* ctx, const char* key, size_t) {
+  auto& state = *static_cast<State*>(ctx);
+  state.sawAnyKey = true;
+  if (state.depth == 1 && key && strcmp(key, "updated") == 0) {
+    state.field = State::Field::Records;
+  } else if (state.depth == 1 && key && (strcmp(key, "errcode") == 0 || strcmp(key, "errCode") == 0)) {
+    state.field = State::Field::ErrorCode;
+  } else if (state.depth == 1 && key && strcmp(key, "synckey") == 0) {
+    state.field = State::Field::SyncKey;
+  } else if (state.inRecord && key && strcmp(key, "bookmarkId") == 0) {
+    state.field = State::Field::BookmarkId;
+  } else if (state.inRecord && key && strcmp(key, "chapterUid") == 0) {
+    state.field = State::Field::ChapterUid;
+  } else if (state.inRecord && key && strcmp(key, "range") == 0) {
+    state.field = State::Field::Range;
+  } else if (state.inRecord && key && strcmp(key, "type") == 0) {
+    state.field = State::Field::Type;
+  } else if (key && strcmp(key, "bookVersion") == 0) {
+    state.field = State::Field::BookVersion;
+  } else {
+    state.field = State::Field::None;
+  }
+}
+
+void BookmarkListImporter::acceptValue(State& state, const char* value, const size_t len) {
+  switch (state.field) {
+    case State::Field::ErrorCode: {
+      char number[24] = {};
+      if (len < sizeof(number) && value) {
+        memcpy(number, value, len);
+        state.errorCode = atoi(number);
+      }
+      break;
+    }
+    case State::Field::SyncKey:
+      state.syncKey = parseUint64(value, len);
+      break;
+    case State::Field::BookmarkId:
+      copyField(state.bookmarkId, sizeof(state.bookmarkId), value, len);
+      break;
+    case State::Field::ChapterUid:
+      copyField(state.chapterUid, sizeof(state.chapterUid), value, len);
+      break;
+    case State::Field::Range:
+      copyField(state.rangeText, sizeof(state.rangeText), value, len);
+      break;
+    case State::Field::BookVersion:
+      state.bookVersion = WeReadProtocol::parseUint32OrZero(value, len);
+      break;
+    case State::Field::Type: {
+      const uint32_t type = WeReadProtocol::parseUint32OrZero(value, len);
+      state.type = static_cast<uint8_t>(type > 255U ? 255U : type);
+      state.typeSeen = true;
+      break;
+    }
+    case State::Field::None:
+    case State::Field::Records:
+      break;
+  }
+  state.field = State::Field::None;
+}
+
+void BookmarkListImporter::onString(void* ctx, const char* value, const size_t len) {
+  acceptValue(*static_cast<State*>(ctx), value, len);
+}
+
+void BookmarkListImporter::onNumber(void* ctx, const char* value, const size_t len) {
+  acceptValue(*static_cast<State*>(ctx), value, len);
+}
+
+void BookmarkListImporter::onBool(void* ctx, bool) { static_cast<State*>(ctx)->field = State::Field::None; }
+
+void BookmarkListImporter::onNull(void* ctx) { static_cast<State*>(ctx)->field = State::Field::None; }
+
+void BookmarkListImporter::onObjectStart(void* ctx) {
+  auto& state = *static_cast<State*>(ctx);
+  ++state.depth;
+  if (state.inRecords && !state.inRecord && state.depth == state.recordsDepth + 1) startRecord(state);
+  state.field = State::Field::None;
+}
+
+void BookmarkListImporter::onObjectEnd(void* ctx) {
+  auto& state = *static_cast<State*>(ctx);
+  if (state.inRecord && state.depth == state.recordDepth) finishRecord(state);
+  if (state.depth == 1) state.rootClosed = true;
+  if (state.depth > 0) --state.depth;
+  state.field = State::Field::None;
+}
+
+void BookmarkListImporter::onArrayStart(void* ctx) {
+  auto& state = *static_cast<State*>(ctx);
+  ++state.depth;
+  if (state.field == State::Field::Records && !state.inRecords) {
+    state.inRecords = true;
+    state.sawRecords = true;
+    state.recordsDepth = state.depth;
+  }
+  state.field = State::Field::None;
+}
+
+void BookmarkListImporter::onArrayEnd(void* ctx) {
+  auto& state = *static_cast<State*>(ctx);
+  if (state.inRecords && state.depth == state.recordsDepth) {
+    state.inRecords = false;
+    state.recordsDepth = -1;
+  }
+  if (state.depth > 0) --state.depth;
+  state.field = State::Field::None;
+}
+
+void BookmarkListImporter::startRecord(State& state) {
+  state.bookmarkId[0] = '\0';
+  state.chapterUid[0] = '\0';
+  state.rangeText[0] = '\0';
+  state.type = 0;
+  state.typeSeen = false;
+  state.inRecord = true;
+  state.recordDepth = state.depth;
+}
+
+void BookmarkListImporter::finishRecord(State& state) {
+  if (state.typeSeen && state.type == 1 && state.bookmarkId[0] && state.rangeText[0]) {
+    Mark mark;
+    uint32_t chapterUid = 0;
+    if (parseChapterUid(state.chapterUid, chapterUid) && parseRange(state.rangeText, mark.rangeStart, mark.rangeEnd)) {
+      mark.chapterUid = chapterUid;
+      mark.flags = Mine;
+      strncpy(mark.bookmarkId, state.bookmarkId, sizeof(mark.bookmarkId) - 1);
+      mark.bookmarkId[sizeof(mark.bookmarkId) - 1] = '\0';
+      if (!state.writer.append(mark)) state.failed = true;
+    }
+  }
+  state.inRecord = false;
+  state.recordDepth = -1;
+}
+
+bool replaceMineFromBookmarkList(const char* bookId, const char* ownerVid, const uint8_t* json, const size_t len) {
+  BookmarkListImporter importer;
+  if (!importer.begin(bookId, ownerVid)) return false;
+  if (!importer.feed(json, len)) {
+    importer.abort();
+    return false;
+  }
+  return importer.finish();
 }
 
 }  // namespace WeReadHighlight

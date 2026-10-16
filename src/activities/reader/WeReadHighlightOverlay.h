@@ -13,4 +13,7 @@ namespace WeReadHighlightOverlay {
 void drawForBook(GfxRenderer& renderer, int fontId, const Page& page, int xOffset, int yOffset, const char* bookId,
                  const Epub& epub, int spineIndex);
 
+// 划线索引更新后丢掉按页缓存，下一帧重新读 SD。
+void invalidate();
+
 }  // namespace WeReadHighlightOverlay

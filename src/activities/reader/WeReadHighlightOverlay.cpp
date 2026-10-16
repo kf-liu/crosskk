@@ -137,4 +137,6 @@ void drawForBook(GfxRenderer& renderer, const int fontId, const Page& page, cons
   drawRanges(renderer, fontId, page, xOffset, yOffset, marks.ranges, marks.count);
 }
 
+void invalidate() { pageMarks().valid = false; }
+
 }  // namespace WeReadHighlightOverlay

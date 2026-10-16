@@ -4245,6 +4245,92 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
   return fail(Error::Protocol);
 }
 
+namespace {
+
+struct HighlightFetchCtx {
+  WeReadHighlight::BookmarkListImporter* importer = nullptr;
+  int status = 0;
+};
+
+bool highlightFetchReset(void*) { return true; }
+
+bool highlightFetchFeed(void* raw, const uint8_t* data, const size_t len) {
+  auto* ctx = static_cast<HighlightFetchCtx*>(raw);
+  return ctx && ctx->importer && ctx->importer->feed(data, len);
+}
+
+bool highlightFetchFinish(void* raw) {
+  auto* ctx = static_cast<HighlightFetchCtx*>(raw);
+  if (!ctx || !ctx->importer) return false;
+  if (ctx->status != 200) {
+    ctx->importer->abort();
+    return false;
+  }
+  return ctx->importer->finish();
+}
+
+}  // namespace
+
+WeReadHighlight::RefreshResult refreshMineFromBookmarkList(const char* bookId) {
+  // 不在这里打开 Wi-Fi。离线或未登录时保留已有 marks.bin，等网络已连通后再拉一次。
+  if (!bookId || !bookId[0]) return WeReadHighlight::RefreshResult::Failed;
+  if (!WeReadHttpClient::networkReady()) return WeReadHighlight::RefreshResult::Skipped;
+
+  WeReadStore::Session session;
+  if (!WeReadStore::loadSession(session) || !session.valid()) return WeReadHighlight::RefreshResult::Skipped;
+
+  auto importer = makeUniqueNoThrow<WeReadHighlight::BookmarkListImporter>();
+  if (!importer) {
+    LOG_ERR("WR", "OOM: highlight importer");
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  if (!importer->begin(bookId, session.vid)) return WeReadHighlight::RefreshResult::Failed;
+
+  // 与浏览请求同一套上限：cookie 896、URL 512。读缓冲只服务这一次 GET。
+  constexpr size_t kCookieSize = 896;
+  constexpr size_t kUrlSize = 512;
+  constexpr size_t kReadSize = 1024;
+  // 阅读任务栈只有 8KB，cookie、URL 和读缓冲不能再压进去。函数返回前释放。
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(kCookieSize + kUrlSize + kReadSize);
+  if (!buffer) {
+    LOG_ERR("WR", "OOM: %u-byte highlight request buffers", static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize));
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  char* cookie = reinterpret_cast<char*>(buffer.get());
+  char* url = cookie + kCookieSize;
+  uint8_t* readBuffer = buffer.get() + kCookieSize + kUrlSize;
+  cookie[0] = '\0';
+  url[0] = '\0';
+
+  char encodedBookId[192];
+  if (!WeReadProtocol::urlEncode(bookId, encodedBookId, sizeof(encodedBookId))) {
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  char path[256];
+  const int length = snprintf(path, sizeof(path), "/web/book/bookmarklist?bookId=%s", encodedBookId);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(path)) return WeReadHighlight::RefreshResult::Failed;
+
+  HighlightFetchCtx ctx;
+  ctx.importer = importer.get();
+  ResponseSink sink{&ctx, highlightFetchReset, highlightFetchFeed, highlightFetchFinish, Error::Protocol};
+  const Error error = requestOnce("GET", path, nullptr, 0, &session, nullptr, sink, ctx.status, cookie, kCookieSize,
+                                  url, kUrlSize, readBuffer, kReadSize, nullptr);
+  if (error != Error::Ok) {
+    LOG_ERR("WR", "highlight refresh failed: status=%d error=%u", ctx.status, static_cast<unsigned>(error));
+    return WeReadHighlight::RefreshResult::Failed;
+  }
+  if (!WeReadStore::saveSession(session)) {
+    LOG_ERR("WR", "highlight refresh wrote marks but failed to save the session");
+  }
+  return WeReadHighlight::RefreshResult::Updated;
+}
+
 }  // namespace WeReadClient
+
+namespace WeReadHighlight {
+
+RefreshResult refreshMine(const char* bookId) { return WeReadClient::refreshMineFromBookmarkList(bookId); }
+
+}  // namespace WeReadHighlight
 
 #endif

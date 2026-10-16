@@ -1507,4 +1507,40 @@ TEST_F(WeReadStoreTest, StoresMyHighlightRangesAndReplacesThemOnTheNextSnapshot)
   EXPECT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
 }
 
+TEST_F(WeReadStoreTest, ReplacesHighlightIndexFromBookmarkListAndKeepsItWhenThePayloadIsBad) {
+  const char* json =
+      R"({"synckey":9,"book":{"bookVersion":4},"updated":[{"bookmarkId":"m1","chapterUid":301,"range":"10-18","type":1},{"bookmarkId":"m2","chapterUid":302,"range":"0-2","type":0},{"bookmarkId":"m3","chapterUid":"301","range":"40-44","type":1}],"removed":["old"]})";
+  ASSERT_TRUE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid", reinterpret_cast<const uint8_t*>(json),
+                                                           strlen(json)));
+
+  WeReadHighlight::Range ranges[4];
+  size_t count = 0;
+  bool truncated = true;
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
+  ASSERT_EQ(count, 2U);
+  EXPECT_EQ(ranges[0].start, 10U);
+  EXPECT_EQ(ranges[0].end, 18U);
+  EXPECT_EQ(ranges[1].start, 40U);
+  EXPECT_EQ(ranges[1].end, 44U);
+
+  const char* broken = "{";
+  EXPECT_FALSE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid",
+                                                             reinterpret_cast<const uint8_t*>(broken), strlen(broken)));
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
+  EXPECT_EQ(count, 2U);
+
+  const char* expired = R"({"errcode":-2012})";
+  EXPECT_FALSE(WeReadHighlight::replaceMineFromBookmarkList(
+      kBrowseBook, "vid", reinterpret_cast<const uint8_t*>(expired), strlen(expired)));
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
+  EXPECT_EQ(count, 2U);
+
+  const char* empty = R"({"updated":[]})";
+  ASSERT_TRUE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid", reinterpret_cast<const uint8_t*>(empty),
+                                                            strlen(empty)));
+  ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
+  EXPECT_EQ(count, 0U);
+  EXPECT_TRUE(WeReadHighlight::clearAll());
+}
+
 }  // namespace

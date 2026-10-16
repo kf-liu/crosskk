@@ -60,6 +60,8 @@
 #include "util/ReadingBackground.h"
 #include "util/ReadingGuideLine.h"
 #ifdef ENABLE_CHINESE_VERSION
+#include <WeReadHighlight.h>
+#include <WeReadHttpClient.h>
 #include <WeReadStore.h>
 
 #include "activities/apps/weread/WeReadProgressSyncActivity.h"
@@ -328,6 +330,25 @@ void EpubReaderActivity::onExit() {
 #endif
 }
 
+#ifdef ENABLE_CHINESE_VERSION
+void EpubReaderActivity::refreshWeReadHighlightsIfNeeded() {
+  if (highlightRefreshAttempted_ || wereadBookId_[0] == '\0') return;
+  if (!WeReadHttpClient::networkReady()) return;
+  highlightRefreshAttempted_ = true;
+  switch (WeReadHighlight::refreshMine(wereadBookId_)) {
+    case WeReadHighlight::RefreshResult::Updated:
+      WeReadHighlightOverlay::invalidate();
+      requestUpdate();
+      break;
+    case WeReadHighlight::RefreshResult::Failed:
+      LOG_ERR("WR", "Highlight refresh failed; keeping the previous cache");
+      break;
+    case WeReadHighlight::RefreshResult::Skipped:
+      break;
+  }
+}
+#endif
+
 bool EpubReaderActivity::loadBook() {
   auto loadedEpub = makeUniqueNoThrow<Epub>(bookPath, "/.crosspoint");
   if (!loadedEpub) {
@@ -387,6 +408,7 @@ bool EpubReaderActivity::loadBook() {
       }
     }
   }
+  refreshWeReadHighlightsIfNeeded();
 #endif
   bool hasSavedProgress = false;
 
@@ -707,6 +729,7 @@ void EpubReaderActivity::loop() {
 
 #ifdef ENABLE_CHINESE_VERSION
   if (maybeOfferCompleteChineseFont()) return;
+  refreshWeReadHighlightsIfNeeded();
 #endif
 
   READING_STATS.tickActiveSession();
