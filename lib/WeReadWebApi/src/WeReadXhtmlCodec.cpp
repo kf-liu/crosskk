@@ -856,6 +856,83 @@ bool alignRenderedWordsInFile(const std::string& path, const uint32_t pageVisibl
   return job.phase != AlignPhase::Failed;
 }
 
+struct CopyJob {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  char* dest = nullptr;
+  size_t capacity = 0;
+  size_t used = 0;
+  bool failed = false;
+  bool done = false;
+};
+
+bool appendUtf8(CopyJob& job, const uint32_t codepoint) {
+  unsigned char bytes[4];
+  int count = 0;
+  if (codepoint < 0x80) {
+    bytes[0] = static_cast<unsigned char>(codepoint);
+    count = 1;
+  } else if (codepoint < 0x800) {
+    bytes[0] = static_cast<unsigned char>(0xC0 | (codepoint >> 6));
+    bytes[1] = static_cast<unsigned char>(0x80 | (codepoint & 0x3F));
+    count = 2;
+  } else if (codepoint < 0x10000) {
+    bytes[0] = static_cast<unsigned char>(0xE0 | (codepoint >> 12));
+    bytes[1] = static_cast<unsigned char>(0x80 | ((codepoint >> 6) & 0x3F));
+    bytes[2] = static_cast<unsigned char>(0x80 | (codepoint & 0x3F));
+    count = 3;
+  } else if (codepoint <= 0x10FFFF) {
+    bytes[0] = static_cast<unsigned char>(0xF0 | (codepoint >> 18));
+    bytes[1] = static_cast<unsigned char>(0x80 | ((codepoint >> 12) & 0x3F));
+    bytes[2] = static_cast<unsigned char>(0x80 | ((codepoint >> 6) & 0x3F));
+    bytes[3] = static_cast<unsigned char>(0x80 | (codepoint & 0x3F));
+    count = 4;
+  } else {
+    return false;
+  }
+  if (job.used + static_cast<size_t>(count) + 1 > job.capacity) return false;
+  memcpy(job.dest + job.used, bytes, static_cast<size_t>(count));
+  job.used += static_cast<size_t>(count);
+  job.dest[job.used] = '\0';
+  return true;
+}
+
+void onCopyCodepoint(const uint32_t codepoint, const uint32_t offset, void* raw) {
+  auto* job = static_cast<CopyJob*>(raw);
+  if (!job || job->failed || job->done) return;
+  if (offset < job->start) return;
+  if (offset >= job->end) {
+    job->done = true;
+    return;
+  }
+  if (codepoint == ' ' || codepoint == '\t' || codepoint == '\n' || codepoint == '\r' || codepoint == 0) return;
+  if (!appendUtf8(*job, codepoint)) job->done = true;
+}
+
+bool copyVisibleTextInFile(const std::string& path, const uint32_t start, const uint32_t end, char* dest,
+                           const size_t destSize, size_t& written) {
+  written = 0;
+  if (path.empty() || !dest || destSize < 2 || end <= start) return false;
+  dest[0] = '\0';
+  HalFile file;
+  if (!Storage.openFileForRead("WR", path, file)) return false;
+  CopyJob job;
+  job.start = start;
+  job.end = end;
+  job.dest = dest;
+  job.capacity = destSize;
+  SourceOffsetResolver resolver(SourceOffsetDirection::VisibleToNative, UINT32_MAX);
+  resolver.setCodepointHandler(onCopyCodepoint, &job);
+  static std::array<uint8_t, 128> buffer{};
+  while (file.available() && !job.failed && !job.done) {
+    const int countRead = file.read(buffer.data(), buffer.size());
+    if (countRead <= 0 || !resolver.feed(buffer.data(), static_cast<size_t>(countRead))) return false;
+  }
+  if (job.failed) return false;
+  written = job.used;
+  return true;
+}
+
 }  // namespace
 
 bool writeLiteral(HalFile& output, const char* text) {
@@ -1018,6 +1095,11 @@ bool alignRenderedWords(const std::string& path, const uint32_t pageVisibleStart
                         const char* (*nextWord)(void* context),
                         void (*onWord)(uint32_t start, uint16_t span, void* context), void* context) {
   return alignRenderedWordsInFile(path, pageVisibleStart, nextWord, onWord, context);
+}
+
+bool copyVisibleText(const std::string& path, const uint32_t start, const uint32_t end, char* dest,
+                     const size_t destSize, size_t& written) {
+  return copyVisibleTextInFile(path, start, end, dest, destSize, written);
 }
 
 }  // namespace WeReadXhtmlCodec

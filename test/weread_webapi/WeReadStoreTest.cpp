@@ -377,6 +377,13 @@ TEST_F(WeReadStoreTest, AlignsRenderedWordsAcrossParagraphWhitespace) {
   EXPECT_EQ(second.index, 1U);
   EXPECT_EQ(second.starts[0], 10U);
   EXPECT_EQ(second.spans[0], 2U);
+
+  char text[32] = {};
+  size_t written = 0;
+  ASSERT_TRUE(WeReadXhtmlCodec::copyVisibleText(path, 3, 6, text, sizeof(text), written));
+  EXPECT_STREQ(text, "你好&");
+  ASSERT_TRUE(WeReadXhtmlCodec::copyVisibleText(path, 10, 12, text, sizeof(text), written));
+  EXPECT_STREQ(text, "世界");
 }
 
 TEST_F(WeReadStoreTest, KeepsUtf8CodepointsIntactAcrossSanitizerReadBoundaries) {
@@ -1631,6 +1638,39 @@ TEST_F(WeReadStoreTest, RemovesOneHighlightAndKeepsTheRest) {
   EXPECT_FALSE(WeReadHighlight::removalSucceeded(reinterpret_cast<const uint8_t*>(expired), strlen(expired)));
   const char* rejected = R"({"data":{"succ":0}})";
   EXPECT_FALSE(WeReadHighlight::removalSucceeded(reinterpret_cast<const uint8_t*>(rejected), strlen(rejected)));
+  EXPECT_TRUE(WeReadHighlight::clearAll());
+}
+
+TEST_F(WeReadStoreTest, AppendsOneHighlightWithoutDroppingTheRest) {
+  const char* json =
+      R"({"book":{"bookVersion":4},"updated":[{"bookmarkId":"m1","chapterUid":301,"range":"10-18","type":1}]})";
+  ASSERT_TRUE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid", reinterpret_cast<const uint8_t*>(json),
+                                                           strlen(json)));
+  WeReadHighlight::Mark mark;
+  strncpy(mark.bookmarkId, "new1", sizeof(mark.bookmarkId) - 1);
+  mark.chapterUid = 301;
+  mark.rangeStart = 100;
+  mark.rangeEnd = 110;
+  mark.flags = WeReadHighlight::Flag::Mine;
+  ASSERT_TRUE(WeReadHighlight::insertMine(kBrowseBook, mark));
+
+  WeReadHighlight::ChapterMark marks[4];
+  size_t count = 0;
+  bool truncated = true;
+  ASSERT_TRUE(WeReadHighlight::loadChapterMarks(kBrowseBook, 301, marks, 4, count, truncated));
+  ASSERT_EQ(count, 2U);
+  EXPECT_STREQ(marks[1].bookmarkId, "new1");
+  EXPECT_EQ(marks[1].start, 100U);
+  EXPECT_EQ(marks[1].end, 110U);
+
+  char id[32] = {};
+  const char* created = R"({"data":{"bookmarkId":"bm42"}})";
+  ASSERT_TRUE(WeReadHighlight::creationBookmarkId(reinterpret_cast<const uint8_t*>(created), strlen(created), id,
+                                                  sizeof(id)));
+  EXPECT_STREQ(id, "bm42");
+  const char* expired = R"({"errcode":-2012})";
+  EXPECT_FALSE(WeReadHighlight::creationBookmarkId(reinterpret_cast<const uint8_t*>(expired), strlen(expired), id,
+                                                   sizeof(id)));
   EXPECT_TRUE(WeReadHighlight::clearAll());
 }
 

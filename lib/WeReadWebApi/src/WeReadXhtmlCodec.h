@@ -29,4 +29,10 @@ bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffse
 bool alignRenderedWords(const std::string& path, uint32_t pageVisibleStart, const char* (*nextWord)(void* context),
                         void (*onWord)(uint32_t start, uint16_t span, void* context), void* context);
 
+// Copies the visible text in [start, end). ASCII space, tab, and newlines are
+// skipped: the reader counts them, but they are not part of the highlighted words.
+// Returns false when the chapter cannot be read. written is the UTF-8 byte count.
+bool copyVisibleText(const std::string& path, uint32_t start, uint32_t end, char* dest, size_t destSize,
+                     size_t& written);
+
 }  // namespace WeReadXhtmlCodec

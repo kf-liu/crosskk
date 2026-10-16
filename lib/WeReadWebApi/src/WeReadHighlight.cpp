@@ -184,6 +184,41 @@ bool removeMine(const char* bookId, const char* bookmarkId) {
   return writer.finish(header.syncKey, header.bookVersion, header.ownerVid);
 }
 
+bool insertMine(const char* bookId, const Mark& mark) {
+  if (!bookId || !bookId[0] || !mark.bookmarkId[0] || mark.rangeEnd <= mark.rangeStart) return false;
+  const std::string path = indexPath(bookId);
+  Header header;
+  bool haveFile = false;
+  HalFile file;
+  if (!path.empty() && Storage.exists(path.c_str())) {
+    if (!Storage.openFileForRead("WR", path, file) ||
+        file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
+        header.version != kVersion || header.recordSize != sizeof(Mark) || header.count > kMaxRecords ||
+        file.fileSize64() != sizeof(Header) + static_cast<uint64_t>(header.count) * sizeof(Mark)) {
+      return false;
+    }
+    haveFile = true;
+  }
+  if (header.count >= kMaxRecords) return false;
+
+  Writer writer;
+  if (!writer.begin(bookId)) return false;
+  if (haveFile) {
+    for (uint32_t i = 0; i < header.count; ++i) {
+      Mark existing;
+      if (file.read(&existing, sizeof(existing)) != static_cast<int>(sizeof(existing)) || !writer.append(existing)) {
+        writer.abort();
+        return false;
+      }
+    }
+  }
+  if (!writer.append(mark)) {
+    writer.abort();
+    return false;
+  }
+  return writer.finish(header.syncKey, header.bookVersion, header.ownerVid);
+}
+
 bool Writer::begin(const char* bookId) {
   abort();
   std::string directory;
@@ -623,6 +658,70 @@ bool removalSucceeded(const uint8_t* json, const size_t len) {
   }
   parser->feed(reinterpret_cast<const char*>(json), len);
   return !parser->hasError() && state->rootClosed && state->errorCode == 0 && state->sawSucc && state->succ;
+}
+
+namespace {
+
+bool keyAt(const char* text, const size_t len, const size_t at, const char* key) {
+  const size_t keyLen = strlen(key);
+  return at + keyLen <= len && memcmp(text + at, key, keyLen) == 0;
+}
+
+bool jsonErrorCode(const char* text, const size_t len, int& code) {
+  code = 0;
+  for (size_t i = 0; i < len; ++i) {
+    size_t keyLen = 0;
+    if (keyAt(text, len, i, "\"errCode\"")) keyLen = 9;
+    else if (keyAt(text, len, i, "\"errcode\""))
+      keyLen = 9;
+    else
+      continue;
+    size_t j = i + keyLen;
+    while (j < len && (text[j] == ' ' || text[j] == ':')) ++j;
+    if (j >= len) return false;
+    int sign = 1;
+    if (text[j] == '-') {
+      sign = -1;
+      ++j;
+    }
+    if (j >= len || text[j] < '0' || text[j] > '9') return false;
+    int value = 0;
+    while (j < len && text[j] >= '0' && text[j] <= '9') {
+      value = value * 10 + (text[j] - '0');
+      ++j;
+    }
+    code = sign * value;
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+bool creationBookmarkId(const uint8_t* json, const size_t len, char* bookmarkId, const size_t bookmarkIdSize) {
+  if (!json || !bookmarkId || bookmarkIdSize < 2) return false;
+  bookmarkId[0] = '\0';
+  const char* text = reinterpret_cast<const char*>(json);
+  int errorCode = 0;
+  if (jsonErrorCode(text, len, errorCode) && errorCode != 0) return false;
+  constexpr char kKey[] = "\"bookmarkId\"";
+  for (size_t i = 0; i + sizeof(kKey) - 1 < len; ++i) {
+    if (!keyAt(text, len, i, kKey)) continue;
+    size_t j = i + sizeof(kKey) - 1;
+    while (j < len && (text[j] == ' ' || text[j] == ':')) ++j;
+    if (j >= len || text[j] != '"') continue;
+    ++j;
+    size_t written = 0;
+    while (j < len && text[j] != '"') {
+      const unsigned char ch = static_cast<unsigned char>(text[j]);
+      if (ch < 0x20 || ch == '\\' || written + 1 >= bookmarkIdSize || written >= 31) return false;
+      bookmarkId[written++] = text[j++];
+    }
+    if (j >= len || text[j] != '"' || written == 0) return false;
+    bookmarkId[written] = '\0';
+    return true;
+  }
+  return false;
 }
 
 bool replaceMineFromBookmarkList(const char* bookId, const char* ownerVid, const uint8_t* json, const size_t len) {

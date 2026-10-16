@@ -17,14 +17,15 @@ namespace fui = freeink::ui;
 EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                const std::string& title, const int currentPage, const int totalPages,
                                                const int bookProgressPercent, const uint8_t currentOrientation,
-                                               const bool hasFootnotes, const bool hasBookmarks)
+                                               const bool hasFootnotes, const bool hasBookmarks,
+                                               const bool canHighlight)
     : UiListActivity("EpubReaderMenu", renderer, mappedInput, false, true),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
       totalPages(totalPages),
       bookProgressPercent(bookProgressPercent) {
-  buildMenuItems(menuItems, hasFootnotes, hasBookmarks);
+  buildMenuItems(menuItems, hasFootnotes, hasBookmarks, canHighlight);
   buildMenuRowItems();
 }
 
@@ -40,9 +41,13 @@ void EpubReaderMenuActivity::buildMenuRowItems() {
   }
 }
 
-void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, bool hasFootnotes, bool hasBookmarks) {
+void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, const bool hasFootnotes,
+                                            const bool hasBookmarks, const bool canHighlight) {
   items.clear();
   items.reserve(MAX_MENU_ITEMS);
+  if (canHighlight) {
+    items.push_back({MenuAction::HIGHLIGHT, StrId::STR_WEREAD_HIGHLIGHT});
+  }
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});

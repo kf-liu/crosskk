@@ -327,4 +327,217 @@ bool hitBookmark(const int x, const int y, char* bookmarkId, const size_t bookma
 
 void invalidate() { pageMarks().valid = false; }
 
+struct ChapterRef {
+  char path[160] = {};
+  uint32_t uid = 0;
+  uint32_t idx = 0;
+};
+
+bool resolveChapter(const char* bookId, const Epub& epub, const int spineIndex, ChapterRef& out) {
+  out = {};
+  if (!bookId || !bookId[0] || spineIndex < 0 || spineIndex >= epub.getSpineItemsCount()) return false;
+  uint32_t tocIndex = 0;
+  const std::string href = epub.getSpineItem(spineIndex).href;
+  if (!WeReadStore::parseGeneratedChapterHref(href, tocIndex)) return false;
+
+  HalFile toc;
+  uint32_t tocCount = 0;
+  // 目录记录 268 字节，不放进 8KB 阅读栈。一次只有一个阅读任务。
+  static WeReadStore::TocRecord chapter;
+  memset(&chapter, 0, sizeof(chapter));
+  const std::string tocFile = WeReadStore::tocPath(bookId);
+  if (!WeReadStore::openToc(tocFile, toc, tocCount) || tocIndex >= tocCount ||
+      !WeReadStore::readTocRecord(toc, tocIndex, chapter)) {
+    return false;
+  }
+  if (!WeReadHighlight::parseChapterUid(chapter.chapterUid, out.uid)) return false;
+  out.idx = chapter.chapterIdx;
+  const std::string path = WeReadStore::chapterPath(WeReadStore::bookDirectory(bookId), tocIndex);
+  if (path.empty() || path.size() >= sizeof(out.path)) return false;
+  memcpy(out.path, path.c_str(), path.size() + 1);
+  return true;
+}
+
+struct WordWalk {
+  GfxRenderer* renderer = nullptr;
+  const Page* page = nullptr;
+  int fontId = 0;
+  int xOffset = 0;
+  int yOffset = 0;
+  int ascender = 0;
+  int lineHeight = 0;
+  size_t elementIndex = 0;
+  uint16_t wordIndex = 0;
+  const PageLine* line = nullptr;
+  const TextBlock* block = nullptr;
+  const char* word = nullptr;
+  bool accepted = false;
+  uint32_t cursor = 0;
+  WordPlace place = WordPlace::AtPoint;
+  int hitX = 0;
+  int hitY = 0;
+  uint32_t paintStart = 0;
+  uint32_t paintEnd = 0;
+  bool painting = false;
+  bool found = false;
+  uint32_t foundStart = 0;
+  uint16_t foundSpan = 0;
+};
+
+const char* pullLocatedWord(void* raw) {
+  auto* walk = static_cast<WordWalk*>(raw);
+  if (!walk || !walk->page) return nullptr;
+  walk->accepted = false;
+  while (walk->elementIndex < walk->page->elements.size()) {
+    const auto& element = walk->page->elements[walk->elementIndex];
+    if (!element || element->getTag() != TAG_PageLine) {
+      ++walk->elementIndex;
+      walk->wordIndex = 0;
+      continue;
+    }
+    walk->line = static_cast<const PageLine*>(element.get());
+    walk->block = walk->line->getBlock().get();
+    if (!walk->block || !walk->block->valid() || walk->wordIndex >= walk->block->wordCount()) {
+      ++walk->elementIndex;
+      walk->wordIndex = 0;
+      walk->line = nullptr;
+      walk->block = nullptr;
+      continue;
+    }
+    walk->word = walk->block->wordText(walk->wordIndex);
+    ++walk->wordIndex;
+    return walk->word;
+  }
+  walk->word = nullptr;
+  walk->line = nullptr;
+  walk->block = nullptr;
+  return nullptr;
+}
+
+void noteWord(WordWalk& walk, const uint16_t wordIndex, const uint32_t start, const uint16_t span) {
+  if (!walk.renderer || !walk.line || !walk.block || !walk.word || span == 0) return;
+  const int8_t tracking = walk.block->getBlockStyle().characterSpacing;
+  const EpdFontFamily::Style style = walk.block->wordStyle(wordIndex);
+  const int width = walk.renderer->getTextAdvanceX(walk.fontId, walk.word, style, tracking);
+  if (width <= 0) return;
+  const int x = walk.line->xPos + walk.xOffset + walk.block->wordXpos(wordIndex);
+  const int y = walk.line->yPos + walk.yOffset;
+  const int height = walk.lineHeight > 0 ? walk.lineHeight : walk.ascender + 4;
+  const uint32_t wordEnd = start + span;
+
+  if (walk.painting) {
+    if (!WeReadHighlight::rangesOverlap(start, wordEnd, walk.paintStart, walk.paintEnd)) return;
+    const int lineY = y + walk.block->getRubyShift(walk.ascender) + walk.ascender + 2;
+    walk.renderer->drawLine(x, lineY, x + width - 1, lineY, 1, true);
+    return;
+  }
+  if (walk.place == WordPlace::AtPoint) {
+    if (walk.hitX < x || walk.hitX >= x + width || walk.hitY < y || walk.hitY >= y + height) return;
+    walk.found = true;
+    walk.foundStart = start;
+    walk.foundSpan = span;
+    return;
+  }
+  if (walk.place == WordPlace::FirstOnPage) {
+    if (walk.found) return;
+    walk.found = true;
+    walk.foundStart = start;
+    walk.foundSpan = span;
+    return;
+  }
+  if (walk.place == WordPlace::LastOnPage) {
+    walk.found = true;
+    walk.foundStart = start;
+    walk.foundSpan = span;
+  }
+}
+
+void acceptLocatedWord(const uint32_t start, const uint16_t span, void* raw) {
+  auto* walk = static_cast<WordWalk*>(raw);
+  if (!walk || walk->wordIndex == 0) return;
+  walk->accepted = true;
+  if (span == 0) return;
+  walk->cursor = start + span;
+  if (walk->place == WordPlace::AtPoint && walk->found) return;
+  noteWord(*walk, static_cast<uint16_t>(walk->wordIndex - 1), start, span);
+}
+
+void fallbackLocatedWord(WordWalk& walk) {
+  if (!walk.word || walk.wordIndex == 0) return;
+  const uint32_t span = countCodepoints(walk.word);
+  if (span == 0 || span > UINT16_MAX) return;
+  noteWord(walk, static_cast<uint16_t>(walk.wordIndex - 1), walk.cursor, static_cast<uint16_t>(span));
+  walk.cursor += span;
+  walk.accepted = true;
+}
+
+void walkPageWords(WordWalk& walk, const char* chapterPath) {
+  walk.cursor = walk.page ? walk.page->visibleTextOffset : 0;
+  if (chapterPath && chapterPath[0]) {
+    WeReadXhtmlCodec::alignRenderedWords(chapterPath, walk.cursor, pullLocatedWord, acceptLocatedWord, &walk);
+  }
+  if (walk.word && !walk.accepted && !(walk.found && !walk.painting && walk.place != WordPlace::LastOnPage)) {
+    fallbackLocatedWord(walk);
+  }
+  const auto done = [&walk]() { return walk.found && !walk.painting && walk.place != WordPlace::LastOnPage; };
+  while (!done() && pullLocatedWord(&walk)) fallbackLocatedWord(walk);
+}
+
+bool wordOnPage(GfxRenderer& renderer, const int fontId, const Page& page, const int xOffset, const int yOffset,
+                const char* bookId, const Epub& epub, const int spineIndex, const WordPlace place, const int x,
+                const int y, uint32_t& visibleStart, uint16_t& span) {
+  ChapterRef chapter;
+  if (!resolveChapter(bookId, epub, spineIndex, chapter)) return false;
+  WordWalk walk;
+  walk.renderer = &renderer;
+  walk.page = &page;
+  walk.fontId = fontId;
+  walk.xOffset = xOffset;
+  walk.yOffset = yOffset;
+  walk.ascender = renderer.getFontAscenderSize(fontId);
+  walk.lineHeight = renderer.getLineHeight(fontId);
+  walk.place = place;
+  walk.hitX = x;
+  walk.hitY = y;
+  walkPageWords(walk, chapter.path);
+  if (!walk.found || walk.foundSpan == 0) return false;
+  visibleStart = walk.foundStart;
+  span = walk.foundSpan;
+  return true;
+}
+
+void drawSelection(GfxRenderer& renderer, const int fontId, const Page& page, const int xOffset, const int yOffset,
+                   const char* bookId, const Epub& epub, const int spineIndex, const uint32_t visibleStart,
+                   const uint32_t visibleEnd) {
+  if (visibleEnd <= visibleStart) return;
+  ChapterRef chapter;
+  if (!resolveChapter(bookId, epub, spineIndex, chapter)) return;
+  WordWalk walk;
+  walk.renderer = &renderer;
+  walk.page = &page;
+  walk.fontId = fontId;
+  walk.xOffset = xOffset;
+  walk.yOffset = yOffset;
+  walk.ascender = renderer.getFontAscenderSize(fontId);
+  walk.lineHeight = renderer.getLineHeight(fontId);
+  walk.paintStart = visibleStart;
+  walk.paintEnd = visibleEnd;
+  walk.painting = true;
+  walkPageWords(walk, chapter.path);
+}
+
+bool chapterFile(const char* bookId, const Epub& epub, const int spineIndex, char* path, const size_t pathSize,
+                 uint32_t& chapterUid, uint32_t& chapterIdx) {
+  if (!path || pathSize < 2) return false;
+  path[0] = '\0';
+  ChapterRef chapter;
+  if (!resolveChapter(bookId, epub, spineIndex, chapter)) return false;
+  const size_t length = strlen(chapter.path);
+  if (length + 1 > pathSize) return false;
+  memcpy(path, chapter.path, length + 1);
+  chapterUid = chapter.uid;
+  chapterIdx = chapter.idx;
+  return true;
+}
+
 }  // namespace WeReadHighlightOverlay

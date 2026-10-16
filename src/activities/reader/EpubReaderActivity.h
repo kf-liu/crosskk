@@ -18,6 +18,7 @@
 #include "ReaderFontPreview.h"
 #include "ReaderPageCache.h"
 #include "ReaderToolbarUi.h"
+#include "WeReadHighlightOverlay.h"
 #include "components/OptionPopup.h"
 
 class EpubReaderActivity final : public ReaderActivity {
@@ -100,16 +101,47 @@ class EpubReaderActivity final : public ReaderActivity {
   char wereadBookId_[64] = {};
   bool clearInitialProgressAfterSave_ = false;
   bool highlightRefreshAttempted_ = false;
-  enum class HighlightNotice : uint8_t { None, Removed, Failed };
+  enum class HighlightNotice : uint8_t { None, Removed, Failed, Added, AddFailed };
+  enum class HighlightSelectPhase : uint8_t { Idle, AwaitStart, AwaitEnd, Confirm };
   HighlightNotice highlightNotice_ = HighlightNotice::None;
   unsigned long highlightNoticeTime_ = 0;
   bool highlightSheetOpen_ = false;
   char highlightBookmarkId_[32] = {};
+  HighlightSelectPhase highlightSelectPhase_ = HighlightSelectPhase::Idle;
+  int highlightAnchorSpine_ = -1;
+  uint32_t highlightAnchor_ = 0;
+  uint16_t highlightAnchorSpan_ = 0;
+  uint32_t highlightPoint_ = 0;
+  uint16_t highlightPointSpan_ = 0;
+  bool highlightPointSet_ = false;
+  bool highlightDragging_ = false;
+  bool highlightTouchTracking_ = false;
+  bool highlightTouchPassed_ = false;
+  bool highlightExtendOnTurn_ = false;
+  bool highlightEdgeArmed_ = false;
+  bool highlightStoppedAtChapter_ = false;
+  unsigned long highlightHoldSince_ = 0;
+  int highlightHoldX_ = 0;
+  int highlightHoldY_ = 0;
+  unsigned long highlightEdgeSince_ = 0;
+  int highlightEdgeDir_ = 0;
   bool maybeOfferCompleteChineseFont();
   void refreshWeReadHighlightsIfNeeded();
   bool handleWeReadHighlightSheet();
   bool handleWeReadHighlightTap();
   void removeOpenWeReadHighlight();
+  void beginWeReadHighlightSelect();
+  void cancelWeReadHighlightSelect();
+  bool highlightSelectionBounds(uint32_t& start, uint32_t& end) const;
+  bool currentPageWord(WeReadHighlightOverlay::WordPlace place, int x, int y, uint32_t& start, uint16_t& span);
+  void setHighlightPoint(uint32_t start, uint16_t span);
+  void openWeReadHighlightConfirm();
+  void submitWeReadHighlight();
+  bool highlightAllowsPageTurn(bool forward);
+  void extendWeReadHighlightAfterTurn(bool forward);
+  void holdWeReadHighlightEdge(int y);
+  bool handleWeReadHighlightSelect();
+  const char* highlightNoticeText() const;
 #endif
 
   // Toolbar reader menu (SETTINGS.readerMenuStyle == READER_MENU_TOOLBAR): drawn

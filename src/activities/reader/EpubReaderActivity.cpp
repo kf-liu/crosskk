@@ -354,6 +354,11 @@ bool EpubReaderActivity::handleWeReadHighlightSheet() {
   if (!overlayPopup.isActive()) {
     highlightSheetOpen_ = false;
     highlightBookmarkId_[0] = '\0';
+    // 点外面或返回只关掉确认框，划线选择还在。
+    if (highlightSelectPhase_ == HighlightSelectPhase::Confirm) {
+      highlightSelectPhase_ = HighlightSelectPhase::AwaitEnd;
+      requestUpdate();
+    }
   }
   return true;
 }
@@ -371,6 +376,341 @@ void EpubReaderActivity::removeOpenWeReadHighlight() {
       break;
   }
   highlightNoticeTime_ = millis();
+}
+
+void EpubReaderActivity::beginWeReadHighlightSelect() {
+  highlightSelectPhase_ = HighlightSelectPhase::AwaitStart;
+  highlightAnchorSpine_ = -1;
+  highlightAnchor_ = 0;
+  highlightAnchorSpan_ = 0;
+  highlightPoint_ = 0;
+  highlightPointSpan_ = 0;
+  highlightPointSet_ = false;
+  highlightDragging_ = false;
+  highlightTouchTracking_ = false;
+  highlightTouchPassed_ = false;
+  highlightExtendOnTurn_ = false;
+  highlightEdgeArmed_ = false;
+  highlightStoppedAtChapter_ = false;
+  highlightEdgeDir_ = 0;
+  automaticPageTurnActive = false;
+  highlightNotice_ = HighlightNotice::None;
+  requestUpdate();
+}
+
+void EpubReaderActivity::cancelWeReadHighlightSelect() {
+  highlightSelectPhase_ = HighlightSelectPhase::Idle;
+  highlightAnchorSpan_ = 0;
+  highlightPointSet_ = false;
+  highlightDragging_ = false;
+  highlightTouchTracking_ = false;
+  highlightTouchPassed_ = false;
+  highlightExtendOnTurn_ = false;
+  highlightEdgeArmed_ = false;
+  highlightStoppedAtChapter_ = false;
+  highlightEdgeDir_ = 0;
+}
+
+bool EpubReaderActivity::highlightSelectionBounds(uint32_t& start, uint32_t& end) const {
+  if (highlightAnchorSpan_ == 0) return false;
+  const uint32_t anchorEnd = highlightAnchor_ + highlightAnchorSpan_;
+  if (!highlightPointSet_) {
+    start = highlightAnchor_;
+    end = anchorEnd;
+    return end > start;
+  }
+  const uint32_t pointEnd = highlightPoint_ + highlightPointSpan_;
+  start = highlightAnchor_ < highlightPoint_ ? highlightAnchor_ : highlightPoint_;
+  end = anchorEnd > pointEnd ? anchorEnd : pointEnd;
+  return end > start;
+}
+
+bool EpubReaderActivity::currentPageWord(const WeReadHighlightOverlay::WordPlace place, const int x, const int y,
+                                         uint32_t& start, uint16_t& span) {
+  if (!section || !epub || section->pageCount <= 0 || section->currentPage < 0 ||
+      section->currentPage >= section->pageCount) {
+    return false;
+  }
+  const auto page = section->loadPage(section->currentPage);
+  if (!page) return false;
+  return WeReadHighlightOverlay::wordOnPage(renderer, SETTINGS.getReaderFontId(), *page, currentPageLinkMarginLeft,
+                                            currentPageLinkMarginTop, wereadBookId_, *epub, currentSpineIndex, place,
+                                            x, y, start, span);
+}
+
+void EpubReaderActivity::setHighlightPoint(const uint32_t start, const uint16_t span) {
+  if (span == 0 || highlightAnchorSpine_ != currentSpineIndex) return;
+  highlightPoint_ = start;
+  highlightPointSpan_ = span;
+  highlightPointSet_ = true;
+}
+
+void EpubReaderActivity::openWeReadHighlightConfirm() {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  if (highlightSelectPhase_ == HighlightSelectPhase::Confirm || !highlightSelectionBounds(start, end)) return;
+  highlightSelectPhase_ = HighlightSelectPhase::Confirm;
+  const char* confirmLabel = tr(STR_WEREAD_HIGHLIGHT_CONFIRM);
+  const char* cancelLabel = tr(STR_CANCEL);
+  const char* const options[] = {confirmLabel, cancelLabel};
+  const char* body =
+      highlightStoppedAtChapter_ ? tr(STR_WEREAD_HIGHLIGHT_CHAPTER_END) : tr(STR_WEREAD_HIGHLIGHT_CONFIRM_BODY);
+  overlayPopup.showMessage(tr(STR_WEREAD_HIGHLIGHT), body, options, 2, 0, [this](const int index) {
+    if (index == 0) {
+      submitWeReadHighlight();
+    } else {
+      highlightSelectPhase_ = HighlightSelectPhase::AwaitEnd;
+    }
+  });
+  highlightSheetOpen_ = overlayPopup.isActive();
+  requestUpdate();
+}
+
+void EpubReaderActivity::submitWeReadHighlight() {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  const int spine = highlightAnchorSpine_;
+  const bool bounds = highlightSelectionBounds(start, end);
+  highlightSelectPhase_ = HighlightSelectPhase::Idle;
+  highlightAnchorSpan_ = 0;
+  highlightPointSet_ = false;
+  highlightDragging_ = false;
+  highlightStoppedAtChapter_ = false;
+  if (!bounds || !epub || spine != currentSpineIndex || wereadBookId_[0] == '\0') {
+    highlightNotice_ = HighlightNotice::AddFailed;
+    highlightNoticeTime_ = millis();
+    return;
+  }
+  char path[160];
+  uint32_t chapterUid = 0;
+  uint32_t chapterIdx = 0;
+  if (!WeReadHighlightOverlay::chapterFile(wereadBookId_, *epub, spine, path, sizeof(path), chapterUid, chapterIdx)) {
+    highlightNotice_ = HighlightNotice::AddFailed;
+    highlightNoticeTime_ = millis();
+    return;
+  }
+  switch (WeReadHighlight::createMine(wereadBookId_, path, chapterUid, chapterIdx, start, end)) {
+    case WeReadHighlight::RefreshResult::Updated:
+      WeReadHighlightOverlay::invalidate();
+      highlightNotice_ = HighlightNotice::Added;
+      break;
+    case WeReadHighlight::RefreshResult::Failed:
+    case WeReadHighlight::RefreshResult::Skipped:
+      highlightNotice_ = HighlightNotice::AddFailed;
+      break;
+  }
+  highlightNoticeTime_ = millis();
+}
+
+bool EpubReaderActivity::highlightAllowsPageTurn(const bool forward) {
+  highlightExtendOnTurn_ = false;
+  if (highlightSelectPhase_ != HighlightSelectPhase::AwaitEnd && !highlightDragging_) return true;
+  if (!section || section->pageCount <= 0) return true;
+  const bool atEdge = forward ? section->currentPage >= section->pageCount - 1 : section->currentPage <= 0;
+  if (!atEdge) {
+    highlightExtendOnTurn_ = highlightDragging_ || highlightEdgeArmed_;
+    return true;
+  }
+  uint32_t start = 0;
+  uint16_t span = 0;
+  const auto place =
+      forward ? WeReadHighlightOverlay::WordPlace::LastOnPage : WeReadHighlightOverlay::WordPlace::FirstOnPage;
+  if (currentPageWord(place, 0, 0, start, span)) {
+    setHighlightPoint(start, span);
+  } else if (highlightAnchorSpan_ != 0) {
+    setHighlightPoint(highlightAnchor_, highlightAnchorSpan_);
+  }
+  highlightStoppedAtChapter_ = true;
+  openWeReadHighlightConfirm();
+  return false;
+}
+
+void EpubReaderActivity::extendWeReadHighlightAfterTurn(const bool forward) {
+  if (!highlightExtendOnTurn_) return;
+  highlightExtendOnTurn_ = false;
+  uint32_t start = 0;
+  uint16_t span = 0;
+  const auto place =
+      forward ? WeReadHighlightOverlay::WordPlace::LastOnPage : WeReadHighlightOverlay::WordPlace::FirstOnPage;
+  if (currentPageWord(place, 0, 0, start, span)) setHighlightPoint(start, span);
+}
+
+void EpubReaderActivity::holdWeReadHighlightEdge(const int y) {
+  if (highlightSelectPhase_ != HighlightSelectPhase::AwaitEnd && !highlightDragging_) return;
+  const int height = renderer.getScreenHeight();
+  int band = height / 8;
+  if (band < 24) band = 24;
+  int dir = 0;
+  if (y < band) {
+    dir = -1;
+  } else if (y >= height - band) {
+    dir = 1;
+  }
+  if (dir == 0) {
+    highlightEdgeDir_ = 0;
+    return;
+  }
+  const unsigned long now = millis();
+  if (highlightEdgeDir_ != dir) {
+    highlightEdgeDir_ = dir;
+    highlightEdgeSince_ = now;
+    return;
+  }
+  if (now - highlightEdgeSince_ < 650 || now - lastPageTurnTime < 400) return;
+  highlightEdgeArmed_ = true;
+  const bool forward = dir > 0;
+  if (highlightAllowsPageTurn(forward)) {
+    const bool turned = pageTurn(forward);
+    if (turned) extendWeReadHighlightAfterTurn(forward);
+    notePageTurn(forward, turned);
+  }
+  highlightEdgeArmed_ = false;
+  highlightEdgeSince_ = millis();
+  requestUpdate();
+}
+
+bool EpubReaderActivity::handleWeReadHighlightSelect() {
+  if (wereadBookId_[0] == '\0' || !epub || !section || highlightSheetOpen_) return false;
+  if (highlightSelectPhase_ == HighlightSelectPhase::Confirm) return false;
+
+  if (highlightSelectPhase_ != HighlightSelectPhase::Idle &&
+      mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+      mappedInput.getHeldTime() < ReaderUtils::GO_BACK_OR_HOME_MS) {
+    cancelWeReadHighlightSelect();
+    requestUpdate();
+    return true;
+  }
+  if (highlightSelectPhase_ == HighlightSelectPhase::AwaitEnd &&
+      mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (highlightPointSet_) openWeReadHighlightConfirm();
+    return true;
+  }
+  if (highlightSelectPhase_ == HighlightSelectPhase::AwaitStart &&
+      mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    return true;
+  }
+
+  int x = 0;
+  int y = 0;
+  if (mappedInput.isScreenTouchHeld(x, y)) {
+    if (!highlightTouchTracking_) {
+      highlightTouchTracking_ = true;
+      highlightTouchPassed_ = false;
+      highlightDragging_ = false;
+      highlightHoldSince_ = millis();
+      highlightHoldX_ = x;
+      highlightHoldY_ = y;
+      highlightEdgeDir_ = 0;
+    } else if (!highlightDragging_ && !highlightTouchPassed_) {
+      const int dx = x - highlightHoldX_;
+      const int dy = y - highlightHoldY_;
+      const bool moved = dx > 16 || dx < -16 || dy > 16 || dy < -16;
+      if (moved && millis() - highlightHoldSince_ < 400) {
+        highlightTouchPassed_ = true;
+      } else if (!moved && millis() - highlightHoldSince_ >= 400) {
+        uint32_t start = 0;
+        uint16_t span = 0;
+        if (currentPageWord(WeReadHighlightOverlay::WordPlace::AtPoint, x, y, start, span)) {
+          if (highlightSelectPhase_ != HighlightSelectPhase::AwaitEnd || highlightAnchorSpine_ != currentSpineIndex) {
+            highlightAnchorSpine_ = currentSpineIndex;
+            highlightAnchor_ = start;
+            highlightAnchorSpan_ = span;
+            highlightPointSet_ = false;
+            highlightSelectPhase_ = HighlightSelectPhase::AwaitEnd;
+          } else {
+            setHighlightPoint(start, span);
+          }
+          highlightDragging_ = true;
+          requestUpdate();
+        } else {
+          highlightTouchPassed_ = true;
+        }
+      }
+    } else if (highlightDragging_) {
+      uint32_t start = 0;
+      uint16_t span = 0;
+      if (currentPageWord(WeReadHighlightOverlay::WordPlace::AtPoint, x, y, start, span) &&
+          (!highlightPointSet_ || start != highlightPoint_ || span != highlightPointSpan_)) {
+        setHighlightPoint(start, span);
+        requestUpdate();
+      }
+    }
+    if (highlightSelectPhase_ == HighlightSelectPhase::AwaitEnd || highlightDragging_) holdWeReadHighlightEdge(y);
+    return highlightDragging_;
+  }
+
+  if (highlightTouchTracking_) {
+    const bool dragged = highlightDragging_;
+    highlightTouchTracking_ = false;
+    highlightDragging_ = false;
+    highlightTouchPassed_ = false;
+    if (dragged) {
+      gpio.suppressTouchContact();
+      if (highlightSelectPhase_ != HighlightSelectPhase::Confirm) {
+        highlightStoppedAtChapter_ = false;
+        if (!highlightPointSet_) setHighlightPoint(highlightAnchor_, highlightAnchorSpan_);
+        openWeReadHighlightConfirm();
+      }
+      return true;
+    }
+  }
+
+  if (highlightSelectPhase_ != HighlightSelectPhase::AwaitStart &&
+      highlightSelectPhase_ != HighlightSelectPhase::AwaitEnd) {
+    return false;
+  }
+  if (!mappedInput.wasScreenTapped(x, y)) return false;
+
+  uint32_t start = 0;
+  uint16_t span = 0;
+  if (currentPageWord(WeReadHighlightOverlay::WordPlace::AtPoint, x, y, start, span)) {
+    if (highlightSelectPhase_ == HighlightSelectPhase::AwaitStart || highlightAnchorSpine_ != currentSpineIndex) {
+      highlightAnchorSpine_ = currentSpineIndex;
+      highlightAnchor_ = start;
+      highlightAnchorSpan_ = span;
+      highlightPointSet_ = false;
+      highlightSelectPhase_ = HighlightSelectPhase::AwaitEnd;
+    } else {
+      highlightStoppedAtChapter_ = false;
+      setHighlightPoint(start, span);
+      openWeReadHighlightConfirm();
+    }
+    requestUpdate();
+    return true;
+  }
+
+  const int width = renderer.getScreenWidth();
+  const int height = renderer.getScreenHeight();
+  const bool center = x >= width / 3 && x < width - width / 3 && y >= height / 3 && y < height - height / 3;
+  if (!center) {
+    const bool mirrored = ReaderUtils::isRtlBookLanguage(epub->getLanguage()) != (SETTINGS.pageTurnDirection != 0);
+    const bool inverted = (SETTINGS.pageTurnGesture == CrossPointSettings::INVERTED_TAP ||
+                           SETTINGS.previousPageGesture == CrossPointSettings::INVERTED_TAP) != mirrored;
+    const bool forward = inverted ? x < (width * 2) / 3 : x >= width / 3;
+    if (highlightAllowsPageTurn(forward)) {
+      const bool turned = pageTurn(forward);
+      if (turned) extendWeReadHighlightAfterTurn(forward);
+      notePageTurn(forward, turned);
+    }
+    requestUpdate();
+  }
+  return true;
+}
+
+const char* EpubReaderActivity::highlightNoticeText() const {
+  switch (highlightNotice_) {
+    case HighlightNotice::None:
+      return nullptr;
+    case HighlightNotice::Removed:
+      return tr(STR_WEREAD_HIGHLIGHT_REMOVED);
+    case HighlightNotice::Failed:
+      return tr(STR_WEREAD_HIGHLIGHT_REMOVE_FAILED);
+    case HighlightNotice::Added:
+      return tr(STR_WEREAD_HIGHLIGHT_ADDED);
+    case HighlightNotice::AddFailed:
+      return tr(STR_WEREAD_HIGHLIGHT_ADD_FAILED);
+  }
+  return nullptr;
 }
 
 bool EpubReaderActivity::handleWeReadHighlightTap() {
@@ -589,7 +929,12 @@ void EpubReaderActivity::openReaderMenu() {
         }
       },
       epub->getTitle(), currentPage, totalPages, bookProgressPercent, SETTINGS.orientation,
-      !currentPageFootnotes.empty(), !cachedBookmarks.empty());
+      !currentPageFootnotes.empty(), !cachedBookmarks.empty()
+#ifdef ENABLE_CHINESE_VERSION
+      ,
+      wereadBookId_[0] != '\0'
+#endif
+  );
 }
 
 ReaderRenderSpec EpubReaderActivity::effectiveRenderSpec(const uint16_t width, const uint16_t height) const {
@@ -821,6 +1166,7 @@ void EpubReaderActivity::loop() {
 #ifdef ENABLE_CHINESE_VERSION
   // 评论面板打开时，这一帧的按键和触摸都归面板，不翻页。
   if (handleWeReadHighlightSheet()) return;
+  if (handleWeReadHighlightSelect()) return;
 #endif
 
   const bool atEndOfBook = currentSpineIndex > 0 && currentSpineIndex >= epub->getSpineItemsCount();
@@ -1057,7 +1403,16 @@ void EpubReaderActivity::loop() {
     }
     const bool forward = pendingManualTurn > 0;
     pendingManualTurn = 0;
+#ifdef ENABLE_CHINESE_VERSION
+    if (!highlightAllowsPageTurn(forward)) {
+      requestUpdate();
+      return;
+    }
+#endif
     const bool succeeded = pageTurn(forward);
+#ifdef ENABLE_CHINESE_VERSION
+    if (succeeded) extendWeReadHighlightAfterTurn(forward);
+#endif
     notePageTurn(forward, succeeded);
     requestUpdate();
     return;
@@ -1081,6 +1436,11 @@ void EpubReaderActivity::loop() {
 
   const unsigned long heldMs = (touch.prev || touch.next) ? touch.heldMs : mappedInput.getHeldTime();
   const bool longPress = !fromTilt && heldMs >= ReaderUtils::SKIP_HOLD_MS;
+#ifdef ENABLE_CHINESE_VERSION
+  if ((highlightSelectPhase_ != HighlightSelectPhase::Idle || highlightDragging_) && longPress) {
+    // 划线时不跳章、不转屏，落到下面的单页翻页。
+  } else
+#endif
   if (longPress && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP) {
     const bool succeeded = skipPages(nextTriggered ? 1 : -1);
     notePageTurn(false, succeeded);
@@ -1108,13 +1468,18 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  if (prevTriggered) {
-    const bool succeeded = pageTurn(false);
-    notePageTurn(false, succeeded);
-  } else {
-    const bool succeeded = pageTurn(true);
-    notePageTurn(true, succeeded);
+  const bool forwardTurn = !prevTriggered;
+#ifdef ENABLE_CHINESE_VERSION
+  if (!highlightAllowsPageTurn(forwardTurn)) {
+    requestUpdate();
+    return;
   }
+#endif
+  const bool succeeded = pageTurn(forwardTurn);
+#ifdef ENABLE_CHINESE_VERSION
+  if (succeeded) extendWeReadHighlightAfterTurn(forwardTurn);
+#endif
+  notePageTurn(forwardTurn, succeeded);
   requestUpdate();
 }
 
@@ -1368,6 +1733,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       addBookmark();
       showBookmarkMessage = true;
       bookmarkMessageTime = millis();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::HIGHLIGHT: {
+#ifdef ENABLE_CHINESE_VERSION
+      if (wereadBookId_[0]) beginWeReadHighlightSelect();
+#endif
       break;
     }
   }
@@ -2088,9 +2459,15 @@ void EpubReaderActivity::renderBook() {
 #ifdef ENABLE_CHINESE_VERSION
   if (highlightSheetOpen_ && overlayPopup.isActive()) {
     overlayPopup.processRender(renderer, mappedInput);
-  } else if (highlightNotice_ != HighlightNotice::None) {
-    GUI.drawPopup(renderer, highlightNotice_ == HighlightNotice::Removed ? tr(STR_WEREAD_HIGHLIGHT_REMOVED)
-                                                                        : tr(STR_WEREAD_HIGHLIGHT_REMOVE_FAILED));
+  } else if (highlightSelectPhase_ == HighlightSelectPhase::AwaitStart ||
+             highlightSelectPhase_ == HighlightSelectPhase::AwaitEnd) {
+    const char* hint = highlightSelectPhase_ == HighlightSelectPhase::AwaitStart
+                           ? tr(STR_WEREAD_HIGHLIGHT_PICK_START)
+                           : tr(STR_WEREAD_HIGHLIGHT_PICK_END);
+    const int hintY = renderer.getScreenHeight() - UITheme::getInstance().getStatusBarHeight() - 22;
+    renderer.drawCenteredText(UI_12_FONT_ID, hintY, hint, true, EpdFontFamily::REGULAR);
+  } else if (const char* notice = highlightNoticeText()) {
+    GUI.drawPopup(renderer, notice);
   }
 #endif
 
@@ -2464,6 +2841,13 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     if (wereadBookId_[0] && epub) {
       WeReadHighlightOverlay::drawForBook(renderer, fontId, *page, orientedMarginLeft, orientedMarginTop, wereadBookId_,
                                           *epub, currentSpineIndex);
+      uint32_t selectionStart = 0;
+      uint32_t selectionEnd = 0;
+      if (highlightSelectPhase_ != HighlightSelectPhase::Idle && highlightAnchorSpine_ == currentSpineIndex &&
+          highlightSelectionBounds(selectionStart, selectionEnd)) {
+        WeReadHighlightOverlay::drawSelection(renderer, fontId, *page, orientedMarginLeft, orientedMarginTop,
+                                              wereadBookId_, *epub, currentSpineIndex, selectionStart, selectionEnd);
+      }
     }
 #endif
   };
@@ -3759,7 +4143,12 @@ void EpubReaderActivity::handleFontPreloadPrompt() {
 // two entries that have their own tool (chapters -> Contents, text -> Text).
 void EpubReaderActivity::buildMoreActions() {
   using MA = EpubReaderMenuActivity::MenuAction;
-  EpubReaderMenuActivity::buildMenuItems(moreItems, !currentPageFootnotes.empty(), !cachedBookmarks.empty());
+  EpubReaderMenuActivity::buildMenuItems(moreItems, !currentPageFootnotes.empty(), !cachedBookmarks.empty()
+#ifdef ENABLE_CHINESE_VERSION
+                                        ,
+                                        wereadBookId_[0] != '\0'
+#endif
+  );
   moreItems.erase(std::remove_if(moreItems.begin(), moreItems.end(),
                                  [](const auto& item) {
                                    return item.action == MA::SELECT_CHAPTER || item.action == MA::TEXT_SETTINGS;

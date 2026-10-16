@@ -106,6 +106,15 @@ bool removalSucceeded(const uint8_t* json, size_t len);
 // 已有网络时删除服务器上的划线，成功后再改本地索引。不打开 Wi-Fi。
 RefreshResult deleteMine(const char* bookId, const char* bookmarkId);
 
+// 在已有索引末尾加一条。原文件损坏或写失败时不替换 marks.bin。
+bool insertMine(const char* bookId, const Mark& mark);
+// addBookmark 成功时写出 data.bookmarkId。有非零错误码、或 id 不能进索引时失败。
+bool creationBookmarkId(const uint8_t* json, size_t len, char* bookmarkId, size_t bookmarkIdSize);
+// 已有网络时提交一条划线，服务器返回 bookmarkId 后再写入本地索引。不打开 Wi-Fi。
+// visible 区间是阅读页的可见偏移，含段落空白；函数内部换成 wr-co。
+RefreshResult createMine(const char* bookId, const char* chapterPath, uint32_t chapterUid, uint32_t chapterIdx,
+                         uint32_t visibleStart, uint32_t visibleEnd);
+
 std::string indexPath(const char* bookId);
 bool clearAll();
 bool loadChapter(const char* bookId, uint32_t chapterUid, Range* ranges, size_t capacity, size_t& count,
