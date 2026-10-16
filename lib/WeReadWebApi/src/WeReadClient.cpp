@@ -35,6 +35,17 @@ using WeReadXhtmlCodec::writeXmlText;
 constexpr const char* kHost = "https://weread.qq.com";
 constexpr const char* kOrigin = "https://weread.qq.com";
 constexpr const char* kDefaultReferer = "https://weread.qq.com/";
+
+// 划线列表在 Referer 是站点根路径时返回 {}。必须带阅读页地址才会给出 updated。
+bool readerReferer(const char* bookId, char* out, const size_t outSize) {
+  if (!bookId || !bookId[0] || !out || outSize < 40) return false;
+  for (const char* cursor = bookId; *cursor; ++cursor) {
+    const unsigned char ch = static_cast<unsigned char>(*cursor);
+    if (ch <= 0x20 || ch >= 0x7F || ch == '"' || ch == '\\' || ch == '<' || ch == '>') return false;
+  }
+  const int written = snprintf(out, outSize, "https://weread.qq.com/web/reader/%s", bookId);
+  return written > 0 && static_cast<size_t>(written) < outSize;
+}
 constexpr const char* kUserAgent =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 "
@@ -2746,9 +2757,15 @@ Error Operation::fetchBrowseOnce() {
   }
   if (length <= 0 || static_cast<size_t>(length) >= kUrlSize) return Error::Protocol;
 
+  char highlightReferer[160];
+  const char* referer = kDefaultReferer;
+  if (browseKind_ == WeReadBrowse::Kind::MyHighlights) {
+    if (!readerReferer(book_.bookId, highlightReferer, sizeof(highlightReferer))) return Error::Protocol;
+    referer = highlightReferer;
+  }
   Error error =
-      requestOnce("GET", path, nullptr, 0, &session_, kDefaultReferer, sink, responseStatus_, cookie_, sizeof(cookie_),
-                  url_, sizeof(url_), ioBuffer_, sizeof(ioBuffer_) - kUrlSize, &bookSession_);
+      requestOnce("GET", path, nullptr, 0, &session_, referer, sink, responseStatus_, cookie_, sizeof(cookie_), url_,
+                  sizeof(url_), ioBuffer_, sizeof(ioBuffer_) - kUrlSize, &bookSession_);
   if (error != Error::Ok && parser->storageFailed()) error = Error::SdCard;
   if (error != Error::Ok) {
     LOG_ERR("WR", "browse request failed: kind=%u page=%u status=%d error=%u", static_cast<unsigned>(browseKind_),
@@ -4271,6 +4288,36 @@ bool highlightFetchFinish(void* raw) {
 
 }  // namespace
 
+// 划线接口比热门划线更严格。wr_skey 过期时 bookmarklist 回 -2012，而 rt 仍可用。
+// 续期上下文大约 1KB，阅读任务栈只有 8KB，放堆上，返回前释放。失败不清除已有会话。
+bool renewStoredSession(WeReadStore::Session& session, char* cookie, const size_t cookieSize, char* url,
+                        const size_t urlSize, uint8_t* readBuffer, const size_t readBufferSize) {
+  if (!session.rt[0]) return false;
+  auto context = makeUniqueNoThrow<SimpleJsonContext>();
+  if (!context) {
+    LOG_ERR("WR", "OOM: session renewal context (%zu bytes)", sizeof(SimpleJsonContext));
+    return false;
+  }
+  auto parser = makeUniqueNoThrow<StreamingJsonParser>(simpleCallbacks(context.get()));
+  if (!parser) {
+    LOG_ERR("WR", "OOM: SAX parser (%zu bytes)", sizeof(StreamingJsonParser));
+    return false;
+  }
+  context->parser = parser.get();
+  ResponseSink sink{context.get(), resetSimple, feedSimple, noOpFinish, Error::Protocol};
+  static constexpr char kRenewBody[] = "{\"rq\":\"%2Fweb%2Fbook%2Fread\",\"ql\":false}";
+  int status = 0;
+  const Error error =
+      requestOnce("POST", "/web/login/renewal", reinterpret_cast<const uint8_t*>(kRenewBody), sizeof(kRenewBody) - 1,
+                  &session, kDefaultReferer, sink, status, cookie, cookieSize, url, urlSize, readBuffer,
+                  readBufferSize, nullptr);
+  if (error != Error::Ok || status != 200 || !context->rootClosed || context->errorCode != 0 || !context->succeed ||
+      !session.valid()) {
+    return false;
+  }
+  return WeReadStore::saveSession(session);
+}
+
 WeReadHighlight::RefreshResult refreshMineFromBookmarkList(const char* bookId) {
   // 不在这里打开 Wi-Fi。离线或未登录时保留已有 marks.bin，等网络已连通后再拉一次。
   if (!bookId || !bookId[0]) return WeReadHighlight::RefreshResult::Failed;
@@ -4284,7 +4331,6 @@ WeReadHighlight::RefreshResult refreshMineFromBookmarkList(const char* bookId) {
     LOG_ERR("WR", "OOM: highlight importer");
     return WeReadHighlight::RefreshResult::Failed;
   }
-  if (!importer->begin(bookId, session.vid)) return WeReadHighlight::RefreshResult::Failed;
 
   // 与浏览请求同一套上限：cookie 896、URL 512。读缓冲只服务这一次 GET。
   constexpr size_t kCookieSize = 896;
@@ -4310,15 +4356,26 @@ WeReadHighlight::RefreshResult refreshMineFromBookmarkList(const char* bookId) {
   const int length = snprintf(path, sizeof(path), "/web/book/bookmarklist?bookId=%s", encodedBookId);
   if (length <= 0 || static_cast<size_t>(length) >= sizeof(path)) return WeReadHighlight::RefreshResult::Failed;
 
-  HighlightFetchCtx ctx;
-  ctx.importer = importer.get();
-  ResponseSink sink{&ctx, highlightFetchReset, highlightFetchFeed, highlightFetchFinish, Error::Protocol};
-  const Error error = requestOnce("GET", path, nullptr, 0, &session, nullptr, sink, ctx.status, cookie, kCookieSize,
-                                  url, kUrlSize, readBuffer, kReadSize, nullptr);
-  if (error != Error::Ok) {
+  char referer[160];
+  if (!readerReferer(bookId, referer, sizeof(referer))) return WeReadHighlight::RefreshResult::Failed;
+  Error error = Error::Protocol;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!importer->begin(bookId, session.vid)) return WeReadHighlight::RefreshResult::Failed;
+    HighlightFetchCtx ctx;
+    ctx.importer = importer.get();
+    ResponseSink sink{&ctx, highlightFetchReset, highlightFetchFeed, highlightFetchFinish, Error::Protocol};
+    error = requestOnce("GET", path, nullptr, 0, &session, referer, sink, ctx.status, cookie, kCookieSize, url,
+                        kUrlSize, readBuffer, kReadSize, nullptr);
+    if (error == Error::Ok) break;
+    if (attempt == 0 && importer->errorCode() == -2012 &&
+        renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
+      LOG_INF("WR", "highlight session renewed");
+      continue;
+    }
     LOG_ERR("WR", "highlight refresh failed: status=%d error=%u", ctx.status, static_cast<unsigned>(error));
     return WeReadHighlight::RefreshResult::Failed;
   }
+  if (error != Error::Ok) return WeReadHighlight::RefreshResult::Failed;
   if (!WeReadStore::saveSession(session)) {
     LOG_ERR("WR", "highlight refresh wrote marks but failed to save the session");
   }

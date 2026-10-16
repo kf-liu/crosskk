@@ -371,7 +371,8 @@ bool BookmarkListImporter::feed(const uint8_t* data, const size_t len) {
 bool BookmarkListImporter::finish() {
   if (!state_ || !state_->parser || !state_->writer.active()) return false;
   const bool emptyObject = !state_->sawAnyKey && !state_->sawRecords;
-  if (state_->errorCode != 0 || state_->inRecord || !state_->rootClosed || (!state_->sawRecords && !emptyObject) ||
+  // {} 是错误 Referer 的空响应，不能覆盖已有 marks.bin。真正的空列表是 {"updated":[]}。
+  if (state_->errorCode != 0 || state_->inRecord || !state_->rootClosed || emptyObject || !state_->sawRecords ||
       state_->parser->hasError() || state_->failed) {
     state_->writer.abort();
     return false;

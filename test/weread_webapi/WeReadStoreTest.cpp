@@ -1302,8 +1302,11 @@ TEST_F(WeReadStoreTest, StreamsAllBrowseResponseShapesAcrossArbitraryChunks) {
 TEST_F(WeReadStoreTest, BrowseParserHandlesEmptyMissingFieldsAndExpiredSession) {
   WeReadBrowse::CacheManifest manifest;
   beginBrowseCache(manifest);
+  WeReadBrowse::ResponseParser emptyObject(kBrowseBook, manifest.activeSlot, WeReadBrowse::Kind::MyHighlights, 0);
+  ASSERT_TRUE(emptyObject.reset());
   static constexpr char kEmpty[] = R"({})";
-  writeBrowsePage(manifest, WeReadBrowse::Kind::MyHighlights, 0, kEmpty);
+  ASSERT_TRUE(emptyObject.feed(reinterpret_cast<const uint8_t*>(kEmpty), sizeof(kEmpty) - 1));
+  EXPECT_FALSE(emptyObject.finish());
   EXPECT_EQ(manifest.recordCounts[WeReadBrowse::kindIndex(WeReadBrowse::Kind::MyHighlights)], 0U);
 
   static constexpr char kMissing[] = R"({"items":[{"totalCount":2},{"markText":"可读"}]})";
@@ -1526,6 +1529,9 @@ TEST_F(WeReadStoreTest, ReplacesHighlightIndexFromBookmarkListAndKeepsItWhenTheP
   const char* broken = "{";
   EXPECT_FALSE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid",
                                                              reinterpret_cast<const uint8_t*>(broken), strlen(broken)));
+  const char* bare = "{}";
+  EXPECT_FALSE(WeReadHighlight::replaceMineFromBookmarkList(kBrowseBook, "vid",
+                                                             reinterpret_cast<const uint8_t*>(bare), strlen(bare)));
   ASSERT_TRUE(WeReadHighlight::loadChapter(kBrowseBook, 301, ranges, 4, count, truncated));
   EXPECT_EQ(count, 2U);
 

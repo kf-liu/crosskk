@@ -454,6 +454,12 @@ bool ResponseParser::finish() {
     return true;
   }
   const bool emptyObject = !sawAnyKey_ && !sawRecords_;
+  // bookmarklist 在 Referer 不对时回 {}。那不是「没有划线」，不能写成空页。
+  if (kind_ == Kind::MyHighlights && emptyObject) {
+    writer_.abort();
+    highlightWriter_.abort();
+    return false;
+  }
   if (inRecord_ || !rootClosed_ || (!sawRecords_ && !emptyObject) || parser_.hasError() || textFailed_) {
     writer_.abort();
     highlightWriter_.abort();

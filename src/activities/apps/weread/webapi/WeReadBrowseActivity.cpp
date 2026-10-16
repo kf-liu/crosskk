@@ -274,6 +274,10 @@ void WeReadBrowseActivity::stepLoad() {
       if (!reloadCache()) {
         error_ = WeReadClient::Error::SdCard;
         state_ = State::Error;
+      } else if (kind_ == WeReadBrowse::Kind::MyHighlights && openPage(0) && pageHeader_.count > 0) {
+        // 空页触发的刷新结束后直接进入列表，不用再点一次「我的划线」。
+        listSelected_ = 0;
+        state_ = State::List;
       } else {
         menuSelected_ = 0;
         listSelected_ = 0;
@@ -314,7 +318,11 @@ void WeReadBrowseActivity::activateMenu() {
       return;
   }
   listSelected_ = 0;
-  if (!openPage(0)) {
+  // 我的划线曾经把错误 Referer 的 {} 写成空页。空页不能当成「没有划线」，要重新拉取。
+  const bool pageReady = openPage(0);
+  const bool staleEmptyHighlights =
+      kind_ == WeReadBrowse::Kind::MyHighlights && pageReady && pageHeader_.count == 0;
+  if (!pageReady || staleEmptyHighlights) {
     hasCache_ = false;
     connectThenCache();
     return;
