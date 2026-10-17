@@ -351,6 +351,7 @@ void StandbyActivity::pumpTimeSync() {
 }
 
 void StandbyActivity::stopTimeSyncWifi() {
+  if (NetworkStartup::stayConnected()) return;
   WiFi.disconnect(false);
   delay(100);
   WiFi.mode(WIFI_OFF);

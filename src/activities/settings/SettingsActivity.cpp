@@ -33,6 +33,7 @@
 #include "KeyboardLayoutsActivity.h"
 #include "LanguageSelectActivity.h"
 #include "MappedInputManager.h"
+#include "NetworkStartup.h"
 #include "OpdsServerListActivity.h"
 #include "OtaUpdateActivity.h"
 #include "ReadingStatsSettingsActivity.h"
@@ -829,7 +830,7 @@ void SettingsActivity::toggleCurrentSetting() {
           // these rows only save credentials, so nothing here would ever
           // release the driver's heap. The scan alone brings it up, so tear
           // down whether or not the user joined a network.
-          if (WiFi.getMode() == WIFI_MODE_NULL) return;
+          if (WiFi.getMode() == WIFI_MODE_NULL || NetworkStartup::stayConnected()) return;
           WiFi.disconnect(false);
           delay(30);
           // Unlike the onExit() teardowns, this runs from the loop task with

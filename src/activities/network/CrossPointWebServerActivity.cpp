@@ -131,7 +131,7 @@ void CrossPointWebServerActivity::onExit() {
     if (isApMode) {
       WiFi.softAPdisconnect(true);
     } else {
-      WiFi.disconnect(false);
+      NetworkStartup::releaseOwnedRadio();
     }
     delay(30);
     NetworkStartup::logMemory("web exit before restart");

@@ -15,6 +15,7 @@
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "NetworkStartup.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/ConfirmationActivity.h"
@@ -91,7 +92,7 @@ void DictionaryDownloadActivity::onExit() {
   std::string().swap(baseUrl_);
   logHeap("exit");
   if (WiFi.getMode() != WIFI_MODE_NULL) {
-    WiFi.disconnect(false);
+    NetworkStartup::releaseOwnedRadio();
     delay(30);
     silentRestart();
   }

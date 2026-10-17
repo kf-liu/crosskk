@@ -439,7 +439,7 @@ void KOReaderSyncActivity::onEnter() {
 void KOReaderSyncActivity::onExit() {
   Activity::onExit();
 
-  if (wifiActivated) {
+  if (wifiActivated && !NetworkStartup::stayConnected()) {
     WiFi.disconnect(false);
     delay(30);
     silentRestartToReader();

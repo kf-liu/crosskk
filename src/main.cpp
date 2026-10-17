@@ -35,6 +35,7 @@
 #include "CrossPointState.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
+#include "NetworkStartup.h"
 #include "OpdsServerStore.h"
 #include "ReadingStatsStore.h"
 #include "RecentBooksStore.h"
@@ -238,6 +239,10 @@ static bool sdFontReloadPending = false;
 
 static bool finishWifiSessionWithoutRestart() {
   if (!BoardConfig::hasTouch()) return false;
+  if (NetworkStartup::stayConnected()) {
+    LOG_DBG("MAIN", "Wi-Fi kept: stay connected");
+    return true;
+  }
   if (esp_sntp_enabled()) esp_sntp_stop();
   WiFi.mode(WIFI_OFF);
   delay(100);
@@ -1094,6 +1099,7 @@ void loop() {
     return;
   }
 
+  NetworkStartup::serviceStayConnected(renderer);
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
   halClock.update();
 

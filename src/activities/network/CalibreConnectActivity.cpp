@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include "MappedInputManager.h"
+#include "NetworkStartup.h"
 #include "SilentRestart.h"
 #include "WifiSelectionActivity.h"
 #include "components/UITheme.h"
@@ -59,7 +60,7 @@ void CalibreConnectActivity::onExit() {
   MDNS.end();
 
   if (WiFi.getMode() != WIFI_MODE_NULL) {
-    WiFi.disconnect(false);
+    NetworkStartup::releaseOwnedRadio();
     delay(30);
     silentRestart();
   }

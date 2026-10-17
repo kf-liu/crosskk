@@ -291,6 +291,10 @@ bool AirPageConnection::startWifiAssociation() {
 
 void AirPageConnection::teardownWifi() {
   if (!ownsWifi_) return;
+  if (NetworkStartup::stayConnected()) {
+    ownsWifi_ = false;
+    return;
+  }
   WiFi.disconnect(false);
   delay(100);
   WiFi.mode(WIFI_OFF);

@@ -8,6 +8,7 @@
 #include <WiFi.h>
 
 #include "MappedInputManager.h"
+#include "NetworkStartup.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
@@ -23,7 +24,7 @@ void CatalogActivity::onEnter() {
 void CatalogActivity::onExit() {
   Activity::onExit();
   if (WiFi.getMode() != WIFI_MODE_NULL) {
-    WiFi.disconnect(false);
+    NetworkStartup::releaseOwnedRadio();
     delay(30);
     silentRestart();
   }

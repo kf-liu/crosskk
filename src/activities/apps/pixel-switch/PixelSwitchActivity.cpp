@@ -297,6 +297,10 @@ bool PixelSwitchActivity::startSavedWifiAssociation() {
 
 void PixelSwitchActivity::teardownOwnedWifi() {
   if (!broughtWifiUp_) return;
+  if (NetworkStartup::stayConnected()) {
+    broughtWifiUp_ = false;
+    return;
+  }
   WiFi.disconnect(false);
   delay(100);
   WiFi.mode(WIFI_OFF);
