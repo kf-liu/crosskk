@@ -15,6 +15,7 @@ extern HalPowerManager powerManager;  // Singleton
 
 class HalPowerManager {
   int normalFreq = 0;  // MHz
+  int appliedFreq = -1;
   bool isLowPower = false;
 
   mutable int _batteryCachedPercent = 0;         // Last read battery percentage (0-100)

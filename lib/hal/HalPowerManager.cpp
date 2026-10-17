@@ -187,28 +187,30 @@ void HalPowerManager::setPowerSaving(bool enabled) {
     return;  // invalid state
   }
 
-  auto wifiMode = WiFi.getMode();
-  if (wifiMode != WIFI_MODE_NULL) {
-    // Wifi is active, force disabling power saving
-    enabled = false;
+  // 无线电开着也不把前台锁在全速。定时心跳和书评在后台跑。
+  // 关联期间最低 80 MHz：C3 的空闲档是 10 MHz，低于 Wi-Fi 能工作的频率。
+  // 有 PSRAM 的板子空闲档本来就是 80，关联时空闲就停在这一档。
+  int target = normalFreq;
+  if (enabled && currentLockMode == None) {
+    target = LOW_POWER_FREQ;
+    if (WiFi.getMode() != WIFI_MODE_NULL && target < 80) target = 80;
   }
 #if CONFIG_IDF_TARGET_ESP32C3 && FREEINK_CAP_BLE_HID_HOST
   // Manual 10 MHz downclocking bypasses the controller's IDF power locks.
   // Protect the entire host lifetime, including scans and reconnect attempts.
-  if (BleHid.isRunning()) enabled = false;
+  if (BleHid.isRunning()) target = normalFreq;
 #endif
 
   // Serialize the entire clock transition: Arduino's APB callbacks retain SPI
   // locks between BEFORE/AFTER, so concurrent frequency changes can deadlock.
   xSemaphoreTake(modeMutex, portMAX_DELAY);
-  const bool targetLowPower = enabled && currentLockMode == None;
-  if (isLowPower != targetLowPower) {
-    const int targetFrequency = targetLowPower ? LOW_POWER_FREQ : normalFreq;
-    if (setCpuFrequencyMhz(targetFrequency)) {
-      isLowPower = targetLowPower;
+  if (appliedFreq != target) {
+    if (setCpuFrequencyMhz(target)) {
+      appliedFreq = target;
+      isLowPower = target != normalFreq;
       LOG_DBG("PWR", "CPU frequency now %u MHz", getCpuFrequencyMhz());
     } else {
-      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", targetFrequency);
+      LOG_DBG("PWR", "Failed to set CPU frequency = %d MHz", target);
     }
   }
 
