@@ -276,6 +276,7 @@ void KkHomeActivity::onEnter() {
   previewBook[0] = '\0';
   previewPages.clear();
   previewPages.reserve(2);
+  requestUpdate();
 }
 
 void KkHomeActivity::onExit() {
