@@ -13,8 +13,15 @@ class KkHomeActivity final : public Activity {
   enum class CoverPrep : uint8_t { Pending, Ready, Failed };
   enum class PreviewPrep : uint8_t { Pending, Ready, Failed };
 
+  struct TitleSpan {
+    uint16_t begin = 0;
+    uint16_t end = 0;
+  };
+  static constexpr int kMaxTitleLines = 8;
+
   Rect bookPanel() const;
   Rect readingPreviewRect() const;
+  void layoutHeading(const RecentBook* book);
   void openCurrentBook();
   bool rememberExistingCover(const RecentBook& book);
   bool ensureCover(const RecentBook& book);
@@ -37,6 +44,14 @@ class KkHomeActivity final : public Activity {
   int previewMarginLeft = 0;
   float previewLineCompression = 1.0f;
   char previewBook[256] = {};
+  // 书名按字节区间引用 RecentBook 里的原文，换行结果留在活动里，灰阶重画不再分配。
+  TitleSpan titleSpans[kMaxTitleLines]{};
+  int titleLineCount = 0;
+  bool titleEllipsis = false;
+  char titleEllipsisText[192]{};
+  char authorLine[160]{};
+  int headingHeight = 0;
+  int bookColumnHeight = 0;
   // 最多两页已排好的正文。进入主页时读一次，离开时释放。
   std::vector<std::unique_ptr<Page>> previewPages;
 
