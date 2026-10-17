@@ -3,6 +3,7 @@
 .idea
 .DS_Store
 .vscode
+.cursor
 .zed
 open-x4-sdk
 fs_
