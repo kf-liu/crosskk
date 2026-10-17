@@ -2332,15 +2332,17 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
     if (static_cast<int>(lines.size()) == maxLines - 1) {
       // Last available line: combine any word already started on this line with
       // the rest of the text, then let truncatedText fit it with an ellipsis.
+      // Newlines become spaces so the tail does not glue two sentences together.
       candidate = currentLine;
       if (!candidate.empty() && !remaining.empty()) candidate.push_back(' ');
-      candidate.append(remaining.data(), remaining.size());
+      for (const char ch : remaining) candidate.push_back(ch == '\n' ? ' ' : ch);
       lines.push_back(truncatedText(fontId, candidate.c_str(), maxWidth, style));
       return lines;
     }
 
-    // Find next word
-    const size_t spacePos = remaining.find(' ');
+    // Next word ends at a space or a hard line break.
+    const size_t spacePos = remaining.find_first_of(" \n");
+    const bool hardBreak = spacePos != std::string_view::npos && remaining[spacePos] == '\n';
     std::string_view word;
 
     if (spacePos == std::string::npos) {
@@ -2351,12 +2353,26 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
       remaining.remove_prefix(spacePos + 1);
     }
 
+    if (word.empty() && hardBreak) {
+      if (!currentLine.empty()) {
+        lines.push_back(currentLine);
+        currentLine.clear();
+        if (static_cast<int>(lines.size()) >= maxLines) return lines;
+      }
+      continue;
+    }
+
     candidate = currentLine;
     if (!candidate.empty()) candidate.push_back(' ');
     candidate.append(word.data(), word.size());
 
     if (getTextWidth(fontId, candidate.c_str(), style) <= maxWidth) {
       currentLine = candidate;
+      if (hardBreak) {
+        lines.push_back(currentLine);
+        currentLine.clear();
+        if (static_cast<int>(lines.size()) >= maxLines) return lines;
+      }
     } else {
       if (!currentLine.empty()) {
         lines.push_back(currentLine);
@@ -2370,6 +2386,11 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
           if (static_cast<int>(lines.size()) >= maxLines) return lines;
         } else {
           currentLine.assign(word.data(), word.size());
+          if (hardBreak) {
+            lines.push_back(currentLine);
+            currentLine.clear();
+            if (static_cast<int>(lines.size()) >= maxLines) return lines;
+          }
         }
       } else {
         // Single word wider than maxWidth: truncate and stop to avoid complicated
