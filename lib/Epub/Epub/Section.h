@@ -147,6 +147,10 @@ class Section {
   // Get the page count from the section cache file without fully loading it.
   std::optional<uint16_t> getCachedPageCount() const;
 
+  // Read one already-built page. A spec or version mismatch returns null and leaves the
+  // cache file untouched, so a preview must not rebuild or delete the reader's section.
+  std::unique_ptr<Page> loadCachedPage(const ReaderRenderSpec& spec, int page);
+
   // Look up the page number for a synthetic paragraph index from XPath p[N].
   std::optional<uint16_t> getPageForParagraphIndex(uint16_t pIndex) const;
 

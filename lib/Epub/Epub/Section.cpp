@@ -898,6 +898,62 @@ std::string Section::getTextFromSectionFile() {
   return fullText;
 }
 
+std::unique_ptr<Page> Section::loadCachedPage(const ReaderRenderSpec& spec, const int page) {
+  if (page < 0) return nullptr;
+
+  HalFile cached;
+  if (!Storage.openFileForRead("SCT", filePath, cached)) return nullptr;
+
+  uint8_t version = 0;
+  if (!serialization::readPod(cached, version) ||
+      (version != SECTION_FILE_VERSION && version != SECTION_FILE_PARTIAL_VERSION)) {
+    return nullptr;
+  }
+
+  int fileFontId = 0;
+  uint16_t fileViewportWidth = 0;
+  uint16_t fileViewportHeight = 0;
+  float fileLineCompression = 0;
+  uint8_t fileExtraParagraphSpacing = 0;
+  uint8_t fileFirstLineIndent = 0;
+  uint8_t fileParagraphIndentSpaces = 3;
+  uint8_t fileParagraphAlignment = 0;
+  bool fileHyphenationEnabled = false;
+  bool fileEmbeddedStyle = false;
+  uint8_t fileImageRendering = 0;
+  bool fileFocusReadingEnabled = false;
+  bool fileCollectTouchLinks = false;
+  int8_t fileCharacterSpacing = 0;
+  uint8_t fileWordSpacingPercent = 100;
+  const bool headerValid =
+      serialization::readPod(cached, fileFontId) && serialization::readPod(cached, fileLineCompression) &&
+      serialization::readPod(cached, fileExtraParagraphSpacing) &&
+      serialization::readPod(cached, fileFirstLineIndent) &&
+      serialization::readPod(cached, fileParagraphIndentSpaces) &&
+      serialization::readPod(cached, fileParagraphAlignment) && serialization::readPod(cached, fileViewportWidth) &&
+      serialization::readPod(cached, fileViewportHeight) && serialization::readPod(cached, fileHyphenationEnabled) &&
+      serialization::readPod(cached, fileEmbeddedStyle) && serialization::readPod(cached, fileImageRendering) &&
+      serialization::readPod(cached, fileFocusReadingEnabled) &&
+      serialization::readPod(cached, fileCollectTouchLinks) && serialization::readPod(cached, fileCharacterSpacing) &&
+      serialization::readPod(cached, fileWordSpacingPercent);
+  // 链接矩形不改变正文排版。预览按文件里的标记读取，不因触摸开关放弃缓存。
+  if (!headerValid || spec.fontId != fileFontId || spec.lineCompression != fileLineCompression ||
+      spec.extraParagraphSpacing != fileExtraParagraphSpacing || spec.firstLineIndent != fileFirstLineIndent ||
+      spec.paragraphIndentSpaces != fileParagraphIndentSpaces || spec.paragraphAlignment != fileParagraphAlignment ||
+      spec.viewportWidth != fileViewportWidth || spec.viewportHeight != fileViewportHeight ||
+      spec.hyphenationEnabled != fileHyphenationEnabled || spec.embeddedStyle != fileEmbeddedStyle ||
+      spec.imageRendering != fileImageRendering || spec.focusReadingEnabled != fileFocusReadingEnabled ||
+      spec.characterSpacing != fileCharacterSpacing || spec.wordSpacingPercent != fileWordSpacingPercent) {
+    LOG_DBG("SCT", "Cached page skipped: viewport %ux%u vs %ux%u font %d vs %d", spec.viewportWidth,
+            spec.viewportHeight,
+            fileViewportWidth, fileViewportHeight, spec.fontId, fileFontId);
+    return nullptr;
+  }
+
+  collectTouchLinks_ = fileCollectTouchLinks;
+  return loadPageAt(page);
+}
+
 std::optional<uint16_t> Section::getCachedPageCount() const {
   HalFile f;
   if (!Storage.openFileForRead("SCT", filePath, f)) {
