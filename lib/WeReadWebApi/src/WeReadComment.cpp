@@ -120,7 +120,9 @@ enum class Expect : uint8_t {
   Review,
   Content,
   Author,
-  AuthorName
+  AuthorName,
+  MarkCount,
+  TotalCount
 };
 
 }  // namespace
@@ -245,6 +247,229 @@ void RangeFile::abort() {
   partPath_.clear();
 }
 
+struct DiskCandidate {
+  uint32_t start = 0;
+  uint32_t end = 0;
+  uint32_t markCount = 0;
+  uint32_t commentTotal = 0;
+  uint32_t query = 0;
+};
+static_assert(sizeof(DiskCandidate) == 20, "candidate records stay 20 bytes");
+
+std::string candidatePath(const char* bookId, const uint32_t chapterUid) {
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, false)) return "";
+  return directory + "/ranges.wri";
+}
+
+bool readDisk(HalFile& file, const uint32_t index, DiskCandidate& record) {
+  const uint32_t offset = kCandidateHeaderSize + index * static_cast<uint32_t>(sizeof(record));
+  return file.seek(offset) && file.read(&record, sizeof(record)) == static_cast<int>(sizeof(record));
+}
+
+bool writeDisk(HalFile& file, const uint32_t index, const DiskCandidate& record) {
+  const uint32_t offset = kCandidateHeaderSize + index * static_cast<uint32_t>(sizeof(record));
+  return file.seek(offset) && file.write(&record, sizeof(record)) == sizeof(record);
+}
+
+Candidate toPublic(const DiskCandidate& record) {
+  Candidate item;
+  item.start = record.start;
+  item.end = record.end;
+  item.markCount = record.markCount;
+  item.commentTotal = record.commentTotal;
+  item.query = static_cast<CandidateQuery>(record.query);
+  return item;
+}
+
+DiskCandidate toDisk(const Candidate& item) {
+  DiskCandidate record;
+  record.start = item.start;
+  record.end = item.end;
+  record.markCount = item.markCount;
+  record.commentTotal = item.commentTotal;
+  record.query = static_cast<uint32_t>(item.query);
+  return record;
+}
+
+bool openCandidate(const char* bookId, const uint32_t chapterUid, HalFile& file, CandidateHeader& header) {
+  const std::string path = candidatePath(bookId, chapterUid);
+  if (path.empty() || !Storage.openFileForRead("WR", path, file)) return false;
+  if (file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kCandidateMagic ||
+      header.version != kCandidateVersion || header.headerSize != kCandidateHeaderSize ||
+      header.chapterUid != chapterUid) {
+    return false;
+  }
+  const size_t expect = kCandidateHeaderSize + static_cast<size_t>(header.count) * sizeof(DiskCandidate);
+  return file.fileSize() == expect;
+}
+
+bool CandidateFile::begin(const char* bookId, const uint32_t chapterUid) {
+  abort();
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, true)) return false;
+  finalPath_ = directory + "/ranges.wri";
+  partPath_ = finalPath_ + ".part";
+  if (Storage.exists(partPath_.c_str())) Storage.remove(partPath_.c_str());
+  if (!Storage.openFileForWrite("WR", partPath_, file_)) return false;
+  CandidateHeader header;
+  header.chapterUid = chapterUid;
+  if (file_.write(&header, sizeof(header)) != sizeof(header)) {
+    abort();
+    return false;
+  }
+  chapterUid_ = chapterUid;
+  count_ = 0;
+  active_ = true;
+  return true;
+}
+
+bool CandidateFile::add(const uint32_t start, const uint32_t end, const uint32_t markCount) {
+  if (!active_ || end <= start) return false;
+  for (uint32_t i = 0; i < count_; ++i) {
+    DiskCandidate record;
+    if (!readDisk(file_, i, record)) return false;
+    if (record.start != start || record.end != end) continue;
+    if (markCount > record.markCount) {
+      record.markCount = markCount;
+      if (!writeDisk(file_, i, record)) return false;
+    }
+    return true;
+  }
+  DiskCandidate record;
+  record.start = start;
+  record.end = end;
+  record.markCount = markCount;
+  const auto slash = finalPath_.rfind('/');
+  if (slash != std::string::npos) {
+    char name[40];
+    const int length = snprintf(name, sizeof(name), "%u_%u.wrn", start, end);
+    if (length > 0 && static_cast<size_t>(length) < sizeof(name)) {
+      const std::string existingPath = finalPath_.substr(0, slash) + "/" + name;
+      HalFile existing;
+      Header header;
+      if (Storage.openFileForRead("WR", existingPath, existing) &&
+          existing.read(&header, sizeof(header)) == static_cast<int>(sizeof(header)) && header.magic == kMagic &&
+          header.version == kVersion && header.commentCount > 0) {
+        record.query = static_cast<uint32_t>((header.flags & kFlagHasMore) != 0 ? CandidateQuery::Partial
+                                                                                : CandidateQuery::Stored);
+      }
+    }
+  }
+  if (!writeDisk(file_, count_, record)) return false;
+  ++count_;
+  return true;
+}
+
+bool CandidateFile::finish() {
+  if (!active_) return false;
+  CandidateHeader header;
+  header.chapterUid = chapterUid_;
+  header.count = count_;
+  if (!file_.seek(0) || file_.write(&header, sizeof(header)) != sizeof(header)) {
+    abort();
+    return false;
+  }
+  file_.flush();
+  file_.close();
+  active_ = false;
+  if (!WeReadStore::atomicReplace(partPath_, finalPath_)) {
+    Storage.remove(partPath_.c_str());
+    return false;
+  }
+  return true;
+}
+
+void CandidateFile::abort() {
+  if (file_.isOpen()) file_.close();
+  active_ = false;
+  count_ = 0;
+  if (!partPath_.empty() && Storage.exists(partPath_.c_str())) Storage.remove(partPath_.c_str());
+  partPath_.clear();
+  finalPath_.clear();
+}
+
+CandidateFile::~CandidateFile() { abort(); }
+
+bool candidatesReady(const char* bookId, const uint32_t chapterUid) {
+  HalFile file;
+  CandidateHeader header;
+  return openCandidate(bookId, chapterUid, file, header);
+}
+
+bool visitCandidates(const char* bookId, const uint32_t chapterUid,
+                     bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx) {
+  if (!visit || !isStandardBook(bookId)) return false;
+  const std::string path = candidatePath(bookId, chapterUid);
+  if (path.empty() || !Storage.exists(path.c_str())) return true;
+  HalFile file;
+  CandidateHeader header;
+  if (!openCandidate(bookId, chapterUid, file, header)) return false;
+  for (uint32_t i = 0; i < header.count; ++i) {
+    DiskCandidate record;
+    if (!readDisk(file, i, record)) return false;
+    if (!visit(ctx, i, toPublic(record))) return true;
+  }
+  return true;
+}
+
+bool readCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, Candidate& item) {
+  HalFile file;
+  CandidateHeader header;
+  if (!openCandidate(bookId, chapterUid, file, header) || index >= header.count) return false;
+  DiskCandidate record;
+  if (!readDisk(file, index, record)) return false;
+  item = toPublic(record);
+  return true;
+}
+
+bool updateCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, const Candidate& item) {
+  const std::string path = candidatePath(bookId, chapterUid);
+  if (path.empty()) return false;
+  HalFile file = Storage.open(path.c_str(), O_RDWR);
+  if (!file) return false;
+  CandidateHeader header;
+  if (file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kCandidateMagic ||
+      header.version != kCandidateVersion || header.headerSize != kCandidateHeaderSize ||
+      header.chapterUid != chapterUid || index >= header.count) {
+    return false;
+  }
+  return writeDisk(file, index, toDisk(item));
+}
+
+bool visitStoredRanges(const char* bookId, const uint32_t chapterUid,
+                       bool (*visit)(void* ctx, uint32_t start, uint32_t end), void* ctx) {
+  if (!visit || !isStandardBook(bookId)) return false;
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, false)) return false;
+  if (!Storage.exists(directory.c_str())) return true;
+  HalFile folder = Storage.open(directory.c_str());
+  if (!folder || !folder.isDirectory()) return true;
+  while (true) {
+    HalFile entry = folder.openNextFile();
+    if (!entry) break;
+    char name[64];
+    const size_t nameLen = entry.getName(name, sizeof(name));
+    if (nameLen == 0 || nameLen >= sizeof(name)) continue;
+    name[nameLen] = '\0';
+    uint32_t start = 0;
+    uint32_t end = 0;
+    if (!parseRangeFileName(name, start, end)) continue;
+    const std::string path = directory + "/" + baseName(name);
+    HalFile file;
+    Header header;
+    if (!Storage.openFileForRead("WR", path, file) ||
+        file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
+        header.version != kVersion || header.headerSize != sizeof(header) || header.chapterUid != chapterUid ||
+        header.rangeStart != start || header.rangeEnd != end || header.commentCount == 0 ||
+        header.commentCount > kMaxStoredComments) {
+      continue;
+    }
+    if (!visit(ctx, start, end)) return true;
+  }
+  return true;
+}
+
 bool loadChapter(const char* bookId, const uint32_t chapterUid, Range* ranges, const size_t capacity, size_t& count,
                  bool& truncated) {
   count = 0;
@@ -350,6 +575,8 @@ struct UnderlineState {
   std::unique_ptr<StreamingJsonParser> parser;
   Range* ranges = nullptr;
   size_t capacity = 0;
+  bool (*sink)(void*, uint32_t, uint32_t, uint32_t) = nullptr;
+  void* sinkCtx = nullptr;
   size_t count = 0;
   bool truncated = false;
   bool failed = false;
@@ -359,14 +586,27 @@ struct UnderlineState {
   uint8_t depth = 0;
   Expect expect = Expect::None;
   char rangeText[32] = {};
+  uint32_t markCount = 0;
 };
+
+void noteMarkCount(UnderlineState& state, const uint32_t value) {
+  if (value > state.markCount) state.markCount = value;
+}
 
 void acceptUnderline(UnderlineState& state) {
   uint32_t start = 0;
   uint32_t end = 0;
   if (!WeReadHighlight::parseRange(state.rangeText, start, end)) return;
+  if (state.sink) {
+    if (!state.sink(state.sinkCtx, start, end, state.markCount)) state.failed = true;
+    else ++state.count;
+    return;
+  }
   for (size_t i = 0; i < state.count; ++i) {
-    if (state.ranges[i].start == start && state.ranges[i].end == end) return;
+    if (state.ranges[i].start != start || state.ranges[i].end != end) continue;
+    // 同一段可能按 type 拆成多条，先到的那条 count 经常是 0。
+    if (state.markCount > state.ranges[i].markCount) state.ranges[i].markCount = state.markCount;
+    return;
   }
   if (state.count >= state.capacity) {
     state.truncated = true;
@@ -374,6 +614,7 @@ void acceptUnderline(UnderlineState& state) {
   }
   state.ranges[state.count].start = start;
   state.ranges[state.count].end = end;
+  state.ranges[state.count].markCount = state.markCount;
   ++state.count;
 }
 
@@ -388,6 +629,9 @@ void underlineKey(void* raw, const char* key, size_t) {
     state.expect = Expect::Reviews;
   } else if (frame == Frame::Item && strcmp(key, "range") == 0) {
     state.expect = Expect::Range;
+  } else if (frame == Frame::Item && (strcmp(key, "count") == 0 || strcmp(key, "totalCount") == 0)) {
+    // 划线人数是 count。网页回包里普通划线的 count 就是 0，热门（type 2）才有人数。
+    state.expect = Expect::MarkCount;
   }
 }
 
@@ -395,6 +639,8 @@ void underlineString(void* raw, const char* value, size_t len) {
   auto& state = *static_cast<UnderlineState*>(raw);
   if (state.expect == Expect::Range) {
     WeReadProtocol::decodeJsonString(value, len, state.rangeText, sizeof(state.rangeText));
+  } else if (state.expect == Expect::MarkCount) {
+    noteMarkCount(state, parseUint32(value, len));
   }
   state.expect = Expect::None;
 }
@@ -405,6 +651,7 @@ void underlineNumber(void* raw, const char* value, size_t len) {
   if (state.expect == Expect::Error && value && len > 0 && value[0] == '-') {
     state.errorCode = -static_cast<int>(parseUint32(value + 1, len - 1));
   }
+  if (state.expect == Expect::MarkCount) noteMarkCount(state, parseUint32(value, len));
   state.expect = Expect::None;
 }
 
@@ -416,7 +663,10 @@ void underlineObjectStart(void* raw) {
   if (state.depth == 0) next = Frame::Root;
   else if (parentFrame(state.stack, state.depth) == Frame::Reviews) next = Frame::Item;
   if (!pushFrame(state.stack, state.depth, next)) state.failed = true;
-  if (next == Frame::Item) state.rangeText[0] = '\0';
+  if (next == Frame::Item) {
+    state.rangeText[0] = '\0';
+    state.markCount = 0;
+  }
   state.expect = Expect::None;
 }
 
@@ -458,6 +708,10 @@ struct ReviewState {
   int errorCode = 0;
   uint32_t maxIdx = 0;
   uint32_t groupMaxIdx = 0;
+  uint32_t totalCount = 0;
+  uint32_t groupTotalCount = 0;
+  uint32_t markCount = 0;
+  uint32_t groupMarkCount = 0;
   uint64_t syncKey = 0;
   uint64_t groupSyncKey = 0;
   uint32_t added = 0;
@@ -525,6 +779,10 @@ void reviewKey(void* raw, const char* key, size_t) {
     state.expect = Expect::HasMore;
   } else if (frame == Frame::Group && strcmp(key, "maxIdx") == 0) {
     state.expect = Expect::MaxIdx;
+  } else if (frame == Frame::Group && strcmp(key, "totalCount") == 0) {
+    state.expect = Expect::TotalCount;
+  } else if (frame == Frame::Group && strcmp(key, "bookMarkCount") == 0) {
+    state.expect = Expect::MarkCount;
   } else if (frame == Frame::Group && (strcmp(key, "synckey") == 0 || strcmp(key, "syncKey") == 0)) {
     state.expect = Expect::SyncKey;
   } else if (frame == Frame::Group && strcmp(key, "pageReviews") == 0) {
@@ -546,6 +804,9 @@ void reviewString(void* raw, const char* value, size_t len) {
   if (state.expect == Expect::Range) {
     WeReadProtocol::decodeJsonString(value, len, state.rangeText, sizeof(state.rangeText));
     state.skipGroup = state.rangeText[0] && strcmp(state.rangeText, state.expectedRange) != 0;
+  } else if (state.expect == Expect::MarkCount && !state.skipGroup) {
+    const uint32_t parsed = parseUint32(value, len);
+    if (parsed > state.groupMarkCount) state.groupMarkCount = parsed;
   } else if (state.expect == Expect::Content) {
     appendContent(state, value, len);
   } else if (state.expect == Expect::AuthorName) {
@@ -569,6 +830,11 @@ void reviewNumber(void* raw, const char* value, size_t len) {
     state.groupHasMore = !(len == 1 && value && value[0] == '0');
   } else if (state.expect == Expect::MaxIdx && !state.skipGroup) {
     state.groupMaxIdx = parseUint32(value, len);
+  } else if (state.expect == Expect::TotalCount && !state.skipGroup) {
+    state.groupTotalCount = parseUint32(value, len);
+  } else if (state.expect == Expect::MarkCount && !state.skipGroup) {
+    const uint32_t parsed = parseUint32(value, len);
+    if (parsed > state.groupMarkCount) state.groupMarkCount = parsed;
   } else if (state.expect == Expect::SyncKey && !state.skipGroup) {
     state.groupSyncKey = parseUint64(value, len);
   }
@@ -597,6 +863,8 @@ void reviewObjectStart(void* raw) {
     state.skipGroup = false;
     state.groupHasMore = false;
     state.groupMaxIdx = 0;
+    state.groupTotalCount = 0;
+    state.groupMarkCount = 0;
     state.groupSyncKey = 0;
   }
   if (next == Frame::Item) clearReviewItem(state);
@@ -609,6 +877,8 @@ void reviewObjectEnd(void* raw) {
   if (ended == Frame::Group && !state.skipGroup) {
     state.hasMore = state.groupHasMore;
     state.maxIdx = state.groupMaxIdx;
+    state.totalCount = state.groupTotalCount;
+    state.markCount = state.groupMarkCount;
     state.syncKey = state.groupSyncKey;
   }
   if (ended == Frame::Item) commitReview(state);
@@ -672,7 +942,8 @@ UnderlineParser::UnderlineParser() : state_(nullptr) {
   }
   state->parser = makeUniqueNoThrow<StreamingJsonParser>(underlineCallbacks(state.get()));
   if (!state->parser) {
-    LOG_ERR("WR", "内存不足：评论候选 JSON 解析器 %u 字节", static_cast<unsigned>(sizeof(StreamingJsonParser)));
+    LOG_ERR("WR", "内存不足：评论候选 JSON 解析器 %u 字节",
+            static_cast<unsigned>(sizeof(StreamingJsonParser)));
     return;
   }
   state_ = state.release();
@@ -680,20 +951,37 @@ UnderlineParser::UnderlineParser() : state_(nullptr) {
 
 UnderlineParser::~UnderlineParser() { delete static_cast<UnderlineState*>(state_); }
 
+void resetUnderline(UnderlineState& state) {
+  state.parser->reset();
+  state.ranges = nullptr;
+  state.capacity = 0;
+  state.sink = nullptr;
+  state.sinkCtx = nullptr;
+  state.count = 0;
+  state.truncated = false;
+  state.failed = false;
+  state.rootClosed = false;
+  state.errorCode = 0;
+  state.depth = 0;
+  state.expect = Expect::None;
+  state.rangeText[0] = '\0';
+}
+
 bool UnderlineParser::begin(Range* ranges, const size_t capacity) {
   auto* state = static_cast<UnderlineState*>(state_);
   if (!state || !state->parser || !ranges || capacity == 0) return false;
-  state->parser->reset();
+  resetUnderline(*state);
   state->ranges = ranges;
   state->capacity = capacity;
-  state->count = 0;
-  state->truncated = false;
-  state->failed = false;
-  state->rootClosed = false;
-  state->errorCode = 0;
-  state->depth = 0;
-  state->expect = Expect::None;
-  state->rangeText[0] = '\0';
+  return true;
+}
+
+bool UnderlineParser::begin(const CandidateSink sink, void* ctx) {
+  auto* state = static_cast<UnderlineState*>(state_);
+  if (!state || !state->parser || !sink) return false;
+  resetUnderline(*state);
+  state->sink = sink;
+  state->sinkCtx = ctx;
   return true;
 }
 
@@ -733,7 +1021,8 @@ ReviewPageParser::ReviewPageParser() : state_(nullptr) {
   }
   state->parser = makeUniqueNoThrow<StreamingJsonParser>(reviewCallbacks(state.get()));
   if (!state->parser) {
-    LOG_ERR("WR", "内存不足：评论页 JSON 解析器 %u 字节", static_cast<unsigned>(sizeof(StreamingJsonParser)));
+    LOG_ERR("WR", "内存不足：评论页 JSON 解析器 %u 字节",
+            static_cast<unsigned>(sizeof(StreamingJsonParser)));
     return;
   }
   state_ = state.release();
@@ -758,6 +1047,10 @@ bool ReviewPageParser::begin(RangeFile* file, const char* rangeText) {
   state->errorCode = 0;
   state->maxIdx = 0;
   state->groupMaxIdx = 0;
+  state->totalCount = 0;
+  state->groupTotalCount = 0;
+  state->markCount = 0;
+  state->groupMarkCount = 0;
   state->syncKey = 0;
   state->groupSyncKey = 0;
   state->added = 0;
@@ -780,6 +1073,8 @@ bool ReviewPageParser::finish(Cursor& cursor) {
   if (!state || !state->parser) return false;
   cursor.maxIdx = state->maxIdx;
   cursor.syncKey = state->syncKey;
+  cursor.totalCount = state->totalCount;
+  cursor.markCount = state->markCount;
   cursor.hasMore = state->hasMore;
   cursor.errorCode = state->errorCode;
   cursor.added = state->added;
@@ -788,8 +1083,9 @@ bool ReviewPageParser::finish(Cursor& cursor) {
 
 CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
                            const uint32_t startMaxIdx, const uint64_t startSyncKey, const bool copyExisting,
-                           const ReviewPageFetch fetch, void* ctx) {
-  if (!fetch || end <= start) return CollectResult::Failed;
+                           const ReviewPageFetch fetch, void* ctx, const int maxPages, uint32_t* totalCount,
+                           uint32_t* markCount) {
+  if (!fetch || end <= start || maxPages <= 0) return CollectResult::Failed;
   RangeFile file;
   if (!file.begin(bookId, chapterUid, start, end, copyExisting)) return CollectResult::Failed;
 
@@ -797,7 +1093,7 @@ CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const 
   cursor.maxIdx = startMaxIdx;
   cursor.syncKey = startSyncKey;
   bool hasMore = false;
-  for (int page = 0; page < kMaxReviewPages && file.count() < kMaxStoredComments; ++page) {
+  for (int page = 0; page < maxPages && file.count() < kMaxStoredComments; ++page) {
     const uint32_t before = file.count();
     const uint32_t requestMax = cursor.maxIdx;
     const uint64_t requestSync = cursor.syncKey;
@@ -814,6 +1110,8 @@ CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const 
     }
     cursor = pageCursor;
     hasMore = pageCursor.hasMore;
+    if (totalCount && pageCursor.totalCount > 0) *totalCount = pageCursor.totalCount;
+    if (markCount && pageCursor.markCount > 0) *markCount = pageCursor.markCount;
     if (!hasMore) break;
   }
   if (file.capped()) hasMore = true;

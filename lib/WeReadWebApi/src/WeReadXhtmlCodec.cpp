@@ -1070,24 +1070,28 @@ bool nativeToVisibleOffset(const std::string& path, const uint32_t nativeOffset,
 
 bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffsets, uint32_t* visibleOffsets,
                             const size_t count) {
-  if (!nativeOffsets || !visibleOffsets || count > kMaxNativeOffsetBatch) return false;
+  if (!nativeOffsets || !visibleOffsets) return false;
   if (count == 0) return true;
   for (size_t i = 0; i < count; ++i) visibleOffsets[i] = UINT32_MAX;
 
-  // One reader render task. Kept off the 8KB stack: 256 offsets are about 1.5KB.
+  // 只在阅读任务里用。静态缓冲约 1.5KB，不放进 8KB 栈。一章评论可以超过这一批，分批扫。
   static uint32_t ordered[kMaxNativeOffsetBatch];
   static uint32_t mapped[kMaxNativeOffsetBatch];
   static uint16_t order[kMaxNativeOffsetBatch];
-  for (size_t i = 0; i < count; ++i) order[i] = static_cast<uint16_t>(i);
-  std::sort(order, order + count, [&](const uint16_t left, const uint16_t right) {
-    return nativeOffsets[left] < nativeOffsets[right];
-  });
-  for (size_t i = 0; i < count; ++i) {
-    ordered[i] = nativeOffsets[order[i]];
-    mapped[i] = UINT32_MAX;
+  for (size_t base = 0; base < count; base += kMaxNativeOffsetBatch) {
+    const size_t batch = std::min(kMaxNativeOffsetBatch, count - base);
+    const uint32_t* nativeBatch = nativeOffsets + base;
+    for (size_t i = 0; i < batch; ++i) order[i] = static_cast<uint16_t>(i);
+    std::sort(order, order + batch, [&](const uint16_t left, const uint16_t right) {
+      return nativeBatch[left] < nativeBatch[right];
+    });
+    for (size_t i = 0; i < batch; ++i) {
+      ordered[i] = nativeBatch[order[i]];
+      mapped[i] = UINT32_MAX;
+    }
+    if (!mapSortedNativeOffsets(path, ordered, mapped, batch)) return false;
+    for (size_t i = 0; i < batch; ++i) visibleOffsets[base + order[i]] = mapped[i];
   }
-  if (!mapSortedNativeOffsets(path, ordered, mapped, count)) return false;
-  for (size_t i = 0; i < count; ++i) visibleOffsets[order[i]] = mapped[i];
   return true;
 }
 

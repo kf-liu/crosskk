@@ -107,6 +107,8 @@ class EpubReaderActivity final : public ReaderActivity {
   unsigned long highlightNoticeTime_ = 0;
   bool highlightSheetOpen_ = false;
   char highlightBookmarkId_[32] = {};
+  uint32_t highlightCommentStart_ = 0;
+  uint32_t highlightCommentEnd_ = 0;
   HighlightSelectPhase highlightSelectPhase_ = HighlightSelectPhase::Idle;
   int highlightAnchorSpine_ = -1;
   uint32_t highlightAnchor_ = 0;

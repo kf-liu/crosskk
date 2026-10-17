@@ -10,17 +10,31 @@ class Page;
 
 namespace WeReadCommentOverlay {
 
-// 进入一章时拉候选 range，只对和当前页相交、这一轮还没查过的 range 翻页拉评论。
-// 返回 true 表示点线需要重画。不打开 Wi-Fi。
+// 把当前页登记给后台任务。网络不在阅读循环里发。返回 true 表示点线需要重画。
 bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumber, uint32_t pageStart,
               uint32_t pageEnd);
+
+// 后台写入了新评论。阅读循环用来刷新画面，本身不发请求。
+bool takeDirty();
 
 // 有他人评论的片段画点状下划线。坐标和划线相同，灰阶各遍复用这一页的结果。
 void drawForBook(GfxRenderer& renderer, int fontId, const Page& page, int xOffset, int yOffset, const char* bookId,
                  const Epub& epub, int spineIndex);
 
+// 阅读页底栏文案。这一页还在拉、加载失败，或本章候选被截断时返回句子，否则 nullptr。
+const char* chapterStatus();
+
 bool openAt(int x, int y);
+// 划线的可见区间盖住了已同步的评论段时，写出该段的原生区间。点在某一段上时优先用那一段。
+bool commentInside(uint32_t visibleStart, uint32_t visibleEnd, int x, int y, uint32_t& nativeStart,
+                   uint32_t& nativeEnd);
+bool openStored(uint32_t nativeStart, uint32_t nativeEnd);
 bool panelOpen();
+// 全文页占满屏幕。弹窗则画在已经画好的阅读页上。
+bool replacesPage();
+bool paintsOverPage();
+// 阅读页重新画完、弹窗盖上去之后调用，后面的翻页只重画弹窗。
+void markPageUnderlay();
 // 面板打开时由阅读循环调用。返回 true 表示画面变了。
 bool handlePanel(MappedInputManager& input, const GfxRenderer& renderer);
 void drawPanel(GfxRenderer& renderer);

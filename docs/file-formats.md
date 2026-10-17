@@ -758,6 +758,22 @@ EPUB，不写这个目录。
 阅读器按 `maxIdx` / `syncKey` 翻页，每页 20 条，直到没有下一页或达到 200 条。
 只在 Wi-Fi 已经连通时请求；失败或空结果都不覆盖已有文件。
 
+同一目录下的 `ranges.wri` 是这一章的候选索引，不设条数上限。长章整表留在卡上，
+内存里只保留当前要拉、要画的那一段。文件头 16 字节，小端：
+
+| 偏移 | 字段 |
+|------|------|
+| 0 | `uint32 magic`（`0x31495257`，字节 `WRI1`） |
+| 4 | `uint16 version`（`1`） |
+| 6 | `uint16 headerSize`（`16`） |
+| 8 | `uint32 chapterUid` |
+| 12 | `uint32 count` |
+
+每条记录 20 字节：`uint32 start`、`uint32 end`、`uint32 markCount`、`uint32 commentTotal`、
+`uint32 query`（0 未知，1 这一轮确认没有评论，2 已存，3 还有下一页，4 失败）。
+`query` 和 `commentTotal` 只在内存语义里使用，不写入 WRN1。写入先写 `ranges.wri.part`，
+完成后再替换；失败删掉 `.part`。重复的 range 只抬高 `markCount`。
+
 ## Reading background cache
 
 `/.crosspoint/background/reading_bg.bin` stores a versioned 1-bit framebuffer

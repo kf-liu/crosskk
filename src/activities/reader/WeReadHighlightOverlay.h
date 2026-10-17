@@ -17,8 +17,9 @@ void drawForBook(GfxRenderer& renderer, int fontId, const Page& page, int xOffse
 // 划线索引更新后丢掉按页缓存，下一帧重新读 SD。
 void invalidate();
 
-// 点在当前页某条划线的文字上时，写出它的 bookmarkId。
-bool hitBookmark(int x, int y, char* bookmarkId, size_t bookmarkIdSize);
+// 点在当前页某条划线的文字上时，写出它的 bookmarkId。可见区间可选。
+bool hitBookmark(int x, int y, char* bookmarkId, size_t bookmarkIdSize, uint32_t* visibleStart = nullptr,
+                 uint32_t* visibleEnd = nullptr);
 
 enum class WordPlace : uint8_t { AtPoint, FirstOnPage, LastOnPage };
 

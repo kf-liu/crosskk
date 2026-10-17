@@ -33,6 +33,7 @@
 #include "BookmarkEntry.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "util/BackgroundWork.h"
 #include "DictionaryWordSelectActivity.h"
 #include "EpubReaderBookmarksActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
@@ -723,7 +724,9 @@ bool EpubReaderActivity::handleWeReadHighlightTap() {
   int y = 0;
   if (!mappedInput.wasScreenTapped(x, y)) return false;
   char bookmarkId[32] = {};
-  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId))) {
+  uint32_t visibleStart = 0;
+  uint32_t visibleEnd = 0;
+  if (!WeReadHighlightOverlay::hitBookmark(x, y, bookmarkId, sizeof(bookmarkId), &visibleStart, &visibleEnd)) {
     if (WeReadCommentOverlay::openAt(x, y)) {
       requestUpdate();
       return true;
@@ -732,10 +735,30 @@ bool EpubReaderActivity::handleWeReadHighlightTap() {
   }
   strncpy(highlightBookmarkId_, bookmarkId, sizeof(highlightBookmarkId_) - 1);
   highlightBookmarkId_[sizeof(highlightBookmarkId_) - 1] = '\0';
+  highlightCommentStart_ = 0;
+  highlightCommentEnd_ = 0;
+  const bool hasComments =
+      WeReadCommentOverlay::commentInside(visibleStart, visibleEnd, x, y, highlightCommentStart_, highlightCommentEnd_);
+  if (!hasComments) {
+    highlightCommentStart_ = 0;
+    highlightCommentEnd_ = 0;
+  }
   const char* removeLabel = tr(STR_WEREAD_HIGHLIGHT_REMOVE);
-  const char* const options[] = {removeLabel};
-  overlayPopup.showMessage(tr(STR_WEREAD_HIGHLIGHT_COMMENTS), tr(STR_WEREAD_HIGHLIGHT_NO_COMMENTS), options, 1, 0,
-                           [this](int index) {
+  const char* viewLabel = tr(STR_WEREAD_VIEW_COMMENTS);
+  const char* const withComments[] = {viewLabel, removeLabel};
+  const char* const withoutComments[] = {removeLabel};
+  const char* body = hasComments ? tr(STR_WEREAD_HIGHLIGHT_HAS_COMMENTS) : tr(STR_WEREAD_HIGHLIGHT_NO_COMMENTS);
+  overlayPopup.showMessage(tr(STR_WEREAD_HIGHLIGHT_COMMENTS), body, hasComments ? withComments : withoutComments,
+                           hasComments ? 2 : 1, 0, [this](int index) {
+                             if (highlightCommentEnd_ > highlightCommentStart_) {
+                               if (index == 0) {
+                                 WeReadCommentOverlay::openStored(highlightCommentStart_, highlightCommentEnd_);
+                                 requestUpdate();
+                                 return;
+                               }
+                               if (index == 1) removeOpenWeReadHighlight();
+                               return;
+                             }
                              if (index == 0) removeOpenWeReadHighlight();
                            });
   highlightSheetOpen_ = overlayPopup.isActive();
@@ -1130,6 +1153,7 @@ void EpubReaderActivity::loop() {
 #ifdef ENABLE_CHINESE_VERSION
   if (maybeOfferCompleteChineseFont()) return;
   refreshWeReadHighlightsIfNeeded();
+  if (WeReadCommentOverlay::takeDirty()) requestUpdate();
   if (wereadBookId_[0] && epub && section && section->currentPage >= 0) {
     const int page = section->currentPage;
     uint32_t pageStart = 0;
@@ -2103,6 +2127,20 @@ bool EpubReaderActivity::skipLoopDelay() {
 void EpubReaderActivity::renderBook() {
   currentPageLinks.clear();
   if (!epub) return;
+#ifdef ENABLE_CHINESE_VERSION
+  // 全文页单独占一屏。弹窗盖在还留在帧缓冲里的阅读页上，不再整页重画。
+  if (WeReadCommentOverlay::replacesPage()) {
+    renderer.clearScreen();
+    WeReadCommentOverlay::drawPanel(renderer);
+    renderer.displayBuffer();
+    return;
+  }
+  if (WeReadCommentOverlay::paintsOverPage()) {
+    WeReadCommentOverlay::drawPanel(renderer);
+    renderer.displayBuffer();
+    return;
+  }
+#endif
   // Runs under the render task's RenderLock; catches every requestUpdate()
   // exit from the overlay while its deferred chrome refresh is still pending.
   settleOverlayRefresh();
@@ -2483,9 +2521,7 @@ void EpubReaderActivity::renderBook() {
   }
 
 #ifdef ENABLE_CHINESE_VERSION
-  if (WeReadCommentOverlay::panelOpen()) {
-    WeReadCommentOverlay::drawPanel(renderer);
-  } else if (highlightSheetOpen_ && overlayPopup.isActive()) {
+  if (highlightSheetOpen_ && overlayPopup.isActive()) {
     overlayPopup.processRender(renderer, mappedInput);
   } else if (highlightSelectPhase_ == HighlightSelectPhase::AwaitStart ||
              highlightSelectPhase_ == HighlightSelectPhase::AwaitEnd) {
@@ -3071,6 +3107,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
 #endif
   renderStatusBar();
+#ifdef ENABLE_CHINESE_VERSION
+  // 从全文页回到弹窗时，阅读页要先画进帧缓冲，再盖上弹窗，只推一次屏。
+  if (WeReadCommentOverlay::panelOpen() && !WeReadCommentOverlay::paintsOverPage() &&
+      !WeReadCommentOverlay::replacesPage()) {
+    WeReadCommentOverlay::drawPanel(renderer);
+    WeReadCommentOverlay::markPageUnderlay();
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    return;
+  }
+#endif
   const auto tBwRender = millis();
 
   if (absoluteImageGrayscale) {
@@ -3383,8 +3429,18 @@ void EpubReaderActivity::renderStatusBar() const {
   std::string title;
   int textYOffset = 0;
   const auto sb = SETTINGS.statusBarSpec();
+  const char* busy = BackgroundWork::foregroundLabel();
+#ifdef ENABLE_CHINESE_VERSION
+  const char* commentStatus = WeReadCommentOverlay::chapterStatus();
+#else
+  const char* commentStatus = nullptr;
+#endif
 
-  if (automaticPageTurnActive) {
+  if (commentStatus && commentStatus[0] != '\0') {
+    title = commentStatus;
+  } else if (busy && busy[0] != '\0') {
+    title = busy;
+  } else if (automaticPageTurnActive) {
     title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);
     const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
     if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {

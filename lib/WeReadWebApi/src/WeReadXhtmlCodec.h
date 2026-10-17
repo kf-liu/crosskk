@@ -17,7 +17,7 @@ bool sanitizeChapter(const std::string& inputPath, const std::string& outputPath
 
 bool visibleToNativeOffset(const std::string& path, uint32_t visibleOffset, uint32_t& nativeOffset);
 bool nativeToVisibleOffset(const std::string& path, uint32_t nativeOffset, uint32_t& visibleOffset);
-// One pass over the chapter. Unmapped entries stay UINT32_MAX. nativeOffsets is not reordered.
+// 调用方的数组顺序不变。对不上的项保持 UINT32_MAX。段数多时内部分批扫描。
 bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffsets, uint32_t* visibleOffsets,
                             size_t count);
 

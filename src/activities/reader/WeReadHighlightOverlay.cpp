@@ -309,17 +309,23 @@ void drawForBook(GfxRenderer& renderer, const int fontId, const Page& page, cons
   drawRanges(renderer, fontId, page, xOffset, yOffset, marks);
 }
 
-bool hitBookmark(const int x, const int y, char* bookmarkId, const size_t bookmarkIdSize) {
+bool hitBookmark(const int x, const int y, char* bookmarkId, const size_t bookmarkIdSize, uint32_t* visibleStart,
+                 uint32_t* visibleEnd) {
   if (!bookmarkId || bookmarkIdSize < 2) return false;
   bookmarkId[0] = '\0';
+  if (visibleStart) *visibleStart = 0;
+  if (visibleEnd) *visibleEnd = 0;
   const PageMarks& marks = pageMarks();
   if (!marks.valid) return false;
   for (size_t i = 0; i < marks.segmentCount; ++i) {
     const HitSegment& segment = marks.segments[i];
     if (segment.markIndex >= marks.count || segment.w <= 0 || segment.h <= 0) continue;
     if (x < segment.x || x >= segment.x + segment.w || y < segment.y || y >= segment.y + segment.h) continue;
-    strncpy(bookmarkId, marks.marks[segment.markIndex].bookmarkId, bookmarkIdSize - 1);
+    const WeReadHighlight::ChapterMark& mark = marks.marks[segment.markIndex];
+    strncpy(bookmarkId, mark.bookmarkId, bookmarkIdSize - 1);
     bookmarkId[bookmarkIdSize - 1] = '\0';
+    if (visibleStart) *visibleStart = mark.start;
+    if (visibleEnd) *visibleEnd = mark.end;
     return bookmarkId[0] != '\0';
   }
   return false;

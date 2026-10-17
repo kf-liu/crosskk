@@ -89,7 +89,7 @@ std::string reviewItem(const int index, const char* authorKey) {
 
 std::string reviewPage(const char* range, const bool hasMore, const uint32_t maxIdx, const uint64_t syncKey,
                        const int first, const int count, const char* authorKey) {
-  std::string json = std::string("{\"reviews\":[{\"range\":\"") + range + "\",\"totalCount\":9,\"hasMore\":" +
+  std::string json = std::string("{\"reviews\":[{\"range\":\"") + range + "\",\"bookMarkCount\":12,\"totalCount\":9,\"hasMore\":" +
                      (hasMore ? "true" : "false") + ",\"maxIdx\":" + std::to_string(maxIdx) +
                      ",\"synckey\":" + std::to_string(syncKey) + ",\"pageReviews\":[";
   for (int i = 0; i < count; ++i) {
@@ -132,8 +132,27 @@ TEST_F(WeReadCommentTest, KeepsNineUnderlineRangesAndIgnoresHeat) {
   ASSERT_TRUE(feed(parser, nineUnderlines()));
   EXPECT_EQ(parser.count(), 9u);
   EXPECT_FALSE(parser.truncated());
+  EXPECT_EQ(ranges[0].markCount, 1u);
   EXPECT_EQ(ranges[8].start, 80u);
   EXPECT_EQ(ranges[8].end, 84u);
+  EXPECT_EQ(ranges[8].markCount, 9u);
+}
+
+TEST_F(WeReadCommentTest, ReadsPeopleCountFromTotalCountWhenCountIsZero) {
+  WeReadComment::UnderlineParser parser;
+  WeReadComment::Range ranges[8] = {};
+  ASSERT_TRUE(parser.begin(ranges, 8));
+  const std::string json =
+      R"({"count":2,"underlines":[{"range":"10-20","count":0,"score":8,"type":1,"totalCount":42},)"
+      R"({"range":"10-20","count":"7","type":2},{"range":"30-40","count":"15","score":1}]})";
+  ASSERT_TRUE(feed(parser, json));
+  EXPECT_EQ(parser.count(), 2u);
+  EXPECT_EQ(ranges[0].start, 10u);
+  EXPECT_EQ(ranges[0].end, 20u);
+  EXPECT_EQ(ranges[0].markCount, 42u);
+  EXPECT_EQ(ranges[1].start, 30u);
+  EXPECT_EQ(ranges[1].end, 40u);
+  EXPECT_EQ(ranges[1].markCount, 15u);
 }
 
 TEST_F(WeReadCommentTest, StoresNineCommentsWithoutStoppingAtEight) {
@@ -148,6 +167,7 @@ TEST_F(WeReadCommentTest, StoresNineCommentsWithoutStoppingAtEight) {
   EXPECT_EQ(cursor.added, 9u);
   EXPECT_EQ(cursor.maxIdx, 9u);
   EXPECT_EQ(cursor.syncKey, 77u);
+  EXPECT_EQ(cursor.markCount, 12u);
   EXPECT_FALSE(cursor.hasMore);
   ASSERT_TRUE(file.finish(cursor.maxIdx, cursor.syncKey, cursor.hasMore));
 
@@ -238,6 +258,30 @@ TEST_F(WeReadCommentTest, RejectsOfficialAccountBooks) {
   EXPECT_EQ(WeReadComment::collectRange("MP_WXS_123", 1, 10, 20, 0, 0, false, scriptedFetch, nullptr),
             WeReadComment::CollectResult::Failed);
   EXPECT_FALSE(std::filesystem::exists(root_ / ".crosspoint/weread/comments"));
+}
+
+TEST_F(WeReadCommentTest, StoresEveryCandidateWithoutACap) {
+  WeReadComment::CandidateFile file;
+  ASSERT_TRUE(file.begin("3300003224", 9));
+  for (uint32_t i = 0; i < 70; ++i) {
+    ASSERT_TRUE(file.add(i * 10, i * 10 + 4, i == 3 ? 1u : i + 1));
+  }
+  ASSERT_TRUE(file.add(30, 34, 99));
+  EXPECT_EQ(file.count(), 70u);
+  ASSERT_TRUE(file.finish());
+  ASSERT_TRUE(WeReadComment::candidatesReady("3300003224", 9));
+  WeReadComment::Candidate item;
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 9, 3, item));
+  EXPECT_EQ(item.start, 30u);
+  EXPECT_EQ(item.end, 34u);
+  EXPECT_EQ(item.markCount, 99u);
+  uint32_t seen = 0;
+  auto visit = [](void* raw, uint32_t, const WeReadComment::Candidate&) {
+    ++*static_cast<uint32_t*>(raw);
+    return true;
+  };
+  ASSERT_TRUE(WeReadComment::visitCandidates("3300003224", 9, visit, &seen));
+  EXPECT_EQ(seen, 70u);
 }
 
 }  // namespace

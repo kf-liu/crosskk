@@ -4590,10 +4590,12 @@ bool reviewFinish(void* raw) {
 
 }  // namespace
 
-bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, WeReadComment::Range* ranges,
-                            const size_t capacity, size_t& count) {
-  count = 0;
-  if (!commentIdSafe(bookId) || !ranges || capacity == 0) return false;
+bool writeCandidate(void* ctx, const uint32_t start, const uint32_t end, const uint32_t markCount) {
+  return static_cast<WeReadComment::CandidateFile*>(ctx)->add(start, end, markCount);
+}
+
+bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid) {
+  if (!commentIdSafe(bookId)) return false;
   if (!WeReadHttpClient::networkReady()) return false;
   WeReadStore::Session session;
   if (!WeReadStore::loadSession(session) || !session.valid()) return false;
@@ -4606,7 +4608,8 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, WeRea
   constexpr size_t kReadSize = 1024;
   auto buffer = makeUniqueNoThrow<uint8_t[]>(kCookieSize + kUrlSize + kReadSize);
   if (!buffer) {
-    LOG_ERR("WR", "内存不足：评论候选请求缓冲 %u 字节", static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize));
+    LOG_ERR("WR", "内存不足：评论候选请求缓冲 %u 字节",
+            static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize));
     return false;
   }
   char* cookie = reinterpret_cast<char*>(buffer.get());
@@ -4622,9 +4625,15 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, WeRea
   char referer[160];
   if (!readerReferer(bookId, referer, sizeof(referer))) return false;
 
+  WeReadComment::CandidateFile index;
+  if (!index.begin(bookId, chapterUid)) return false;
+
   Error error = Error::Protocol;
   for (int attempt = 0; attempt < 2; ++attempt) {
-    if (!parser->begin(ranges, capacity)) return false;
+    if (!parser->begin(writeCandidate, &index)) {
+      index.abort();
+      return false;
+    }
     CommentHttpCtx http;
     http.feed = underlineFeed;
     http.finish = underlineFinish;
@@ -4636,17 +4645,20 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, WeRea
     if (attempt == 0 && parser->errorCode() == -2012 &&
         renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
       LOG_INF("WR", "评论候选请求已续期会话");
+      index.abort();
+      if (!index.begin(bookId, chapterUid)) return false;
       continue;
     }
     LOG_ERR("WR", "评论候选请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),
             parser->errorCode());
+    index.abort();
     return false;
   }
-  if (error != Error::Ok) return false;
-  count = parser->count();
-  if (parser->truncated()) {
-    LOG_ERR("WR", "本章评论候选超过 %u 条，只保留前面的", static_cast<unsigned>(capacity));
+  if (error != Error::Ok || !parser->finish()) {
+    index.abort();
+    return false;
   }
+  if (!index.finish()) return false;
   if (!WeReadStore::saveSession(session)) LOG_ERR("WR", "评论候选已解析，但会话没有写回");
   return true;
 }
