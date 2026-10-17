@@ -181,6 +181,7 @@ bool ReaderActivity::handleEndOfBookMenu(const bool suppressConfirmRelease) {
   std::string openPath;
   switch (endOfBookOptions->handleMenuInput(mappedInput, &openPath)) {
     case EndOfBookOptions::Action::OpenBook:
+      if (syncProgressBeforeLeave(openPath)) return true;
       activityManager.goToReader(openPath);
       return true;
     case EndOfBookOptions::Action::GoHome:

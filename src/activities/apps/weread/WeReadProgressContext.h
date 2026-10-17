@@ -14,4 +14,12 @@ struct WeReadProgressContext {
   WeReadBackend::Client::LocalOffsetBasis localOffsetBasis = WeReadBackend::Client::LocalOffsetBasis::None;
 };
 
+// 一次进度同步是怎么被打开的。进入和退出在后台走，不换阅读画面；菜单仍走手动比较。
+enum class WeReadSyncOccasion : uint8_t {
+  Manual,
+  Enter,
+  Exit,
+  Duration,
+};
+
 static_assert(sizeof(WeReadProgressContext) == 20);

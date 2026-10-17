@@ -27,6 +27,11 @@ class ReaderActivity : public Activity {
                           std::string bookPath, bool allowFastInitialRefresh);
 
   virtual bool loadBook() = 0;
+  // 离开当前书去打开另一本之前。返回 true 表示派生阅读器已经接过这次离开（例如先同步进度）。
+  virtual bool syncProgressBeforeLeave(const std::string& nextPath) {
+    (void)nextPath;
+    return false;
+  }
   // Called when loadBook() failed. Return true to keep the activity alive
   // (e.g. showing a dialog); false finishes it (the default).
   virtual bool handleLoadFailure() { return false; }

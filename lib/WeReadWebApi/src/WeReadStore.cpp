@@ -618,6 +618,8 @@ std::string optionsPath(const std::string& bookDir) { return bookDir + "/options
 
 std::string initialProgressPath(const char* bookId) { return bookDirectory(bookId) + "/initial-progress.bin"; }
 
+std::string readingTimePath(const char* bookId) { return bookDirectory(bookId) + "/reading-time.bin"; }
+
 std::string detailPath(const std::string& bookDir) { return bookDir + "/detail.bin"; }
 
 std::string coverPath(const std::string& bookDir) { return bookDir + "/cover.v2.bmp"; }
@@ -847,6 +849,47 @@ bool saveInitialProgress(const char* bookId, const float fraction) {
     HalFile file;
     written =
         Storage.openFileForWrite("WR", partPath, file) && file.write(&progress, sizeof(progress)) == sizeof(progress);
+    if (written) file.flush();
+  }
+  if (!written) {
+    if (Storage.exists(partPath.c_str())) Storage.remove(partPath.c_str());
+    return false;
+  }
+  return atomicReplace(partPath, finalPath);
+}
+
+bool loadBookReadingSeconds(const char* bookId, uint32_t& seconds) {
+  seconds = 0;
+  if (!bookId || !bookId[0]) return false;
+  struct FileRecord {
+    uint32_t magic;
+    uint32_t seconds;
+  };
+  FileRecord record;
+  HalFile file;
+  if (!Storage.openFileForRead("WR", readingTimePath(bookId), file) || file.fileSize64() != sizeof(record) ||
+      file.read(&record, sizeof(record)) != static_cast<int>(sizeof(record)) || record.magic != kReadingTimeMagic) {
+    return false;
+  }
+  seconds = record.seconds;
+  return true;
+}
+
+bool saveBookReadingSeconds(const char* bookId, const uint32_t seconds) {
+  if (!bookId || !bookId[0]) return false;
+  const std::string bookDir = bookDirectory(bookId);
+  if (!ensureRoot() || !Storage.ensureDirectoryExists(bookDir.c_str())) return false;
+  const std::string finalPath = readingTimePath(bookId);
+  const std::string partPath = finalPath + ".part";
+  if (Storage.exists(partPath.c_str())) Storage.remove(partPath.c_str());
+  const struct FileRecord {
+    uint32_t magic;
+    uint32_t seconds;
+  } record{kReadingTimeMagic, seconds};
+  bool written = false;
+  {
+    HalFile file;
+    written = Storage.openFileForWrite("WR", partPath, file) && file.write(&record, sizeof(record)) == sizeof(record);
     if (written) file.flush();
   }
   if (!written) {

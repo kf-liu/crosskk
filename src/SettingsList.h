@@ -535,6 +535,9 @@ inline const std::vector<SettingInfo>& getBaseSettingsList() {
         SettingInfo::Value(StrId::STR_WARMTH, &CrossPointSettings::frontlightWarmth, {0, 100, 5}, "frontlightWarmth"),
 #endif
         SettingInfo::Toggle(StrId::STR_FRONTLIGHT, &CrossPointSettings::frontlightOn, "frontlightOn"),
+        // Control-center online switch. Category-less so the pull-down owns
+        // the on-device control; the key is still persisted.
+        SettingInfo::Toggle(StrId::STR_WIFI_ONLINE, &CrossPointSettings::wifiStayConnected, "wifiStayConnected"),
     });
     v.insert(v.end(), {
         // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---

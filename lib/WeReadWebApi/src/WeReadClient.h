@@ -66,6 +66,10 @@ enum class ProgressSyncMode : uint8_t {
   Compare,
   ApplyRemote,
   UploadLocal,
+  // Report reading seconds at the cloud position. Does not move either bookmark.
+  ReportDuration,
+  // While reading: current local position, rt is one interval, not a backlog.
+  LiveReading,
 };
 
 enum class ProgressSyncOutcome : uint8_t {
@@ -74,6 +78,7 @@ enum class ProgressSyncOutcome : uint8_t {
   SelectionRequired,
   ApplyRemote,
   LocalUploaded,
+  DurationReported,
 };
 
 struct ProgressSyncResult {
@@ -101,6 +106,9 @@ class Operation {
   bool begin(Kind kind, const WeReadStore::ShelfRecord* book = nullptr, DownloadOptions options = {},
              ShelfCoverScope shelfCoverScope = ShelfCoverScope::None);
   bool beginProgressSync(const char* bookId, ProgressSyncInput input, ProgressSyncMode mode);
+  // Another live slice on the session already entered. False starts a new enter.
+  bool continueLiveReading(ProgressSyncInput input);
+  static constexpr uint32_t kLiveReadingIntervalSeconds = 30;
   bool beginBrowseCache(const WeReadStore::BookRecord& book);
   Event step(WeReadStore::WorkCallback callback = nullptr, void* callbackContext = nullptr);
   void cancel();
@@ -307,6 +315,9 @@ class Operation {
         return ProgressAction::ApplyRemote;
       case ProgressSyncMode::UploadLocal:
         return ProgressAction::UploadLocal;
+      case ProgressSyncMode::ReportDuration:
+      case ProgressSyncMode::LiveReading:
+        return ProgressAction::AlreadySynced;
     }
     return ProgressAction::SelectDirection;
   }
@@ -318,19 +329,17 @@ class Operation {
     }
     return true;
   }
-  // Reading time rides on one progress report. Matching positions still upload
-  // when there are seconds to send; choosing the cloud reports that remote
-  // position so the seconds cannot move it backwards.
-  static constexpr ProgressReportPlan progressReportPlan(const ProgressAction action, const uint32_t readingSeconds) {
+  // Progress sync never carries reading time. Duration is a separate report.
+  static constexpr ProgressReportPlan progressReportPlan(const ProgressAction action) {
     switch (action) {
       case ProgressAction::SelectDirection:
         return ProgressReportPlan::Ask;
       case ProgressAction::UploadLocal:
         return ProgressReportPlan::UploadLocal;
       case ProgressAction::AlreadySynced:
-        return readingSeconds > 0 ? ProgressReportPlan::UploadLocal : ProgressReportPlan::Finish;
+        return ProgressReportPlan::Finish;
       case ProgressAction::ApplyRemote:
-        return readingSeconds > 0 ? ProgressReportPlan::UploadRemote : ProgressReportPlan::Finish;
+        return ProgressReportPlan::Finish;
     }
     return ProgressReportPlan::Ask;
   }
@@ -419,6 +428,7 @@ class Operation {
   bool bindRemoteChapterForReport();
   void persistInitialProgress();
   Error decideProgress();
+  Error bindLocalChapter();
   Error fetchReaderOnce();
   Error fetchShardOnce(const char* endpoint, const std::string& destination);
   void startDownloadMetrics();
@@ -487,6 +497,8 @@ class Operation {
   int responseStatus_ = 0;
   uint32_t progressUploadStartedAt_ = 0;
   bool reportRemoteOutcome_ = false;
+  bool durationReport_ = false;
+  bool liveSessionReady_ = false;
   bool readingTimeConsumed_ = false;
   char previousVid_[64] = {};
   char loginUid_[128] = {};

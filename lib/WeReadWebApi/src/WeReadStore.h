@@ -21,6 +21,7 @@ constexpr uint32_t kImageWorkMagic = 0x31504957;        // WIP1
 constexpr uint32_t kBookOptionsMagic = 0x314F5257;      // WRO1
 constexpr uint32_t kBookDetailMagic = 0x31444257;       // WBD1
 constexpr uint32_t kInitialProgressMagic = 0x31505257;  // WRP1
+constexpr uint32_t kReadingTimeMagic = 0x31545257;      // WRT1
 constexpr uint16_t kIndexVersion = 1;
 constexpr uint16_t kBookOptionsVersion = 1;
 constexpr uint16_t kBookDetailVersion = 1;
@@ -222,6 +223,9 @@ bool saveBookOptions(const std::string& bookDir, const BookOptions& options);
 bool loadInitialProgress(const char* bookId, float& fraction);
 bool saveInitialProgress(const char* bookId, float fraction);
 bool clearInitialProgress(const char* bookId);
+// Seconds returned by getProgress readingTime. Missing file means this book has not been synced yet.
+bool loadBookReadingSeconds(const char* bookId, uint32_t& seconds);
+bool saveBookReadingSeconds(const char* bookId, uint32_t seconds);
 bool openBookDetail(const std::string& bookDir, BookDetailHeader& header, HalFile& file);
 bool atomicReplace(const std::string& partPath, const std::string& finalPath);
 bool looksLikeZip(const std::string& path);

@@ -12,6 +12,9 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
+#include "NetworkStartup.h"
+#include "util/BackgroundWork.h"
 #include "OpdsServerStore.h"
 #include "apps/2048/Game2048Activity.h"
 #include "apps/AppsMenuActivity.h"
@@ -26,6 +29,7 @@
 #endif
 #ifdef ENABLE_CHINESE_VERSION
 #include "apps/weread/WeReadActivity.h"
+#include "apps/weread/WeReadBackgroundSync.h"
 #endif
 #include "apps/gomoku/GomokuMenuActivity.h"
 #include "apps/minesweeper/MinesweeperMenuActivity.h"
@@ -155,7 +159,8 @@ void ActivityManager::loop() {
       if (currentActivity->handleHomeGesture()) {
         return;
       }
-      goHome();
+      // 阅读器要在离开前把进度交到后台，不能绕过 onGoHome 直接回首页。
+      currentActivity->onGoHome();
       return;
     }
 
@@ -187,6 +192,15 @@ void ActivityManager::loop() {
 
     // Note: do not hold a lock here, the loop() method must be responsible for acquire one if needed
     if (!handleHomeStandbyInput()) currentActivity->loop();
+    // 下拉控制中心的任务区跟着后台动作刷新。阅读页自己刷底部。
+    if (currentActivity->name == "FrontlightPanel") {
+      static uint32_t seenBackgroundWork = 0;
+      const uint32_t backgroundGeneration = BackgroundWork::generation();
+      if (backgroundGeneration != seenBackgroundWork) {
+        seenBackgroundWork = backgroundGeneration;
+        currentActivity->requestUpdate();
+      }
+    }
   }
 
   while (pendingAction.load() != PendingAction::None) {
@@ -288,6 +302,15 @@ void ActivityManager::loop() {
       xTaskNotify(renderTaskHandle, 1, eIncrement);
     }
   }
+
+#ifdef ENABLE_CHINESE_VERSION
+  // 进入比较和退出上传不占阅读画面。退出后阅读器已经销毁，步骤还要在这里继续。
+  WeReadBackgroundSync::step();
+  // 进度同步走完、人也不在阅读里，再关掉这条阅读连接。
+  if (NetworkStartup::stayConnected() && !isReaderActivity() && !WeReadBackgroundSync::busy()) {
+    NetworkStartup::releaseReadingRadio();
+  }
+#endif
 }
 
 void ActivityManager::resetHomeStandbyInput() {
@@ -572,6 +595,11 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
 }
 
 void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
+  // 回到首页即结束这一轮阅读。下一本重新进入时才会再做进入同步。
+  if (!APP_STATE.wereadEnterSyncedPath.empty()) {
+    APP_STATE.wereadEnterSyncedPath.clear();
+    if (!APP_STATE.saveToFile()) LOG_ERR("ACT", "could not clear WeRead enter-sync marker");
+  }
   if (!CrossPointSettings::requiresOnboarding(SETTINGS.onboardingVersion)) {
     UserGuide::installIfPending(static_cast<Language>(SETTINGS.language) == Language::ZH_CN);
   }

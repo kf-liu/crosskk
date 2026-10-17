@@ -183,9 +183,11 @@ void RemoteProgressParser::acceptCandidate(const Candidate& candidate) {
   progress_.appIdHash = candidate.appIdHash;
   progress_.chapterOffset = candidate.chapterOffset;
   progress_.updateTime = candidate.updateTime;
+  progress_.readingTimeSeconds = candidate.readingTimeSeconds;
   progress_.hasChapterOffset = candidate.hasChapterOffset && candidate.chapterUid[0] != '\0';
   progress_.hasUpdateTime = candidate.hasUpdateTime;
   progress_.hasAppId = candidate.hasAppId;
+  progress_.hasReadingTime = candidate.hasReadingTime;
   bestDepth_ = objectDepth_;
   bestScore_ = score;
 }
@@ -203,6 +205,8 @@ void RemoteProgressParser::onKey(void* raw, const char* key, size_t) {
     parser.field_ = Field::ChapterOffset;
   } else if (strcmp(key, "updateTime") == 0 || strcmp(key, "update_time") == 0) {
     parser.field_ = Field::UpdateTime;
+  } else if (strcmp(key, "readingTime") == 0 || strcmp(key, "reading_time") == 0) {
+    parser.field_ = Field::ReadingTime;
   } else if (strcmp(key, "appId") == 0 || strcmp(key, "app_id") == 0) {
     parser.field_ = Field::AppId;
   } else if (strcmp(key, "errcode") == 0 || strcmp(key, "errCode") == 0) {
@@ -246,6 +250,10 @@ void RemoteProgressParser::onValue(void* raw, const char* value, const size_t le
       case Field::UpdateTime:
         candidate->updateTime = parseUint32OrZero(value, len);
         candidate->hasUpdateTime = candidate->updateTime != 0 || (len == 1 && value && value[0] == '0');
+        break;
+      case Field::ReadingTime:
+        candidate->readingTimeSeconds = parseUint32OrZero(value, len);
+        candidate->hasReadingTime = candidate->readingTimeSeconds != 0 || (len == 1 && value && value[0] == '0');
         break;
       case Field::AppId:
         if (len > 0 && len < 64) {

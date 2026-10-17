@@ -6,6 +6,7 @@
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalClock.h>
+#include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <Memory.h>
@@ -19,6 +20,7 @@
 #include <utility>
 
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "NetworkStartup.h"
 #include "ProgressMapper.h"
@@ -36,19 +38,55 @@
 
 namespace {
 static_assert(sizeof(WeReadClient::Operation) <= 8 * 1024, "WeRead progress workspace exceeds its fixed heap budget");
+
+#if !CROSSPOINT_EMULATED
+// FAT 日期时间打包成 date<<16|time。年从 1980 起，秒被折半存，这里只取到分钟。
+uint32_t fatPackedToUnix(const uint32_t packed) {
+  if (packed == 0) return 0;
+  const uint16_t date = static_cast<uint16_t>(packed >> 16);
+  const uint16_t time = static_cast<uint16_t>(packed & 0xFFFF);
+  const int year = 1980 + static_cast<int>(date >> 9);
+  const unsigned month = (date >> 5) & 0x0Fu;
+  const unsigned day = date & 0x1Fu;
+  const unsigned hour = time >> 11;
+  const unsigned minute = (time >> 5) & 0x3Fu;
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return 0;
+  uint32_t epoch = 0;
+  if (!TimeUtils::localDateTimeToUtcEpoch(year, month, day, hour, minute, epoch)) return 0;
+  return epoch;
+}
+#endif
+
+bool formatProgressWhen(const uint32_t epoch, char* buffer, const size_t size) {
+  if (!buffer || size == 0) return false;
+  buffer[0] = '\0';
+  std::tm local{};
+  if (epoch == 0 || !TimeUtils::isClockValid(epoch) || !TimeUtils::getLocalDateTime(epoch, local)) return false;
+  const int length = snprintf(buffer, size, "%04d-%02d-%02d %02d:%02d", local.tm_year + 1900, local.tm_mon + 1,
+                              local.tm_mday, local.tm_hour, local.tm_min);
+  return length > 0 && static_cast<size_t>(length) < size;
+}
 }
 
 WeReadProgressSyncActivity::WeReadProgressSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                        std::string epubPath, const char* bookId,
-                                                       const WeReadProgressContext& context)
-    : Activity("WeReadProgressSync", renderer, mappedInput), epubPath_(std::move(epubPath)) {
+                                                       const WeReadProgressContext& context,
+                                                       const WeReadSyncOccasion occasion,
+                                                       const uint32_t localProgressEpoch, const char* continuePath)
+    : Activity(occasion == WeReadSyncOccasion::Duration ? "WeReadDurationReport" : "WeReadProgressSync", renderer,
+               mappedInput),
+      occasion_(occasion),
+      syncMode_(modeFor(occasion)),
+      durationOnly_(occasion == WeReadSyncOccasion::Duration),
+      epubPath_(std::move(epubPath)),
+      localProgressEpoch_(localProgressEpoch) {
   if (bookId) strncpy(bookId_, bookId, sizeof(bookId_) - 1);
+  if (continuePath && continuePath[0] != '\0') continuePath_ = continuePath;
   input_.localFraction = context.localFraction;
   input_.localTocIndex = context.localTocIndex;
   input_.localOffset = context.localOffset;
   input_.localOffsetBasis = context.localOffsetBasis;
   localSpineIndex_ = context.localSpineIndex;
-  localPageNumber_ = context.localPageNumber;
   localPageCount_ = context.localPageCount;
 }
 
@@ -81,6 +119,18 @@ WeReadProgressContext WeReadProgressSyncActivity::makeContext(const Epub& epub, 
   return context;
 }
 
+uint32_t WeReadProgressSyncActivity::readProgressTimestamp(const std::string& cachePath) {
+  HalFile file;
+  if (!Storage.openFileForRead("WRSync", cachePath + "/progress.bin", file)) return 0;
+  const uint32_t stored = file.modificationTime();
+#if CROSSPOINT_EMULATED
+  // 模拟器的 modificationTime() 已经是 Unix 秒。再按 FAT 打包解码会把 2026 读成 2033。
+  return stored;
+#else
+  return fatPackedToUnix(stored);
+#endif
+}
+
 void WeReadProgressSyncActivity::onEnter() {
   Activity::onEnter();
   fullRefreshPending_.store(true);
@@ -95,36 +145,40 @@ void WeReadProgressSyncActivity::onEnter() {
     return;
   }
 
-  // The reader has already ended its session. Keep whole seconds for this one
-  // upload; they are not written anywhere if the screen is left.
-  const auto& snapshot = READING_STATS.getLastSessionSnapshot();
-  if (snapshot.valid && snapshot.path == epubPath_) {
-    input_.readingSeconds = snapshot.sessionMs / 1000u;
+  // The button sends one live slice, the same size as the in-reader heartbeat.
+  // Reading itself reports every interval while Wi-Fi is already up.
+  if (durationOnly_) {
+    input_.readingSeconds = WeReadClient::Operation::kLiveReadingIntervalSeconds;
+    pendingSeconds_ = input_.readingSeconds;
+    LOG_INF("WRSync", "manual live reading seconds=%u", static_cast<unsigned>(pendingSeconds_));
   }
-  LOG_INF("WRSync", "session reading seconds=%u", static_cast<unsigned>(input_.readingSeconds));
 
-  // Offline reading never starts Wi-Fi by itself. This screen opens a network
-  // only because the user asked to sync, and only when nothing is connected.
+  // 进入和退出也会打开 Wi-Fi。已经连着就直接同步，否则仍先选网络。
   NetworkStartup::prepare(renderer);
+  wifiActivated_ = true;
   if (WiFi.status() == WL_CONNECTED) {
-    wifiActivated_ = false;
+    LOG_INF("WRSync", "Wi-Fi already connected");
     state_ = State::Starting;
     requestUpdate();
     return;
   }
-  wifiActivated_ = true;
   launchWifiSelection();
 }
 
 void WeReadProgressSyncActivity::onExit() {
+  if (workNoted_) {
+    BackgroundWork::end(workKind_);
+    workNoted_ = false;
+  }
   operation_.reset();
   Activity::onExit();
-  // A connection that was already up belongs to the reader. Rebooting here
-  // would drop it, so only the session this screen started is torn down.
-  if (!wifiActivated_) return;
+  // This screen opened the radio. Rebooting drops it, unless the control
+  // center is holding the association. The reader replace is already queued.
+  if (!wifiActivated_ || NetworkStartup::stayConnected()) return;
   WiFi.disconnect(false);
   delay(30);
-  silentRestartToReader();
+  if (returnHome_) silentRestart();
+  else silentRestartToReader();
 }
 
 bool WeReadProgressSyncActivity::preventAutoSleep() { return state_ == State::Starting || state_ == State::Syncing; }
@@ -146,7 +200,7 @@ void WeReadProgressSyncActivity::launchWifiSelection() {
 
 void WeReadProgressSyncActivity::onWifiSelectionComplete(const bool connected) {
   if (!connected || WiFi.status() != WL_CONNECTED) {
-    returnToReader();
+    leaveSync();
     return;
   }
   fullRefreshPending_.store(true);
@@ -187,10 +241,11 @@ void WeReadProgressSyncActivity::advanceSync() {
     case WeReadClient::Operation::Event::QrReady:
       return;
     case WeReadClient::Operation::Event::Cancelled:
-      returnToReader();
+      leaveSync();
       return;
     case WeReadClient::Operation::Event::Failed:
       error_ = operation_.error();
+      commitReportedTime();
       if (operation_.readingTimeConsumed()) input_.readingSeconds = 0;
       state_ = error_ == WeReadClient::Error::SessionExpired ? State::LoginRequired : State::Failed;
       requestUpdate();
@@ -202,10 +257,24 @@ void WeReadProgressSyncActivity::advanceSync() {
   const auto result = operation_.progressSyncResult();
   outcome_ = result.outcome;
   LOG_INF("WRSync", "sync complete: outcome=%u", static_cast<unsigned>(outcome_));
+  commitReportedTime();
   if (operation_.readingTimeConsumed()) input_.readingSeconds = 0;
   operation_.reset();
   if (outcome_ == WeReadClient::ProgressSyncOutcome::SelectionRequired) {
     remoteFraction_ = result.remote.percent / 100.0f;
+    remoteUpdateTime_ = result.remote.hasUpdateTime ? result.remote.updateTime : 0;
+    // 退出时不再询问，直接再传一次当前进度。仍冲突就离开，本地进度保持不变。
+    if (occasion_ == WeReadSyncOccasion::Exit) {
+      if (!exitUploadRetried_) {
+        exitUploadRetried_ = true;
+        selectedDirection_ = DirectionOption::UploadLocal;
+        beginSelectedDirection();
+        return;
+      }
+      LOG_ERR("WRSync", "exit upload still conflicts; leaving with local progress");
+      finishLeaving();
+      return;
+    }
     uploadConflict_ = syncMode_ == WeReadClient::ProgressSyncMode::UploadLocal;
     selectedDirection_ = DirectionOption::ApplyRemote;
     syncMode_ = WeReadClient::ProgressSyncMode::Compare;
@@ -213,12 +282,11 @@ void WeReadProgressSyncActivity::advanceSync() {
     requestUpdate();
     return;
   }
-  if (outcome_ == WeReadClient::ProgressSyncOutcome::ApplyRemote) {
+  if (outcome_ == WeReadClient::ProgressSyncOutcome::ApplyRemote && !durationOnly_) {
     applyRemoteProgress(result.remote);
     return;
   }
-  state_ = State::Success;
-  requestUpdate();
+  showOrLeave();
 }
 
 void WeReadProgressSyncActivity::beginSelectedDirection() {
@@ -320,14 +388,55 @@ void WeReadProgressSyncActivity::applyRemoteProgress(const WeReadProtocol::Remot
     return;
   }
   uniqueEpub.reset();
-  state_ = State::Success;
-  requestUpdate();
+  showOrLeave();
 }
 
 void WeReadProgressSyncActivity::returnToReader() { activityManager.goToReader(epubPath_); }
 
+void WeReadProgressSyncActivity::leaveSync() {
+  if (occasion_ == WeReadSyncOccasion::Exit) finishLeaving();
+  else returnToReader();
+}
+
+void WeReadProgressSyncActivity::finishLeaving() {
+  if (leaving_) return;
+  leaving_ = true;
+  if (occasion_ == WeReadSyncOccasion::Exit) {
+    // 本轮阅读结束。下一本若接着打开，进入同步会重新比较。
+    APP_STATE.wereadEnterSyncedPath.clear();
+    if (!continuePath_.empty()) APP_STATE.openEpubPath = continuePath_;
+    if (!APP_STATE.saveToFile()) LOG_ERR("WRSync", "could not clear enter-sync marker");
+    returnHome_ = continuePath_.empty();
+    if (returnHome_) activityManager.goHome();
+    else activityManager.goToReader(continuePath_);
+    return;
+  }
+  returnToReader();
+}
+
+void WeReadProgressSyncActivity::showOrLeave() {
+  // 进入时一致、退出时上传完成，都不再多停一屏。手动同步仍显示结果。
+  if (occasion_ == WeReadSyncOccasion::Enter || occasion_ == WeReadSyncOccasion::Exit) {
+    finishLeaving();
+    return;
+  }
+  state_ = State::Success;
+  requestUpdate();
+}
+
+void WeReadProgressSyncActivity::commitReportedTime() {
+  if (!durationOnly_ || reportedMarked_ || pendingSeconds_ == 0 || !operation_.readingTimeConsumed()) return;
+  reportedMarked_ = READING_STATS.markReadingReported(epubPath_, pendingSeconds_);
+  if (!reportedMarked_) {
+    LOG_ERR("WRSync", "could not store reported reading seconds=%u", static_cast<unsigned>(pendingSeconds_));
+  }
+}
+
 const char* WeReadProgressSyncActivity::resultMessage() const {
+  if (noReadingTime_) return tr(STR_WEREAD_NO_READING_TIME);
   switch (outcome_) {
+    case WeReadClient::ProgressSyncOutcome::DurationReported:
+      return tr(STR_WEREAD_READING_TIME_REPORTED);
     case WeReadClient::ProgressSyncOutcome::Pending:
     case WeReadClient::ProgressSyncOutcome::AlreadySynced:
       return tr(STR_ALREADY_SYNCED);
@@ -365,6 +474,13 @@ const char* WeReadProgressSyncActivity::errorMessage() const {
 }
 
 void WeReadProgressSyncActivity::loop() {
+  const bool working = state_ == State::Starting || state_ == State::Syncing;
+  if (working != workNoted_) {
+    if (workNoted_) BackgroundWork::end(workKind_);
+    workKind_ = durationOnly_ ? BackgroundWork::Kind::SyncReadingTime : BackgroundWork::Kind::SyncProgress;
+    if (working) BackgroundWork::begin(workKind_);
+    workNoted_ = working;
+  }
   switch (state_) {
     case State::WifiSelection:
       return;
@@ -379,7 +495,7 @@ void WeReadProgressSyncActivity::loop() {
       return;
     case State::ChoosingDirection: {
       if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-        returnToReader();
+        leaveSync();
         return;
       }
       const auto& metrics = UITheme::getInstance().getMetrics();
@@ -417,13 +533,13 @@ void WeReadProgressSyncActivity::loop() {
       int y = 0;
       if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
           mappedInput.wasReleased(MappedInputManager::Button::Confirm) || mappedInput.wasScreenTapped(x, y)) {
-        returnToReader();
+        leaveSync();
       }
       return;
     }
     case State::Failed:
       if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-        returnToReader();
+        leaveSync();
         return;
       }
       {
@@ -444,8 +560,8 @@ void WeReadProgressSyncActivity::render(RenderLock&&) {
   renderer.clearScreen();
   const auto metrics = UITheme::getInstance().getMetrics();
   const Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-  GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
-                 tr(STR_WEREAD_SYNC_PROGRESS));
+  const char* title = durationOnly_ ? tr(STR_WEREAD_REPORT_READING_TIME) : tr(STR_WEREAD_SYNC_PROGRESS);
+  GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight}, title);
   const Rect content = SubpageLayout::contentRect(screen, metrics);
   const Rect textBounds = SubpageLayout::insetHorizontal(content, metrics.contentSidePadding);
   const int titleHeight = renderer.getLineHeight(UI_12_FONT_ID);
@@ -453,30 +569,42 @@ void WeReadProgressSyncActivity::render(RenderLock&&) {
   switch (state_) {
     case State::WifiSelection:
     case State::Starting:
-    case State::Syncing:
+    case State::Syncing: {
+      const char* status = durationOnly_ ? tr(STR_WEREAD_REPORTING_READING_TIME) : tr(STR_WEREAD_SYNCING_PROGRESS);
       UITheme::drawCenteredText(renderer, textBounds, UI_12_FONT_ID, SubpageLayout::centeredTop(content, titleHeight),
-                                tr(STR_WEREAD_SYNCING_PROGRESS), true, EpdFontFamily::BOLD);
+                                status, true, EpdFontFamily::BOLD);
       break;
+    }
     case State::ChoosingDirection: {
       const int contentTop = content.y + SubpageLayout::sectionGap(metrics);
       const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
-      const char* comparisonTitle = uploadConflict_ ? tr(STR_WEREAD_PROGRESS_CHANGED) : tr(STR_PROGRESS_FOUND);
+      const char* comparisonTitle =
+          uploadConflict_ ? tr(STR_WEREAD_PROGRESS_CHANGED) : tr(STR_WEREAD_PROGRESS_DIFFERS);
       UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, contentTop, comparisonTitle, true,
                                 EpdFontFamily::BOLD);
 
+      char remoteWhen[24];
+      char localWhen[24];
+      const char* remoteWhenText = formatProgressWhen(remoteUpdateTime_, remoteWhen, sizeof(remoteWhen))
+                                      ? remoteWhen
+                                      : tr(STR_PROGRESS_TIME_UNKNOWN);
+      const char* localWhenText = formatProgressWhen(localProgressEpoch_, localWhen, sizeof(localWhen))
+                                     ? localWhen
+                                     : tr(STR_PROGRESS_TIME_UNKNOWN);
       char remoteValue[24];
+      char localValue[24];
       snprintf(remoteValue, sizeof(remoteValue), "%.2f%%", remoteFraction_ * 100.0f);
-      char localValue[64];
-      snprintf(localValue, sizeof(localValue), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), localPageNumber_ + 1, localPageCount_,
-               input_.localFraction * 100.0f);
-      const int remoteLabelY = contentTop + lineHeight * 2;
+      snprintf(localValue, sizeof(localValue), "%.2f%%", input_.localFraction * 100.0f);
+      const int remoteLabelY = contentTop + lineHeight + SubpageLayout::sectionGap(metrics);
       UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, remoteLabelY, tr(STR_REMOTE_LABEL), true,
                                 EpdFontFamily::BOLD);
-      UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, remoteLabelY + lineHeight, remoteValue);
-      const int localLabelY = remoteLabelY + lineHeight * 3;
+      UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, remoteLabelY + lineHeight, remoteWhenText);
+      UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, remoteLabelY + lineHeight * 2, remoteValue);
+      const int localLabelY = remoteLabelY + lineHeight * 3 + SubpageLayout::sectionGap(metrics);
       UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, localLabelY, tr(STR_LOCAL_LABEL), true,
                                 EpdFontFamily::BOLD);
-      UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, localLabelY + lineHeight, localValue);
+      UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, localLabelY + lineHeight, localWhenText);
+      UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, localLabelY + lineHeight * 2, localValue);
 
       const int optionStep = metrics.menuRowHeight + metrics.menuSpacing;
       const int optionTop = content.y + content.height - optionStep * 2;
@@ -494,10 +622,19 @@ void WeReadProgressSyncActivity::render(RenderLock&&) {
       }
       break;
     }
-    case State::Success:
-      UITheme::drawCenteredText(renderer, textBounds, UI_12_FONT_ID, SubpageLayout::centeredTop(content, titleHeight),
-                                resultMessage(), true, EpdFontFamily::BOLD);
+    case State::Success: {
+      const bool showSpan = durationOnly_ && beforeLabel_[0] && afterLabel_[0];
+      const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+      const int blockHeight = showSpan ? titleHeight + lineHeight * 2 + 16 : titleHeight;
+      int top = SubpageLayout::centeredTop(content, blockHeight);
+      UITheme::drawCenteredText(renderer, textBounds, UI_12_FONT_ID, top, resultMessage(), true, EpdFontFamily::BOLD);
+      if (showSpan) {
+        top += titleHeight + 8;
+        UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, top, beforeLabel_);
+        UITheme::drawCenteredText(renderer, textBounds, UI_10_FONT_ID, top + lineHeight, afterLabel_);
+      }
       break;
+    }
     case State::LoginRequired:
       UITheme::drawCenteredWrappedText(renderer, textBounds, UI_10_FONT_ID, tr(STR_WEREAD_LOGIN_REQUIRED), 2, true,
                                        EpdFontFamily::BOLD);

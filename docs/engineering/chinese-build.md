@@ -166,7 +166,18 @@ EPUBs continue to use KOReader. WeRead public-account books (`MP_WXS_`), moved
 files, and renamed files are intentionally treated as ordinary EPUBs. The
 existing long-press KOReader shortcut is unchanged.
 
-Manual WeRead sync starts with the saved Cookie and renews it only after an
+Opening a standard WeRead book starts one progress sync in the background while
+the control-center switch is Online. The book opens immediately and does not
+wait on the sync screen. Offline skips both automatic syncs and does not open
+Wi-Fi. If the cloud position differs, the open book then shows each side's time
+and whole-book percentage and waits for a choice. Leaving the book, including
+opening another book from the end-of-book list, returns immediately and uploads
+the current local position in the background without asking. A following return
+does not sync again until the reader returns home or opens a different book. No
+saved login skips both automatic syncs. The menu action still compares and asks
+on its own screen.
+
+Manual and automatic WeRead sync start with the saved Cookie and renew it only after an
 authentication failure. Newly generated WeRead chapters retain invisible
 raw-XHTML UTF-16 source anchors. These map the local page's visible-text offset
 to WeRead's native `chapterUid + chapterOffset` coordinate without clamping the
@@ -175,17 +186,21 @@ through the reader's existing pagination LUT. Older generated books without
 anchors retain the visible-offset approximation, and other EPUBs fall back to
 the whole-book percentage derived from `WRT2` word counts. Different canonical
 positions show the direction selector. A local upload uses an enter/report pair
-and includes the whole seconds recorded by the local reading session that ended
-when manual sync was opened. When the remote position is selected, its exact
-chapter and offset are reported before being applied locally, so reporting time
-cannot move cloud progress backwards. Upload is accepted only after a read-back
-verifies the chapter and offset. A timed report is not sent again when the
-network result is unclear, including an explicit retry on the current screen;
-that retry uploads progress without the seconds. No pending time is persisted
-after leaving the screen. The sync screen opens Wi-Fi only when the user asked
-to sync and nothing is already connected, and it disconnects only the connection
-it opened. An expired session directs the user back to **Apps → WeRead** to
-sign in; it does not open a QR flow from the reader.
+and does not include reading time. Reading time is a separate reader-menu
+action, **Report Reading Time**, shown only for a standard WeRead book.
+While that book is open, the control center is Online, and Wi-Fi is already connected, the reader reports one
+30-second slice about every 30 seconds: the first slice sends an enter request
+without `rt`, then a report with `rt` at the current local position. Later
+slices send only the report. Offline slices are skipped and are not queued.
+The menu action sends one such slice and opens Wi-Fi for that upload. The
+in-reader heartbeat does not open Wi-Fi by itself and does not disconnect on
+exit. The control-center **Online** tile joins the last saved network once and
+keeps it associated while the device is awake; **Offline** shuts the radio
+down. A dropped link retries about once a minute, not on each report.
+Progress sync still opens Wi-Fi when the radio is down. With Online on, that
+screen leaves the association up. Reading-time reports do not use the progress chooser. An expired session directs the
+user back to **Apps → WeRead** to sign in; the heartbeat does not open a QR
+flow from the reader.
 
 For a new standard-book cache, the downloader fetches cloud progress after the
 `WRT2` catalog and before any chapter or image. This request is best effort:

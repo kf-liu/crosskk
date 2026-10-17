@@ -20,6 +20,12 @@
 #include "ReaderToolbarUi.h"
 #include "WeReadHighlightOverlay.h"
 #include "components/OptionPopup.h"
+#ifdef ENABLE_CHINESE_VERSION
+#include <WeReadClient.h>
+
+#include "activities/apps/weread/WeReadBackgroundSync.h"
+#include "activities/apps/weread/WeReadProgressContext.h"
+#endif
 
 class EpubReaderActivity final : public ReaderActivity {
   std::shared_ptr<Epub> epub;
@@ -286,7 +292,31 @@ class EpubReaderActivity final : public ReaderActivity {
   void openDictionaryWordSelect();
   bool launchKOReaderSync();
 #ifdef ENABLE_CHINESE_VERSION
-  bool launchWeReadSync();
+  bool launchWeReadSync(WeReadSyncOccasion occasion = WeReadSyncOccasion::Manual, const char* continuePath = nullptr);
+  bool syncProgressBeforeLeave(const std::string& nextPath) override;
+  void pollLiveReading();
+  // 后台任务里走一拍网络。调用方握着锁。还有后续阶段时返回 true。
+  bool stepLiveReading();
+  void ensureLiveReadingTask();
+  void detachLiveReading();
+  static void liveReadingTaskMain(void*);
+  void noteReadingTime(bool on);
+  void refreshBusyFooter();
+  // 进入比较和退出上传都不换画面。Started 才会记下这次打开已经同步过。
+  enum class BackgroundArm : uint8_t { Started, Busy, Skipped };
+  BackgroundArm armBackgroundEnter();
+  void armBackgroundExit();
+  bool captureWeReadSyncInput(WeReadProgressContext& context, uint32_t& localEpoch, bool reportSaveError = true);
+  bool handleProgressChoice();
+  bool pollWeReadBackground();
+  void applyWeReadRemoteProgress(const WeReadProtocol::RemoteProgress& remote, uint16_t hintSpine, uint16_t hintPages);
+  void showProgressChoice(const WeReadBackgroundSync::Choice& choice);
+  bool progressChoiceOpen_ = false;
+  bool enterSyncWaiting_ = false;
+  std::unique_ptr<WeReadClient::Operation> wereadHeartbeat_;
+  unsigned long wereadHeartbeatDueMs_ = 0;
+  bool readingTimeBusy_ = false;
+  uint32_t busyFooterGen_ = 0;
 #endif
   unsigned long confirmLongPressThreshold() const;
   void toggleAutoPageTurn(uint8_t requestedPageTurnRate);
@@ -335,7 +365,9 @@ class EpubReaderActivity final : public ReaderActivity {
       : ReaderActivity("EpubReader", renderer, mappedInput, std::move(bookPath), allowFastInitialRefresh) {}
   ~EpubReaderActivity() override;
 
+  void onEnter() override;
   void onExit() override;
+  void onGoHome(HomeMenuItem item = HomeMenuItem::NONE) override;
   void loop() override;
   void render(RenderLock&& lock) override;
 

@@ -538,7 +538,7 @@ void WeReadActivity::onExit() {
   stageRenderPending_.store(false);
   if (shelfFile_.isOpen()) shelfFile_.close();
   std::vector<TabInfo>().swap(mainTabs_);
-  if (wifiSessionActive_ && WiFi.getMode() != WIFI_MODE_NULL) {
+  if (wifiSessionActive_ && WiFi.getMode() != WIFI_MODE_NULL && !NetworkStartup::stayConnected()) {
     WiFi.disconnect(false);
     delay(100);
     WiFi.mode(WIFI_OFF);
@@ -1361,7 +1361,9 @@ void WeReadActivity::openBook(const char* path) {
 #ifdef CROSSPOINT_EMULATED
   activityManager.goToReader(path);
 #else
-  if (WiFi.getMode() == WIFI_MODE_NULL) {
+  // 智能在线进阅读时握住已经连上的无线电，避免为了回收驱动再整机重启。
+  if (NetworkStartup::smartOnlineReading()) NetworkStartup::holdReadingRadio(true);
+  if (WiFi.getMode() == WIFI_MODE_NULL || NetworkStartup::stayConnected()) {
     activityManager.goToReader(path);
     return;
   }

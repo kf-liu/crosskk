@@ -224,6 +224,8 @@ void ReadingStatsStore::mergeBookInto(ReadingBookStats& primary, const ReadingBo
   }
 
   primary.totalReadingMs += duplicate.totalReadingMs;
+  primary.reportedReadingMs += duplicate.reportedReadingMs;
+  if (primary.reportedReadingMs > primary.totalReadingMs) primary.reportedReadingMs = primary.totalReadingMs;
   primary.sessions += duplicate.sessions;
   primary.lastSessionMs = std::max(primary.lastSessionMs, duplicate.lastSessionMs);
   if (primary.firstReadAt == 0 || (duplicate.firstReadAt != 0 && duplicate.firstReadAt < primary.firstReadAt)) {
@@ -925,6 +927,32 @@ void ReadingStatsStore::endSession() {
   lastSessionSnapshot.endProgressPercent = book.lastProgressPercent;
 
   activeSession = {};
+}
+
+uint32_t ReadingStatsStore::unreportedReadingSeconds(const std::string& path) const {
+  const ReadingBookStats* book = findBook(path);
+  if (!book || book->totalReadingMs <= book->reportedReadingMs) return 0;
+  const uint64_t pendingMs = book->totalReadingMs - book->reportedReadingMs;
+  return static_cast<uint32_t>(std::min<uint64_t>(pendingMs / 1000ULL, UINT32_MAX));
+}
+
+uint64_t ReadingStatsStore::reportedReadingMs(const std::string& path) const {
+  const ReadingBookStats* book = findBook(path);
+  if (!book) return 0;
+  return std::min(book->reportedReadingMs, book->totalReadingMs);
+}
+
+bool ReadingStatsStore::markReadingReported(const std::string& path, const uint32_t seconds) {
+  if (seconds == 0) return false;
+  const size_t index = findBookIndexByPath(path);
+  if (index >= books.size()) return false;
+  auto& book = books[index];
+  const uint64_t room = book.totalReadingMs > book.reportedReadingMs ? book.totalReadingMs - book.reportedReadingMs : 0;
+  const uint64_t add = std::min(static_cast<uint64_t>(seconds) * 1000ULL, room);
+  if (add == 0) return false;
+  book.reportedReadingMs += add;
+  markDirty();
+  return saveToFile();
 }
 
 bool ReadingStatsStore::adjustBookReadingTime(const std::string& path, const uint32_t dayOrdinal,

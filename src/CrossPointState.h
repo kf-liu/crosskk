@@ -14,6 +14,9 @@ class CrossPointState : public PersistableStore<CrossPointState> {
   static constexpr uint8_t SLEEP_RECENT_COUNT = 16;
 
   std::string openEpubPath;
+  // 本轮阅读已经做过进入同步的书籍路径。静默重启后仍要跳过第二次进入同步，
+  // 所以放在会落盘的状态里，而不是活动成员。退出阅读或回到首页时清空。
+  std::string wereadEnterSyncedPath;
   uint16_t recentSleepImages[SLEEP_RECENT_COUNT] = {};  // circular buffer of recent wallpaper indices
   uint8_t recentSleepPos = 0;                           // next write slot
   uint8_t recentSleepFill = 0;                          // valid entries (0..SLEEP_RECENT_COUNT)

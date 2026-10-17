@@ -20,10 +20,14 @@ StrId labelId(const Kind kind) {
   switch (kind) {
     case Kind::FetchComments:
       return StrId::STR_BUSY_FETCH_COMMENTS;
+    case Kind::SyncProgress:
+      return StrId::STR_BUSY_SYNC_PROGRESS;
+    case Kind::SyncReadingTime:
+      return StrId::STR_BUSY_SYNC_READING_TIME;
     case Kind::Count:
       break;
   }
-  return StrId::STR_BUSY_FETCH_COMMENTS;
+  return StrId::STR_BUSY_SYNC_PROGRESS;
 }
 
 }  // namespace

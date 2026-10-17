@@ -1975,6 +1975,8 @@ void Operation::reset() {
   responseStatus_ = 0;
   progressUploadStartedAt_ = 0;
   reportRemoteOutcome_ = false;
+  durationReport_ = false;
+  liveSessionReady_ = false;
   readingTimeConsumed_ = false;
   previousVid_[0] = '\0';
   loginUid_[0] = '\0';
@@ -2112,6 +2114,26 @@ bool Operation::beginProgressSync(const char* bookId, ProgressSyncInput input, c
   }
   phase_ = Phase::PrepareProgressSync;
   logMemory("progress sync start");
+  return true;
+}
+
+bool Operation::continueLiveReading(ProgressSyncInput input) {
+  if (!liveSessionReady_ || !psvts_[0] || !book_.bookId[0] || active()) return false;
+  progressSyncMode_ = ProgressSyncMode::LiveReading;
+  progressSyncInput_ = input;
+  progressSyncInput_.localFraction = std::max(0.0f, std::min(1.0f, input.localFraction));
+  progressSyncInput_.readingSeconds = input.readingSeconds;
+  readingTimeConsumed_ = false;
+  error_ = Error::Ok;
+  progressSyncResult_ = {};
+  const Error mapped = bindLocalChapter();
+  if (mapped != Error::Ok || !makeReaderReferer(book_.bookId, chapter_.chapterUid, referer_)) {
+    liveSessionReady_ = false;
+    return false;
+  }
+  requestAttempt_ = 0;
+  kind_ = Kind::ProgressSync;
+  phase_ = Phase::SendProgressReport;
   return true;
 }
 
@@ -2897,6 +2919,10 @@ Error Operation::fetchProgressOnce(const bool bypassCache) {
     return Error::Protocol;
   }
   progressSyncResult_.remote = parser->progress();
+  if (progressSyncResult_.remote.hasReadingTime &&
+      !WeReadStore::saveBookReadingSeconds(book_.bookId, progressSyncResult_.remote.readingTimeSeconds)) {
+    LOG_ERR("WR", "Failed to store WeRead reading time for %s", book_.bookId);
+  }
   return WeReadStore::saveSession(session_) ? Error::Ok : Error::SdCard;
 }
 
@@ -2958,9 +2984,7 @@ void Operation::persistInitialProgress() {
   WeReadStore::clearInitialProgress(book_.bookId);
 }
 
-Error Operation::decideProgress() {
-  const float remoteFraction = normalizedRemoteProgress();
-  progressSyncResult_.remote.percent = remoteFraction * 100.0f;
+Error Operation::bindLocalChapter() {
   bool preciseLocal = false;
   const char* basis = "fraction";
   switch (progressSyncInput_.localOffsetBasis) {
@@ -2986,9 +3010,45 @@ Error Operation::decideProgress() {
           static_cast<unsigned>(preciseLocal), basis, static_cast<unsigned>(progressSyncInput_.localTocIndex),
           chapter_.chapterUid, static_cast<unsigned>(progressChapterOffset_),
           static_cast<unsigned long>(progressSyncInput_.localFraction * 1000000.0f + 0.5f));
+  return Error::Ok;
+}
+
+Error Operation::decideProgress() {
+  if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+    const Error mapped = bindLocalChapter();
+    if (mapped != Error::Ok) return mapped;
+    LOG_INF("WR", "live reading report: seconds=%u", static_cast<unsigned>(progressSyncInput_.readingSeconds));
+    if (progressSyncInput_.readingSeconds == 0) {
+      progressSyncResult_.outcome = ProgressSyncOutcome::DurationReported;
+      return Error::Ok;
+    }
+    if (!makeReaderReferer(book_.bookId, chapter_.chapterUid, referer_)) return Error::Unavailable;
+    progressUploadStartedAt_ = TimeUtils::getCurrentValidTimestamp();
+    return progressUploadStartedAt_ == 0 ? Error::Clock : Error::Ok;
+  }
+  const float remoteFraction = normalizedRemoteProgress();
+  progressSyncResult_.remote.percent = remoteFraction * 100.0f;
+  if (progressSyncMode_ == ProgressSyncMode::ReportDuration) {
+    LOG_INF("WR", "duration report: seconds=%u", static_cast<unsigned>(progressSyncInput_.readingSeconds));
+    if (progressSyncInput_.readingSeconds == 0) {
+      progressSyncResult_.outcome = ProgressSyncOutcome::DurationReported;
+      return Error::Ok;
+    }
+    // Re-report the cloud coordinate so rt cannot move the bookmark.
+    if (!bindRemoteChapterForReport()) {
+      LOG_INF("WR", "duration report skipped: remote chapter unavailable");
+      return Error::Unavailable;
+    }
+    durationReport_ = true;
+    if (!makeReaderReferer(book_.bookId, chapter_.chapterUid, referer_)) return Error::Unavailable;
+    progressUploadStartedAt_ = TimeUtils::getCurrentValidTimestamp();
+    return progressUploadStartedAt_ == 0 ? Error::Clock : Error::Ok;
+  }
+  const Error mapped = bindLocalChapter();
+  if (mapped != Error::Ok) return mapped;
   const bool samePosition = sameRemotePosition();
   const ProgressAction action = progressAction(progressSyncMode_, samePosition);
-  const ProgressReportPlan plan = progressReportPlan(action, progressSyncInput_.readingSeconds);
+  const ProgressReportPlan plan = progressReportPlan(action);
   LOG_INF("WR", "progress decision: mode=%u same=%u action=%u plan=%u seconds=%u",
           static_cast<unsigned>(progressSyncMode_), static_cast<unsigned>(samePosition),
           static_cast<unsigned>(action), static_cast<unsigned>(plan),
@@ -3913,7 +3973,13 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       if (!WeReadStore::ensureRoot() || !Storage.ensureDirectoryExists(bookDir_.c_str())) return fail(Error::SdCard);
       HalFile toc;
       uint32_t count = 0;
-      phase_ = WeReadStore::openToc(tocPath_, toc, count) && count > 0 ? Phase::FetchProgress : Phase::FetchToc;
+      const bool tocReady = WeReadStore::openToc(tocPath_, toc, count) && count > 0;
+      if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+        if (!tocReady) return fail(Error::Unavailable);
+        phase_ = Phase::DecideProgress;
+        return Event::None;
+      }
+      phase_ = tocReady ? Phase::FetchProgress : Phase::FetchToc;
       return Event::None;
     }
 
@@ -3957,6 +4023,10 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
     case Phase::FetchProgressReader: {
       const Error error = fetchProgressReaderOnce();
       if (error == Error::SessionExpired) {
+        if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+          liveSessionReady_ = false;
+          return fail(error);
+        }
         requestAuthentication(Phase::FetchProgressReader);
         return phase_ == Phase::Failed ? fail(error_) : Event::None;
       }
@@ -3969,6 +4039,10 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
     case Phase::SendProgressEnter: {
       const Error error = sendProgressOnce(false);
       if (error == Error::SessionExpired) {
+        if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+          liveSessionReady_ = false;
+          return fail(error);
+        }
         requestAuthentication(Phase::FetchProgressReader);
         return phase_ == Phase::Failed ? fail(error_) : Event::None;
       }
@@ -3988,14 +4062,29 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
         progressSyncInput_.readingSeconds = 0;
       }
       if (error == Error::SessionExpired) {
+        if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+          liveSessionReady_ = false;
+          return fail(error);
+        }
         requestAuthentication(Phase::FetchProgressReader);
         return phase_ == Phase::Failed ? fail(error_) : Event::None;
       }
       if (error != Error::Ok) {
+        if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+          liveSessionReady_ = false;
+          return fail(error);
+        }
         if (!retryAutomaticProgressReport(carriedTime, error)) return fail(error);
         return handleRequestError(error, Phase::SendProgressReport);
       }
       requestSucceeded();
+      if (progressSyncMode_ == ProgressSyncMode::LiveReading) {
+        liveSessionReady_ = true;
+        progressSyncResult_.outcome = ProgressSyncOutcome::DurationReported;
+        phase_ = Phase::Complete;
+        logJobComplete();
+        return Event::Complete;
+      }
       progressVerifyAttempts_ = 0;
       nextActionAt_ = millis() + kNetworkRetryBaseMs;
       phase_ = Phase::VerifyProgress;
@@ -4024,11 +4113,17 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       switch (outcome) {
         case ProgressSyncOutcome::LocalUploaded:
         case ProgressSyncOutcome::AlreadySynced:
-          progressSyncResult_.outcome = reportRemoteOutcome_ ? ProgressSyncOutcome::ApplyRemote : outcome;
+          if (durationReport_) {
+            progressSyncResult_.outcome = ProgressSyncOutcome::DurationReported;
+          } else {
+            progressSyncResult_.outcome = reportRemoteOutcome_ ? ProgressSyncOutcome::ApplyRemote : outcome;
+          }
           break;
         case ProgressSyncOutcome::SelectionRequired:
+          if (durationReport_) return fail(Error::Unavailable);
           progressSyncResult_.outcome = outcome;
           break;
+        case ProgressSyncOutcome::DurationReported:
         case ProgressSyncOutcome::ApplyRemote:
           return fail(Error::Protocol);
         case ProgressSyncOutcome::Pending:

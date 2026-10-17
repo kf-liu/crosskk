@@ -78,12 +78,12 @@ bool saveJsonDocumentToFile(const char* moduleName, const char* path, const Json
 }  // namespace
 
 // ---- ReadingStatsStore ----
-// reading_stats.json, format version 6. Written atomically (temp + rename) and
+// reading_stats.json, format version 7. Written atomically (temp + rename) and
 // parsed via a streamed HalFileStream so large histories don't double peak heap.
 
 bool JsonSettingsIO::saveReadingStats(const ReadingStatsStore& store, const char* path) {
   JsonDocument doc;
-  doc["formatVersion"] = 6;
+  doc["formatVersion"] = 7;
 
   JsonArray days = doc["readingDays"].to<JsonArray>();
   for (const auto& day : store.getReadingDays()) {
@@ -120,6 +120,7 @@ bool JsonSettingsIO::saveReadingStats(const ReadingStatsStore& store, const char
     obj["coverBmpPath"] = book.coverBmpPath;
     obj["chapterTitle"] = book.chapterTitle;
     obj["totalReadingMs"] = book.totalReadingMs;
+    obj["reportedReadingMs"] = book.reportedReadingMs;
     obj["sessions"] = book.sessions;
     obj["lastSessionMs"] = book.lastSessionMs;
     obj["firstReadAt"] = book.firstReadAt;
@@ -215,6 +216,8 @@ bool JsonSettingsIO::loadReadingStats(ReadingStatsStore& store, const char* json
     book.coverBmpPath = obj["coverBmpPath"] | std::string("");
     book.chapterTitle = obj["chapterTitle"] | std::string("");
     book.totalReadingMs = obj["totalReadingMs"] | static_cast<uint64_t>(0);
+    book.reportedReadingMs = obj["reportedReadingMs"] | static_cast<uint64_t>(0);
+    if (book.reportedReadingMs > book.totalReadingMs) book.reportedReadingMs = book.totalReadingMs;
     book.sessions = obj["sessions"] | static_cast<uint32_t>(0);
     book.lastSessionMs = obj["lastSessionMs"] | static_cast<uint32_t>(0);
     book.firstReadAt = obj["firstReadAt"] | static_cast<uint32_t>(0);

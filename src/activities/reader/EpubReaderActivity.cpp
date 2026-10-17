@@ -21,7 +21,12 @@
 #include <WiFi.h>
 #include <esp_system.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -33,6 +38,8 @@
 #include "BookmarkEntry.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "NetworkStartup.h"
+#include "activities/RenderLock.h"
 #include "util/BackgroundWork.h"
 #include "DictionaryWordSelectActivity.h"
 #include "EpubReaderBookmarksActivity.h"
@@ -62,10 +69,13 @@
 #include "util/ReadingBackground.h"
 #include "util/ReadingGuideLine.h"
 #ifdef ENABLE_CHINESE_VERSION
+#include <WeReadClient.h>
 #include <WeReadHighlight.h>
 #include <WeReadHttpClient.h>
 #include <WeReadStore.h>
+#include <WeReadXhtmlCodec.h>
 
+#include "activities/apps/weread/WeReadBackgroundSync.h"
 #include "activities/apps/weread/WeReadProgressSyncActivity.h"
 #include "activities/settings/FontDownloadActivity.h"
 #endif
@@ -298,6 +308,10 @@ bool EpubReaderActivity::updateChapterBuild() {
 }
 
 EpubReaderActivity::~EpubReaderActivity() {
+#ifdef ENABLE_CHINESE_VERSION
+  noteReadingTime(false);
+  wereadHeartbeat_.reset();
+#endif
   ImageBlock::setExtractor(nullptr, nullptr);
   settleOverlayRefresh();
   discardOverlayPage();
@@ -312,8 +326,45 @@ EpubReaderActivity::~EpubReaderActivity() {
   }
 }
 
+void EpubReaderActivity::onEnter() {
+  ReaderActivity::onEnter();
+#ifdef ENABLE_CHINESE_VERSION
+  // 智能在线：进入阅读再关联，主页不保持连接。同一本书这一轮已经比较过也要连着，心跳还要报。
+  if (wereadBookId_[0] != '\0' && NetworkStartup::smartOnlineReading()) {
+    NetworkStartup::holdReadingRadio(true);
+    if (!WeReadHttpClient::networkReady()) NetworkStartup::beginSavedNetwork(renderer);
+  }
+  if (!epub || wereadBookId_[0] == '\0') return;
+  // 同一次打开里不再同步。退出或回首页会清掉这个标记。
+  if (APP_STATE.wereadEnterSyncedPath == bookPath) return;
+  switch (armBackgroundEnter()) {
+    case BackgroundArm::Started:
+      break;
+    case BackgroundArm::Busy:
+      // 上一本的退出上传还在走。这一轮循环结束后再开始比较。
+      enterSyncWaiting_ = true;
+      break;
+    case BackgroundArm::Skipped:
+      break;
+  }
+#endif
+}
+
+void EpubReaderActivity::onGoHome(const HomeMenuItem item) {
+#ifdef ENABLE_CHINESE_VERSION
+  if (wereadBookId_[0]) armBackgroundExit();
+#endif
+  ReaderActivity::onGoHome(item);
+}
+
 void EpubReaderActivity::onExit() {
 #ifdef ENABLE_CHINESE_VERSION
+  noteReadingTime(false);
+  detachLiveReading();
+  // 退出上传还在走时先留着无线电，同步结束再关。
+  if (!WeReadBackgroundSync::busy()) NetworkStartup::releaseReadingRadio();
+  // 退出上传还挂在后台，分页暂停不能跟着阅读器一起留下。
+  WeReadBackgroundSync::setPaused(false);
   WeReadCommentOverlay::reset();
 #endif
   if (footnoteDepth > 0 && epub) {
@@ -1152,7 +1203,10 @@ void EpubReaderActivity::loop() {
 
 #ifdef ENABLE_CHINESE_VERSION
   if (maybeOfferCompleteChineseFont()) return;
+  WeReadBackgroundSync::setPaused(section && section->isBuilding());
   refreshWeReadHighlightsIfNeeded();
+  pollLiveReading();
+  refreshBusyFooter();
   if (WeReadCommentOverlay::takeDirty()) requestUpdate();
   if (wereadBookId_[0] && epub && section && section->currentPage >= 0) {
     const int page = section->currentPage;
@@ -1210,6 +1264,9 @@ void EpubReaderActivity::loop() {
   if (!updateChapterBuild()) return;
 
 #ifdef ENABLE_CHINESE_VERSION
+  // 分页先走完这一拍。选择框打开后再吃掉翻页，避免对话框把章节构建停住。
+  if (handleProgressChoice()) return;
+  if (pollWeReadBackground()) return;
   if (WeReadCommentOverlay::panelOpen()) {
     if (WeReadCommentOverlay::handlePanel(mappedInput, renderer)) requestUpdate();
     return;
@@ -1785,6 +1842,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       bookmarkMessageTime = millis();
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::REPORT_READING_TIME: {
+#ifdef ENABLE_CHINESE_VERSION
+      if (wereadBookId_[0]) launchWeReadSync(WeReadSyncOccasion::Duration);
+#endif
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::HIGHLIGHT: {
 #ifdef ENABLE_CHINESE_VERSION
       if (wereadBookId_[0]) beginWeReadHighlightSelect();
@@ -1859,27 +1922,455 @@ bool EpubReaderActivity::launchKOReaderSync() {
 }
 
 #ifdef ENABLE_CHINESE_VERSION
-bool EpubReaderActivity::launchWeReadSync() {
-  if (!wereadBookId_[0]) return false;
+void EpubReaderActivity::noteReadingTime(const bool on) {
+  if (on == readingTimeBusy_) return;
+  if (on) BackgroundWork::begin(BackgroundWork::Kind::SyncReadingTime);
+  else BackgroundWork::end(BackgroundWork::Kind::SyncReadingTime);
+  readingTimeBusy_ = on;
+}
 
+void EpubReaderActivity::refreshBusyFooter() {
+  const uint32_t generation = BackgroundWork::generation();
+  if (generation == busyFooterGen_) return;
+  // 分页或浮层还占着画面时不刷底部，下一帧整页会带上新文案。
+  if (!epub || !section || section->isBuilding() || overlay != Overlay::None || RenderLock::peek()) return;
+  RenderLock lock(RenderLock::Mode::Try);
+  if (!lock.ownsLock()) return;
+
+  // Clear from the ink origin, not the reserved band. The text sits above that
+  // band, so a short clear left the finished task's glyphs under the title.
+  const int y = std::max(0, UITheme::getStatusBarTextOrigin(renderer, 0));
+  renderer.fillRect(0, y, renderer.getScreenWidth(), renderer.getScreenHeight() - y, false);
+  renderStatusBar();
+  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+  busyFooterGen_ = generation;
+}
+
+namespace {
+std::atomic<bool> liveReadingPaused{false};
+SemaphoreHandle_t liveLock = nullptr;
+TaskHandle_t liveTask = nullptr;
+EpubReaderActivity* liveOwner = nullptr;
+}  // namespace
+
+void EpubReaderActivity::liveReadingTaskMain(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+    if (!liveLock) continue;
+    for (;;) {
+      if (xSemaphoreTake(liveLock, pdMS_TO_TICKS(200)) != pdTRUE) break;
+      EpubReaderActivity* owner = liveOwner;
+      const bool more = owner && owner->stepLiveReading();
+      xSemaphoreGive(liveLock);
+      if (!more) break;
+    }
+  }
+}
+
+void EpubReaderActivity::ensureLiveReadingTask() {
+#if !defined(SIMULATOR)
+  if (!liveLock) liveLock = xSemaphoreCreateMutex();
+  if (liveTask || !liveLock) return;
+  // 8192 与评论任务相同：HTTPS 放在这条栈上，阅读循环只负责到点登记。
+  if (xTaskCreate(liveReadingTaskMain, "wrBeat", 8192, nullptr, 1, &liveTask) != pdPASS) {
+    LOG_ERR("WR", "阅读心跳任务创建失败，栈 8192 字节");
+    liveTask = nullptr;
+  }
+#else
+  (void)liveLock;
+  (void)liveTask;
+#endif
+}
+
+void EpubReaderActivity::detachLiveReading() {
+#if !defined(SIMULATOR)
+  if (liveLock) xSemaphoreTake(liveLock, portMAX_DELAY);
+#endif
+  if (liveOwner == this) liveOwner = nullptr;
+  wereadHeartbeat_.reset();
+#if !defined(SIMULATOR)
+  if (liveLock) xSemaphoreGive(liveLock);
+#endif
+}
+
+bool EpubReaderActivity::stepLiveReading() {
+  if (liveReadingPaused.load() || !wereadHeartbeat_ || !wereadHeartbeat_->active()) return false;
+  noteReadingTime(true);
+  const unsigned long intervalMs = WeReadClient::Operation::kLiveReadingIntervalSeconds * 1000UL;
+  const auto event = wereadHeartbeat_->step();
+  if (event == WeReadClient::Operation::Event::Complete) {
+    LOG_INF("WR", "live reading report sent: seconds=%u",
+            static_cast<unsigned>(WeReadClient::Operation::kLiveReadingIntervalSeconds));
+    wereadHeartbeatDueMs_ = millis() + intervalMs;
+  } else if (event == WeReadClient::Operation::Event::Failed) {
+    LOG_ERR("WR", "live reading report failed: error=%u", static_cast<unsigned>(wereadHeartbeat_->error()));
+    wereadHeartbeatDueMs_ = millis() + intervalMs;
+  }
+  return wereadHeartbeat_ && wereadHeartbeat_->active();
+}
+
+void EpubReaderActivity::pollLiveReading() {
+  liveReadingPaused.store(section && section->isBuilding());
+#if !defined(SIMULATOR)
+  if (wereadBookId_[0] != '\0' && NetworkStartup::smartOnlineReading()) ensureLiveReadingTask();
+  // 后台正在收发时这一轮不登记，翻页不等那一拍结束。
+  if (liveLock && xSemaphoreTake(liveLock, 0) != pdTRUE) return;
+  if (wereadBookId_[0] != '\0') liveOwner = this;
+#endif
+  bool wake = false;
+  const unsigned long intervalMs = WeReadClient::Operation::kLiveReadingIntervalSeconds * 1000UL;
+  if (wereadBookId_[0] == '\0' || !epub) {
+    noteReadingTime(false);
+  } else if (WeReadBackgroundSync::busy()) {
+    // 进度同步和心跳共用一条 TLS，进行中不再另开一拍。
+    noteReadingTime(false);
+  } else if (wereadHeartbeat_ && wereadHeartbeat_->active()) {
+    noteReadingTime(true);
+    wake = !liveReadingPaused.load();
+  } else if (overlay != Overlay::None) {
+    noteReadingTime(false);
+  } else if (!NetworkStartup::smartOnlineReading() || !WeReadHttpClient::networkReady()) {
+    noteReadingTime(false);
+    if (wereadHeartbeatDueMs_ != 0 && static_cast<long>(millis() - wereadHeartbeatDueMs_) >= 0) {
+      LOG_INF("WR", "live reading report skipped: offline");
+      wereadHeartbeatDueMs_ = millis() + intervalMs;
+    }
+  } else if (wereadHeartbeatDueMs_ == 0) {
+    wereadHeartbeatDueMs_ = millis() + intervalMs;
+  } else if (static_cast<long>(millis() - wereadHeartbeatDueMs_) < 0 || (section && section->isBuilding())) {
+    // 还没到点，或这一章还在分页。
+  } else {
+    if (!wereadHeartbeat_) {
+      wereadHeartbeat_ = makeUniqueNoThrow<WeReadClient::Operation>();
+    }
+    if (!wereadHeartbeat_) {
+      LOG_ERR("WR", "OOM: live reading report (%u bytes)", static_cast<unsigned>(sizeof(WeReadClient::Operation)));
+      wereadHeartbeatDueMs_ = millis() + intervalMs;
+    } else {
+      const int currentPage = section ? section->currentPage : nextPageNumber;
+      const int totalPages = section ? section->estimatedTotalPages() : cachedChapterTotalPageCount;
+      const float chapterFraction =
+          totalPages > 1 ? static_cast<float>(currentPage) / static_cast<float>(totalPages - 1) : 0.0f;
+      const float localFraction = epub->calculateProgress(currentSpineIndex, chapterFraction);
+      const auto context =
+          WeReadProgressSyncActivity::makeContext(*epub, wereadBookId_, localFraction, getCurrentPosition());
+      WeReadClient::ProgressSyncInput input;
+      input.localFraction = localFraction;
+      input.localTocIndex = context.localTocIndex;
+      input.localOffset = context.localOffset;
+      input.localOffsetBasis = context.localOffsetBasis;
+      input.readingSeconds = WeReadClient::Operation::kLiveReadingIntervalSeconds;
+      if (!wereadHeartbeat_->continueLiveReading(input) &&
+          !wereadHeartbeat_->beginProgressSync(wereadBookId_, input, WeReadClient::ProgressSyncMode::LiveReading)) {
+        LOG_ERR("WR", "live reading report could not start: error=%u",
+                static_cast<unsigned>(wereadHeartbeat_->error()));
+        wereadHeartbeatDueMs_ = millis() + intervalMs;
+      } else {
+        wake = wereadHeartbeat_->active();
+      }
+    }
+  }
+#if !defined(SIMULATOR)
+  if (liveLock) xSemaphoreGive(liveLock);
+  if (wake && liveTask) {
+    xTaskNotify(liveTask, 0, eIncrement);
+    return;
+  }
+#endif
+  if (wake) stepLiveReading();
+}
+
+bool EpubReaderActivity::syncProgressBeforeLeave(const std::string& nextPath) {
+  if (!wereadBookId_[0] || nextPath.empty()) return false;
+  // 下一本马上打开。当前这本书的上传在后台走完，不挡住跳转。
+  armBackgroundExit();
+  return false;
+}
+
+bool EpubReaderActivity::captureWeReadSyncInput(WeReadProgressContext& context, uint32_t& localEpoch,
+                                                 const bool reportSaveError) {
+  if (!epub) return false;
   const int currentPage = section ? section->currentPage : nextPageNumber;
   const int totalPages = section ? section->estimatedTotalPages() : cachedChapterTotalPageCount;
+  // 进入同步时章节往往还没分页。百分比跳转先落在 pendingSpineProgress 上。
   const float chapterFraction =
-      totalPages > 1 ? static_cast<float>(currentPage) / static_cast<float>(totalPages - 1) : 0.0f;
+      pendingPercentJump ? pendingSpineProgress
+                         : (totalPages > 1 ? static_cast<float>(currentPage) / static_cast<float>(totalPages - 1)
+                                           : 0.0f);
   const float localFraction = epub->calculateProgress(currentSpineIndex, chapterFraction);
   const CrossPointPosition localPosition = getCurrentPosition();
-  std::string savedEpubPath = epub->getPath();
-
+  // 先读修改时间，再保存。保存会把文件时间改成现在，进入比较时就分不出上次阅读是什么时候。
+  localEpoch = WeReadProgressSyncActivity::readProgressTimestamp(epub->getCachePath());
   if (!saveProgress(currentSpineIndex, currentPage, totalPages)) {
     LOG_ERR("WRSync", "Aborting sync because current progress could not be saved");
-    pendingSyncSaveError = true;
-    requestUpdate();
+    if (reportSaveError) {
+      pendingSyncSaveError = true;
+      requestUpdate();
+    }
+    return false;
+  }
+  context = WeReadProgressSyncActivity::makeContext(*epub, wereadBookId_, localFraction, localPosition);
+  return true;
+}
+
+EpubReaderActivity::BackgroundArm EpubReaderActivity::armBackgroundEnter() {
+  if (!epub || wereadBookId_[0] == '\0') return BackgroundArm::Skipped;
+  if (APP_STATE.wereadEnterSyncedPath == bookPath) return BackgroundArm::Skipped;
+  if (WeReadBackgroundSync::busy()) return BackgroundArm::Busy;
+  // 控制中心的「离线」不打开无线电，也不打断阅读。只有「在线」才自动同步。
+  if (!NetworkStartup::smartOnlineReading()) {
+    LOG_INF("WRSync", "skip auto sync: offline");
+    return BackgroundArm::Skipped;
+  }
+  WeReadStore::Session session;
+  const bool loggedIn = WeReadStore::loadSession(session) && session.valid();
+  session.clear();
+  if (!loggedIn) {
+    LOG_INF("WRSync", "skip auto sync: not logged in");
+    APP_STATE.wereadEnterSyncedPath = bookPath;
+    if (!APP_STATE.saveToFile()) LOG_ERR("WRSync", "could not remember skipped enter sync");
+    return BackgroundArm::Skipped;
+  }
+
+  WeReadProgressContext context;
+  uint32_t localEpoch = 0;
+  if (!captureWeReadSyncInput(context, localEpoch)) return BackgroundArm::Skipped;
+  WeReadClient::ProgressSyncInput input;
+  input.localFraction = context.localFraction;
+  input.localTocIndex = context.localTocIndex;
+  input.localOffset = context.localOffset;
+  input.localOffsetBasis = context.localOffsetBasis;
+  switch (WeReadBackgroundSync::beginEnter(wereadBookId_, input, localEpoch, context.localSpineIndex,
+                                           context.localPageCount)) {
+    case WeReadBackgroundSync::BeginResult::Started:
+      APP_STATE.wereadEnterSyncedPath = bookPath;
+      if (!APP_STATE.saveToFile()) LOG_ERR("WRSync", "could not remember enter sync");
+      return BackgroundArm::Started;
+    case WeReadBackgroundSync::BeginResult::Busy:
+      return BackgroundArm::Busy;
+    case WeReadBackgroundSync::BeginResult::Failed:
+      pendingSyncLaunchError = true;
+      requestUpdate();
+      return BackgroundArm::Skipped;
+  }
+  return BackgroundArm::Skipped;
+}
+
+void EpubReaderActivity::armBackgroundExit() {
+  if (progressChoiceOpen_) {
+    overlayPopup.dismiss();
+    progressChoiceOpen_ = false;
+    WeReadBackgroundSync::dismissChoice();
+  }
+  enterSyncWaiting_ = false;
+  noteReadingTime(false);
+  wereadHeartbeat_.reset();
+  if (!epub || wereadBookId_[0] == '\0') return;
+  if (!NetworkStartup::smartOnlineReading()) {
+    LOG_INF("WRSync", "skip auto sync: offline");
+    return;
+  }
+  WeReadStore::Session session;
+  const bool loggedIn = WeReadStore::loadSession(session) && session.valid();
+  session.clear();
+  if (!loggedIn) {
+    LOG_INF("WRSync", "skip auto sync: not logged in");
+    return;
+  }
+  WeReadProgressContext context;
+  uint32_t localEpoch = 0;
+  if (!captureWeReadSyncInput(context, localEpoch, false)) return;
+  WeReadClient::ProgressSyncInput input;
+  input.localFraction = context.localFraction;
+  input.localTocIndex = context.localTocIndex;
+  input.localOffset = context.localOffset;
+  input.localOffsetBasis = context.localOffsetBasis;
+  if (WeReadBackgroundSync::beginExit(wereadBookId_, input) == WeReadBackgroundSync::BeginResult::Failed) {
+    LOG_ERR("WRSync", "exit upload was not started");
+  }
+}
+
+bool EpubReaderActivity::handleProgressChoice() {
+  if (!progressChoiceOpen_) return false;
+  overlayPopup.handleInput(mappedInput, [this] { requestUpdate(); });
+  if (!overlayPopup.isActive()) {
+    progressChoiceOpen_ = false;
+    // 选了方向时 beginDirection 已经接上；返回或点外面则保持本地进度。
+    WeReadBackgroundSync::dismissChoice();
+  }
+  return true;
+}
+
+// 选择框里的本地百分比来自 Epub::calculateProgress（章节文件大小）。
+// 远端若直接显示目录字数比例，数字可以更大，但章节其实更靠前。
+// 这里改成同一把尺子：映射到 spine 后的文件进度，和状态栏一致。
+float remoteStatusPercent(const Epub& epub, const char* bookId, const WeReadProtocol::RemoteProgress& remote) {
+  WeReadStore::BookOptions options;
+  if (!bookId || !bookId[0] || !remote.hasChapterOffset ||
+      !WeReadStore::loadBookOptions(WeReadStore::bookDirectory(bookId), options)) {
+    return remote.percent;
+  }
+  uint32_t tocIndex = 0;
+  float chapterFraction = 0.0f;
+  float ignoredBookFraction = 0.0f;
+  if (!WeReadStore::mapChapterToPosition(WeReadStore::tocPath(bookId), remote.chapterUid, remote.chapterOffset,
+                                         tocIndex, chapterFraction, ignoredBookFraction)) {
+    return remote.percent;
+  }
+  for (int spine = 0; spine < epub.getSpineItemsCount(); ++spine) {
+    uint32_t parsed = 0;
+    if (!WeReadStore::parseGeneratedChapterHref(epub.getSpineItem(spine).href, parsed) || parsed != tocIndex) continue;
+    return epub.calculateProgress(spine, chapterFraction) * 100.0f;
+  }
+  return remote.percent;
+}
+
+void EpubReaderActivity::showProgressChoice(const WeReadBackgroundSync::Choice& choice) {
+  char remoteWhen[24];
+  char localWhen[24];
+  const char* remoteWhenText = WeReadBackgroundSync::formatWhen(choice.remoteEpoch, remoteWhen, sizeof(remoteWhen))
+                                   ? remoteWhen
+                                   : tr(STR_PROGRESS_TIME_UNKNOWN);
+  const char* localWhenText = WeReadBackgroundSync::formatWhen(choice.localEpoch, localWhen, sizeof(localWhen))
+                                  ? localWhen
+                                  : tr(STR_PROGRESS_TIME_UNKNOWN);
+  const float remotePercent = epub ? remoteStatusPercent(*epub, wereadBookId_, choice.remote) : choice.remote.percent;
+  char body[160];
+  // 每一侧是「名称 时间 百分比」，时间和百分比之间留空格。换行只放在两侧之间。
+  snprintf(body, sizeof(body), "%s %s %.2f%%\n%s %s %.2f%%", tr(STR_REMOTE_LABEL), remoteWhenText,
+           static_cast<double>(remotePercent), tr(STR_LOCAL_LABEL), localWhenText,
+           static_cast<double>(choice.localFraction * 100.0f));
+  const char* options[] = {tr(STR_APPLY_REMOTE), tr(STR_UPLOAD_LOCAL)};
+  overlayPopup.showMessage(tr(STR_WEREAD_PROGRESS_DIFFERS), body, options, 2, 0, [this](const int index) {
+    const auto mode =
+        index == 0 ? WeReadClient::ProgressSyncMode::ApplyRemote : WeReadClient::ProgressSyncMode::UploadLocal;
+    if (WeReadBackgroundSync::beginDirection(mode) == WeReadBackgroundSync::BeginResult::Failed) {
+      pendingSyncLaunchError = true;
+      requestUpdate();
+    }
+  });
+  progressChoiceOpen_ = true;
+  requestUpdate();
+}
+
+bool EpubReaderActivity::pollWeReadBackground() {
+  if (!epub || wereadBookId_[0] == '\0') return false;
+  if (enterSyncWaiting_ && !WeReadBackgroundSync::busy()) {
+    switch (armBackgroundEnter()) {
+      case BackgroundArm::Started:
+      case BackgroundArm::Skipped:
+        enterSyncWaiting_ = false;
+        break;
+      case BackgroundArm::Busy:
+        break;
+    }
+  }
+
+  WeReadBackgroundSync::ApplyRequest apply;
+  if (WeReadBackgroundSync::takeApply(apply)) {
+    applyWeReadRemoteProgress(apply.remote, apply.localSpineIndex, apply.localPageCount);
     return true;
   }
 
-  const auto context = WeReadProgressSyncActivity::makeContext(*epub, wereadBookId_, localFraction, localPosition);
+  if (progressChoiceOpen_ || overlayPopup.isActive() || overlay != Overlay::None) return false;
+  if (highlightSelectPhase_ != HighlightSelectPhase::Idle) return false;
+  if (WeReadCommentOverlay::panelOpen()) return false;
+  if (section && section->isBuilding()) return false;
+
+  WeReadBackgroundSync::Choice choice;
+  if (!WeReadBackgroundSync::takeChoice(choice)) return false;
+  showProgressChoice(choice);
+  return true;
+}
+
+void EpubReaderActivity::applyWeReadRemoteProgress(const WeReadProtocol::RemoteProgress& remote,
+                                                   const uint16_t hintSpine, const uint16_t hintPages) {
+  if (!epub) return;
+  SavedProgressPosition fallback{"", std::max(0.0f, std::min(100.0f, remote.percent)) / 100.0f};
+  bool preciseRemote = false;
+  uint32_t remoteTocIndex = 0;
+  float chapterFraction = 0.0f;
+  float remoteBookFraction = 0.0f;
+  int exactSpineIndex = -1;
+  WeReadStore::BookOptions options;
+  const std::string bookDir = WeReadStore::bookDirectory(wereadBookId_);
+  const bool generatedBook = WeReadStore::loadBookOptions(bookDir, options);
+  const bool canonicalRemote =
+      generatedBook && remote.hasChapterOffset &&
+      WeReadStore::mapChapterToPosition(WeReadStore::tocPath(wereadBookId_), remote.chapterUid, remote.chapterOffset,
+                                        remoteTocIndex, chapterFraction, remoteBookFraction);
+  if (canonicalRemote) {
+    for (int spine = 0; spine < epub->getSpineItemsCount(); ++spine) {
+      uint32_t tocIndex = 0;
+      if (!WeReadStore::parseGeneratedChapterHref(epub->getSpineItem(spine).href, tocIndex) ||
+          tocIndex != remoteTocIndex) {
+        continue;
+      }
+      exactSpineIndex = spine;
+      preciseRemote = true;
+      break;
+    }
+    if (exactSpineIndex < 0) {
+      LOG_ERR("WRSync", "Remote chapter %u is not present in the downloaded range",
+              static_cast<unsigned>(remoteTocIndex));
+      return;
+    }
+  }
+
+  const CrossPointPosition target =
+      preciseRemote ? ProgressMapper::fromSpineProgress(epub, exactSpineIndex, chapterFraction, renderer, hintSpine,
+                                                        hintPages)
+                    : ProgressMapper::toCrossPoint(epub, fallback, renderer, hintSpine, hintPages);
+  if (target.totalPages <= 0) {
+    LOG_ERR("WRSync", "remote progress could not be mapped");
+    return;
+  }
+  // 主分支写入的页来自 fromSpineProgress，和状态栏的文件进度同一把尺子。
+  // 章节原生偏移经常大于目录字数，换成可见文字后会更靠前，不用它覆盖这一页。
+  if (!EpubReaderUtils::saveProgress(*epub, target.spineIndex, target.pageNumber, target.totalPages)) {
+    LOG_ERR("WRSync", "could not save remote progress");
+    pendingSyncSaveError = true;
+    requestUpdate();
+    return;
+  }
+
+  {
+    RenderLock lock;
+    clearDeferredReposition();
+    pendingOffsetJump.reset();
+    pendingPercentJump = false;
+    const bool sameSpine = section && currentSpineIndex == target.spineIndex;
+    currentSpineIndex = target.spineIndex;
+    cachedSpineIndex = currentSpineIndex;
+    nextPageNumber = std::max(0, target.pageNumber);
+    if (!sameSpine) {
+      section.reset();
+    } else if (section) {
+      section->currentPage = nextPageNumber;
+    }
+  }
+  requestUpdate();
+}
+
+bool EpubReaderActivity::launchWeReadSync(const WeReadSyncOccasion occasion, const char* continuePath) {
+  if (!wereadBookId_[0]) return false;
+  // 进入和退出走后台。这里只留下菜单里的手动比较和上报时长。
+  if (occasion == WeReadSyncOccasion::Enter || occasion == WeReadSyncOccasion::Exit) return false;
+  if (progressChoiceOpen_) {
+    overlayPopup.dismiss();
+    progressChoiceOpen_ = false;
+    WeReadBackgroundSync::dismissChoice();
+  }
+  enterSyncWaiting_ = false;
+  WeReadBackgroundSync::release();
+
+  WeReadProgressContext context;
+  uint32_t localProgressEpoch = 0;
+  if (!captureWeReadSyncInput(context, localProgressEpoch)) return true;
+  std::string savedEpubPath = epub->getPath();
   auto sync = makeUniqueNoThrow<WeReadProgressSyncActivity>(renderer, mappedInput, std::move(savedEpubPath),
-                                                            wereadBookId_, context);
+                                                            wereadBookId_, context, occasion, localProgressEpoch,
+                                                            continuePath);
   if (!sync) {
     LOG_ERR("WRSync", "OOM: WeReadProgressSyncActivity (%u bytes)",
             static_cast<unsigned>(sizeof(WeReadProgressSyncActivity)));
@@ -2062,8 +2553,10 @@ void EpubReaderActivity::beginLoanTimeSync() {
     }
     GUI.drawPopup(renderer, tr(STR_SYNCING_TIME));
     const bool synced = trustedtime::syncNow(5000);
-    WiFi.disconnect(false);
-    delay(30);
+    if (!NetworkStartup::stayConnected()) {
+      WiFi.disconnect(false);
+      delay(30);
+    }
     if (!synced) {
       // Reopening would hit the same unverified-time refusal: offer a retry.
       const char* options[2] = {I18N.get(StrId::STR_RETRY), I18N.get(StrId::STR_OK_BUTTON)};
@@ -2079,9 +2572,9 @@ void EpubReaderActivity::beginLoanTimeSync() {
     }
     APP_STATE.openEpubPath = bookPath;
     APP_STATE.saveToFile();
-    // Reboot straight back into this book with a clean heap (no-op on touch
-    // boards, which fall through to the in-place relaunch below).
-    silentRestartToReader();
+    // Reboot straight back into this book with a clean heap. Stay-connected
+    // skips the reboot so the association survives; the relaunch below runs.
+    if (!NetworkStartup::stayConnected()) silentRestartToReader();
     activityManager.goToReader(bookPath);
   });
 }
@@ -2113,6 +2606,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
   ReaderActivity::render(std::move(lock));
+#ifdef ENABLE_CHINESE_VERSION
+  // 进度选择盖在已经画好的阅读页或读完页上。分页没完成时先不取这条结果。
+  if (progressChoiceOpen_ && overlayPopup.isActive()) overlayPopup.processRender(renderer, mappedInput);
+#endif
   // Rebuild the page underneath, including after a global control-center visit.
   if (fontPromptState != FontPromptState::Idle) {
     overlayPopup.processRender(renderer, mappedInput);
@@ -4630,6 +5127,11 @@ CrossPointPosition EpubReaderActivity::getCurrentPosition() const {
   CrossPointPosition localPos = {currentSpineIndex, currentPage, totalPages};
   localPos.hasResolvedSpineIndex = true;
   localPos.hasMappedPage = true;
+  // 进入同步发生在章节分页之前，位置还在 progress.bin 的缓存偏移上。
+  if (!section && cachedVisibleTextOffset) {
+    localPos.visibleTextOffset = *cachedVisibleTextOffset;
+    localPos.hasVisibleTextOffset = true;
+  }
   if (section && currentPage >= 0 && currentPage < section->pageCount) {
     if (const auto offset = section->getVisibleTextOffsetForPage(static_cast<uint16_t>(currentPage))) {
       localPos.visibleTextOffset = *offset;

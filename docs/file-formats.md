@@ -616,6 +616,11 @@ location is not migrated or read.
   removes this record; otherwise a positive value is applied once and removed
   after the resulting reader progress is saved atomically. Invalid and
   zero-valued records are removed and use the normal EPUB text start.
+- Per-book `reading-time.bin` is an atomic fixed 8-byte `WRT1` record:
+  `uint32 magic` (`0x31545257`) followed by `uint32 seconds`, the whole-book
+  reading time last returned by WeRead `getprogress`. A missing file means this
+  book has not reported a reading time yet. This magic is only for this file;
+  catalog indexes use a different `WRT2` layout.
 - Per-book `detail.bin` starts with a fixed 1024-byte `WBD1` header followed
   immediately by the decoded UTF-8 introduction. The version-1 header contains
   `uint32 magic` (`0x31444257`), `uint16 version`, `uint16 headerSize`,

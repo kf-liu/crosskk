@@ -70,8 +70,8 @@ struct OperationTestPeer {
     return Operation::progressAction(mode, samePosition);
   }
   using ProgressReportPlan = Operation::ProgressReportPlan;
-  static ProgressReportPlan progressReportPlan(const ProgressAction action, const uint32_t readingSeconds) {
-    return Operation::progressReportPlan(action, readingSeconds);
+  static ProgressReportPlan progressReportPlan(const ProgressAction action) {
+    return Operation::progressReportPlan(action);
   }
   static bool isPublicAccountBookId(const char* bookId) { return Operation::isPublicAccountBookId(bookId); }
   static bool readingTimeWasTransmitted(const Error error) { return Operation::readingTimeWasTransmitted(error); }
@@ -187,7 +187,7 @@ TEST(WeReadProtocol, UsesOnlyARealReaderCursor) {
 
 TEST(WeReadProtocol, ParsesNestedRemoteProgressAcrossEveryChunkBoundary) {
   constexpr char json[] =
-      R"({"ignored":{"bookId":"other-book","progress":99},"payload":{"bookId":"book-1","progress":"40.5","chapterUid":"chapter-2","metadata":{"progress":77},"chapterOffset":150,"updateTime":1785301234,"appId":"wb123h456"}})";
+      R"({"ignored":{"bookId":"other-book","progress":99},"payload":{"bookId":"book-1","progress":"40.5","chapterUid":"chapter-2","metadata":{"progress":77},"chapterOffset":150,"updateTime":1785301234,"readingTime":7260,"appId":"wb123h456"}})";
   for (size_t split = 0; split <= sizeof(json) - 1; ++split) {
     WeReadProtocol::RemoteProgressParser parser("book-1");
     ASSERT_TRUE(parser.feed(reinterpret_cast<const uint8_t*>(json), split));
@@ -200,6 +200,8 @@ TEST(WeReadProtocol, ParsesNestedRemoteProgressAcrossEveryChunkBoundary) {
     EXPECT_TRUE(parser.progress().hasChapterOffset);
     EXPECT_EQ(parser.progress().updateTime, 1785301234U);
     EXPECT_TRUE(parser.progress().hasUpdateTime);
+    EXPECT_EQ(parser.progress().readingTimeSeconds, 7260U);
+    EXPECT_TRUE(parser.progress().hasReadingTime);
     EXPECT_TRUE(parser.progress().hasAppId);
     EXPECT_EQ(parser.progress().appIdHash, WeReadProtocol::hashAppId("wb123h456", 9));
   }
@@ -225,6 +227,7 @@ TEST(WeReadProtocol, RejectsInvalidOrMismatchedRemoteProgressAndFallsBackToRawPe
   EXPECT_FLOAT_EQ(parser.progress().percent, 33.0f);
   EXPECT_STREQ(parser.progress().chapterUid, "");
   EXPECT_FALSE(parser.progress().hasChapterOffset);
+  EXPECT_FALSE(parser.progress().hasReadingTime);
 
   ASSERT_TRUE(parser.reset());
   constexpr char nestedMetadata[] = R"({"progress":40,"metadata":{"progress":77}})";
@@ -618,12 +621,10 @@ TEST(WeReadClientState, AttachesReadingTimeToOneProgressReport) {
   const auto plan = WeReadClient::OperationTestPeer::progressReportPlan;
   const auto retry = WeReadClient::OperationTestPeer::retryAutomaticProgressReport;
 
-  EXPECT_EQ(plan(Action::AlreadySynced, 0), Plan::Finish);
-  EXPECT_EQ(plan(Action::AlreadySynced, 12), Plan::UploadLocal);
-  EXPECT_EQ(plan(Action::ApplyRemote, 0), Plan::Finish);
-  EXPECT_EQ(plan(Action::ApplyRemote, 12), Plan::UploadRemote);
-  EXPECT_EQ(plan(Action::UploadLocal, 0), Plan::UploadLocal);
-  EXPECT_EQ(plan(Action::SelectDirection, 12), Plan::Ask);
+  EXPECT_EQ(plan(Action::AlreadySynced), Plan::Finish);
+  EXPECT_EQ(plan(Action::ApplyRemote), Plan::Finish);
+  EXPECT_EQ(plan(Action::UploadLocal), Plan::UploadLocal);
+  EXPECT_EQ(plan(Action::SelectDirection), Plan::Ask);
 
   EXPECT_TRUE(WeReadClient::OperationTestPeer::isPublicAccountBookId("MP_WXS_article"));
   EXPECT_FALSE(WeReadClient::OperationTestPeer::isPublicAccountBookId("3300000001"));

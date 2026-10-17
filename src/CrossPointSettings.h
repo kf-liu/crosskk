@@ -517,6 +517,9 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   uint8_t frontlightWarmth = 50;
   uint8_t frontlightOn = 0;
   uint8_t frontlightRestoreOnWake = 1;
+  // Pull-down control center. 0 = the radio stays down unless a screen opens
+  // it. 1 = keep the last saved network associated while the device is awake.
+  uint8_t wifiStayConnected = 0;
   // Language setting (Language enum index). Fresh devices start in English and
   // choose their UI language and matching content profile in the startup guide.
   // Resolved out-of-line in CrossPointSettings.cpp so the generated
