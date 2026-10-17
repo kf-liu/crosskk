@@ -13,6 +13,8 @@
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "NetworkStartup.h"
+#include "activities/ActivityManager.h"
 #include "activities/MainTab.h"
 #include "components/HeaderBackTapTarget.h"
 #include "components/UITheme.h"
@@ -212,6 +214,22 @@ void FrontlightPanelActivity::runTile(const int idx) {
       }
       SETTINGS.saveToFile();
       requestUpdate();
+      break;
+    case 4:  // 离线阅读
+      if (SETTINGS.wifiStayConnected != 0) {
+        NetworkStartup::setStayConnected(renderer, false);
+        requestUpdate();
+      }
+      break;
+    case 5:  // 智能在线阅读：主页不连接，已经在读书就握住这条无线电。
+      if (SETTINGS.wifiStayConnected == 0) {
+        NetworkStartup::setStayConnected(renderer, true);
+        if (activityManager.isReaderActivity()) {
+          NetworkStartup::holdReadingRadio(true);
+          NetworkStartup::beginSavedNetwork(renderer);
+        }
+        requestUpdate();
+      }
       break;
     default:
       break;
@@ -414,13 +432,18 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
     // the mode names say what the tile is about on their own.
     const char* orientLabel = I18N.get(kOrientNames[SETTINGS.orientation % 4]);
     const bool touchOn = SETTINGS.touchReaderControls != CrossPointSettings::TOUCH_READER_OFF;
+    const bool smartOnline = SETTINGS.wifiStayConnected != 0;
 
-    const char* labels[kTileCount] = {tr(STR_NIGHT_MODE), tr(STR_FORCE_REFRESH), orientLabel, tr(STR_TOUCH_TOGGLE)};
-    const fui::State states[kTileCount] = {SETTINGS.screenInverted ? fui::StateChecked : fui::StateNormal,
-                                           fui::StateNormal, fui::StateNormal,
-                                           // Filled when touch reader controls are OFF — the non-default,
-                                           // attention-worthy state.
-                                           touchOn ? fui::StateNormal : fui::StateChecked};
+    const char* labels[kTileCount] = {tr(STR_NIGHT_MODE), tr(STR_FORCE_REFRESH), orientLabel, tr(STR_TOUCH_TOGGLE),
+                                      tr(STR_OFFLINE_READING), tr(STR_SMART_ONLINE_READING)};
+    const fui::State states[kTileCount] = {
+        SETTINGS.screenInverted ? fui::StateChecked : fui::StateNormal,
+        fui::StateNormal, fui::StateNormal,
+        // Filled when touch reader controls are OFF — the non-default,
+        // attention-worthy state.
+        touchOn ? fui::StateNormal : fui::StateChecked,
+        // 两格单选：选中的一格是黑底。
+        smartOnline ? fui::StateNormal : fui::StateChecked, smartOnline ? fui::StateChecked : fui::StateNormal};
 
     for (int id = 0; id < kTileCount; ++id) {
       gridItems[id].label = labels[id];

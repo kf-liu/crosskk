@@ -9,7 +9,9 @@
 // or a button bound to "Control Center" (iOS Control Center style): a grabber,
 // the frontlight brightness/warmth sliders (on boards with a light), and a grid
 // of quick-setting tiles — night mode, ghost-cleanup refresh, reading
-// orientation, and reader touch controls on/off. The
+// orientation, reader touch controls on/off, then a two-cell radio:
+// offline reading or smart online reading. Smart online associates only
+// while a book is open. The
 // frontlight controls are always there: they are what the panel is for. Pure
 // 1-bit: no dithered fills, selection reads as a filled tile. The grabber sits
 // along the panel's bottom edge, the edge the sheet is dragged from.
@@ -36,8 +38,9 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   int panelBottom = 0;
 
   // Quick-setting tiles, in grid order (2 columns): night mode, refresh,
-  // orientation, touch. Fixed set — shown on touch boards, absent elsewhere.
-  static constexpr int kTileCount = 4;
+  // orientation, touch, then offline reading / smart online reading.
+  // Fixed set — shown on touch boards, absent elsewhere.
+  static constexpr int kTileCount = 6;
 
   // fui::SliderRowProps and fui::TileGridProps embed a 324-byte fui::StyleSet,
   // so the props the render path fills in live here instead of on the stack
