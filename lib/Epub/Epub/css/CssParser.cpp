@@ -9,8 +9,13 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <type_traits>
+#if defined(__APPLE__)
+#include <xlocale.h>
+#endif
 
 namespace {
 
@@ -88,14 +93,39 @@ void forEachDelimitedToken(std::string_view s, Pred isDelimiter, F&& fn) {
 // Parse the entirety of s as a number into `out`. Accepts an optional leading
 // '+' (which std::from_chars rejects by spec) so callers can pass CSS-style
 // signed numbers without manual trimming. Returns false on empty input, a
-// non-numeric suffix, or any from_chars error.
+// non-numeric suffix, or any parse error.
+//
+// Apple Command Line Tools libc++ advertises floating-point std::from_chars but
+// the overload is deleted. CSS lengths on macOS go through strtof_l in the C
+// locale so the decimal point does not follow the user locale. Other builds
+// keep from_chars.
 template <typename T>
 bool tryParseNumber(std::string_view s, T& out) {
   const char* begin = s.data();
   const char* end = s.data() + s.size();
   if (begin < end && *begin == '+') ++begin;
-  const auto r = std::from_chars(begin, end, out);
-  return r.ec == std::errc{} && r.ptr == end;
+  if (begin == end) return false;
+  if constexpr (std::is_floating_point_v<T>) {
+#if defined(__APPLE__)
+    char buffer[64];
+    const size_t length = static_cast<size_t>(end - begin);
+    if (length >= sizeof(buffer)) return false;
+    memcpy(buffer, begin, length);
+    buffer[length] = '\0';
+    static locale_t const cLocale = newlocale(LC_ALL_MASK, "C", nullptr);
+    char* parsedEnd = nullptr;
+    const float value = strtof_l(buffer, &parsedEnd, cLocale);
+    if (parsedEnd != buffer + length || !std::isfinite(value)) return false;
+    out = static_cast<T>(value);
+    return true;
+#else
+    const auto r = std::from_chars(begin, end, out);
+    return r.ec == std::errc{} && r.ptr == end;
+#endif
+  } else {
+    const auto r = std::from_chars(begin, end, out);
+    return r.ec == std::errc{} && r.ptr == end;
+  }
 }
 
 // Collect up to 4 whitespace-separated tokens for a CSS edge-value shorthand
