@@ -763,11 +763,12 @@ void setup() {
 
   const auto wakeupReason = gpio.getWakeupReason();
 
-  // IMU bring-up on every target. Read Pico's SC7A20H is an accelerometer with no
-  // gyroscope, so HalTiltSensor differentiates the gravity component for the tilt
-  // page-turn gesture instead of reading an angular rate; the thresholds are converted
-  // from the same 270 dps. halClock.begin() restores the system clock from the board RTC
-  // when the system clock is invalid; Read Pico's RTC is the PMU, whose hooks
+  // IMU bring-up on every target. Read Pico and Metalio E-Ink 4 use an SC7A20H
+  // accelerometer with no gyroscope, so HalTiltSensor differentiates the gravity
+  // component for the tilt/shake page-turn gesture instead of reading an angular
+  // rate; the thresholds are converted from the same 270 dps. The part stays asleep
+  // until that setting is on and a book is open. halClock.begin() restores the system
+  // clock from the board RTC when the system clock is invalid; Read Pico's RTC is the PMU, whose hooks
   // BoardReadPico::begin() already installed.
   halTiltSensor.begin();
   halClock.begin();

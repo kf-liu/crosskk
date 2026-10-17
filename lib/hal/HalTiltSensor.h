@@ -42,7 +42,7 @@ class HalTiltSensor {
   static constexpr float NEUTRAL_RATE_GPS = NEUTRAL_RATE_DPS * DPS_TO_GPS;
   static constexpr unsigned long COOLDOWN_MS = 600;            // Minimum ms between triggers
   static constexpr unsigned long POLL_INTERVAL_MS = 50;        // 20 Hz polling
-  static constexpr unsigned long ACCEL_POLL_INTERVAL_MS = 80;  // SC7A20H samples at 12.5 Hz
+  static constexpr unsigned long ACCEL_POLL_INTERVAL_MS = 80;  // Read Pico SC7A20H at 12.5 Hz
   static constexpr unsigned long WAKE_STABILIZE_MS = 300;      // Ignore readings after wake
 
   mutable unsigned long _lastPollMs = 0;

@@ -27,9 +27,11 @@ class Imu {
   bool read(Sample& out) { ++reads; out=sample; return readOk; }
 };
 ''')
-        for pico in (0, 1):
-            binary = root / f"tilt-{pico}"
+        cases = ((0, 0), (1, 0), (0, 1))  # gyro, Read Pico accel, Metalio accel
+        for pico, metalio in cases:
+            binary = root / f"tilt-{pico}-{metalio}"
             subprocess.run(["c++", "-std=c++17", f"-DFREEINK_DEVICE_READPICO={pico}",
+                            f"-DFREEINK_DEVICE_METALIO_EINK4={metalio}",
                             "-I" + str(root), "-I" + str(ROOT / "lib/hal"),
                             str(ROOT / "lib/hal/HalTiltSensor.cpp"),
                             str(ROOT / "test/hal_tilt/gestures.cpp"), "-o", str(binary)], check=True, env=env)

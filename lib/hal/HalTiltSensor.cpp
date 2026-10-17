@@ -54,13 +54,13 @@ void HalTiltSensor::begin() {
     return;
   }
 
-  // The SC7A20H (Read Pico) is a 3-axis accelerometer with no gyroscope: read() fills
-  // ax/ay/az but reports gx = gy = gz = 0, so the angular-rate gesture below could never
-  // fire. The same flick is still measurable -- see RATE_THRESHOLD_GPS in the header --
-  // by differentiating the gravity component, so the part is brought up like any other
-  // and update() takes the accelerometer path. isAvailable() then reports true, which is
-  // the gate SettingsList uses to offer "Tilt page turn".
-#if FREEINK_DEVICE_READPICO
+  // The SC7A20H (Read Pico at 12.5 Hz, Metalio E-Ink 4 at 100 Hz) is a 3-axis
+  // accelerometer with no gyroscope: read() fills ax/ay/az but reports gx = gy = gz = 0,
+  // so the angular-rate gesture below could never fire. The same flick is still
+  // measurable — see RATE_THRESHOLD_GPS in the header — by differentiating the gravity
+  // component. isAvailable() then reports true, which is the gate SettingsList uses to
+  // offer "Tilt page turn" (晃动翻页 on these boards).
+#if FREEINK_DEVICE_READPICO || FREEINK_DEVICE_METALIO_EINK4
   _accelOnly = BoardConfig::ACTIVE.sensors.imuType == BoardConfig::ImuType::Sc7a20h;
 #else
   _accelOnly = false;
@@ -147,7 +147,14 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
     return;
   }
 
-  const unsigned long pollInterval = _accelOnly ? ACCEL_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+  // Read Pico's SC7A20H samples at 12.5 Hz (80 ms). Metalio's samples at 100 Hz;
+  // 20 ms still lands on a fresh ZYXDA sample and keeps the shared g/s threshold.
+#if FREEINK_DEVICE_METALIO_EINK4
+  const unsigned long accelPollMs = 20;
+#else
+  const unsigned long accelPollMs = ACCEL_POLL_INTERVAL_MS;
+#endif
+  const unsigned long pollInterval = _accelOnly ? accelPollMs : POLL_INTERVAL_MS;
   if ((now - _lastPollMs) < pollInterval) {
     return;
   }

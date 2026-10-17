@@ -17,15 +17,20 @@ int main() {
   };
   auto noEvent = [&] { assert(!sensor.wasTiltedForward() && !sensor.wasTiltedBack()); };
   update(1000);
-#if FREEINK_DEVICE_READPICO
+#if FREEINK_DEVICE_READPICO || FREEINK_DEVICE_METALIO_EINK4
   Imu::sample.ax = 1;
   update(1700);  // first sample after wake establishes the baseline
   noEvent();
   const int first = Imu::reads;
-  update(1750);  // sensor has not reached its next 80 ms sample
+#if FREEINK_DEVICE_METALIO_EINK4
+  constexpr unsigned long gapMs = 20;  // 100 Hz SC7A20H
+#else
+  constexpr unsigned long gapMs = 80;  // 12.5 Hz SC7A20H
+#endif
+  update(1700 + gapMs - 1);  // sensor has not reached its next sample
   assert(Imu::reads == first);
   Imu::sample.ax = 0.5f;
-  update(1780);
+  update(1700 + gapMs);
   assert(sensor.wasTiltedForward());
   noEvent();     // one event per flick
   update(1860);  // repeated gravity sample is neutral
