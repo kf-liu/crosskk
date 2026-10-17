@@ -193,9 +193,22 @@ constexpr int chooseJpegScale(const int srcWidth, const int srcHeight, const int
   return 0;
 }
 
+// 解码器实际输出的是 1/2、1/4、1/8。真机上这些宏的值正好是 2/4/8，
+// 模拟器里宏的值是 1/2/4，不能把宏的数值直接当成缩小倍数。
+constexpr int jpegDecodedDivisor(const int scaleOption) {
+  if (scaleOption == JPEG_SCALE_EIGHTH) return 8;
+  if (scaleOption == JPEG_SCALE_QUARTER) return 4;
+  if (scaleOption == JPEG_SCALE_HALF) return 2;
+  return 1;
+}
+
 static_assert(chooseJpegScale(600, 800, 112, 149) == JPEG_SCALE_QUARTER);
 static_assert(chooseJpegScale(1600, 2400, 109, 164) == JPEG_SCALE_EIGHTH);
 static_assert(chooseJpegScale(300, 400, 112, 149) == JPEG_SCALE_HALF);
+static_assert(jpegDecodedDivisor(0) == 1);
+static_assert(jpegDecodedDivisor(JPEG_SCALE_HALF) == 2);
+static_assert(jpegDecodedDivisor(JPEG_SCALE_QUARTER) == 4);
+static_assert(jpegDecodedDivisor(JPEG_SCALE_EIGHTH) == 8);
 
 // Static file pointer for JPEGDEC open callback.
 // Safe in single-threaded embedded context; never accessed concurrently.
@@ -646,7 +659,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   // of allocating 32 KB just to produce a 112x164 shelf cover.
   const int scaleOption =
       progressiveDecode ? JPEG_SCALE_EIGHTH : chooseJpegScale(srcWidth, srcHeight, outWidth, outHeight);
-  const int scaleDenominator = scaleOption == 0 ? 1 : scaleOption;
+  const int scaleDenominator = jpegDecodedDivisor(scaleOption);
   const int scaleSrcWidth = (srcWidth + scaleDenominator - 1) / scaleDenominator;
   const int scaleSrcHeight = (srcHeight + scaleDenominator - 1) / scaleDenominator;
   LOG_DBG("JPG", "JPEG decoder scale: 1/%d (%dx%d -> %dx%d), output=%dx%d", scaleDenominator, srcWidth, srcHeight,
