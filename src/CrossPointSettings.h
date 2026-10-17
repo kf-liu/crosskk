@@ -256,7 +256,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     ROUNDEDRAFF = 3,
     LYRA_CAROUSEL = 4,
     INX = 5,
-    COVER_GRID = 6
+    COVER_GRID = 6,
+    KK = 7
   };
   enum INX_TAB_POSITION { INX_TAB_TOP = 0, INX_TAB_BOTTOM = 1, INX_TAB_POSITION_COUNT };
 
@@ -618,6 +619,8 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
   bool migrateLanguageBinaryFile();
 
  public:
+  bool usesInxChrome() const { return uiTheme == INX || uiTheme == KK; }
+  bool usesKkTheme() const { return uiTheme == KK; }
   float getReaderLineCompression() const;
   unsigned long getSleepTimeoutMs() const;
   int getRefreshFrequency() const;

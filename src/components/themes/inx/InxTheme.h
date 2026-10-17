@@ -114,7 +114,7 @@ constexpr ThemeMetrics makeValues() {
 inline constexpr ThemeMetrics values = makeValues();
 }  // namespace InxMetrics
 
-class InxTheme final : public LyraTheme {
+class InxTheme : public LyraTheme {
  public:
   void drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle = nullptr,
                   bool backButton = true) const override;

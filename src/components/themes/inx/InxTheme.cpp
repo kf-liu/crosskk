@@ -85,6 +85,8 @@ const uint8_t* iconForTab(const MainTab tab) {
 #else
       return InxAppsTabIcon;
 #endif
+    case MainTab::Home:
+    case MainTab::Bookshelf:
     case MainTab::None:
       return nullptr;
   }
@@ -468,7 +470,8 @@ void InxTheme::drawMainTabStatusBar(const GfxRenderer& renderer, const Rect rect
   constexpr int edgeInset = UiHighDpiProfile::enabled ? UiHighDpiProfile::contentPadding : 12;
   constexpr int batteryTextOffset = 6;  // drawBatteryRight offsets the icon below the text origin.
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const bool tabsAtBottom = SETTINGS.inxTabPosition == CrossPointSettings::INX_TAB_BOTTOM;
+  const bool tabsAtBottom =
+      SETTINGS.usesKkTheme() || SETTINGS.inxTabPosition == CrossPointSettings::INX_TAB_BOTTOM;
   // The battery cap and numeric glyphs include the positioning edge pixel.
   const int right = std::min(rect.x + rect.width - 1, renderer.getScreenWidth() - edgeInset);
   const int textY = UiHighDpiProfile::enabled ? rect.y + (rect.height - renderer.getLineHeight(numericFontId)) / 2
@@ -479,7 +482,8 @@ void InxTheme::drawMainTabStatusBar(const GfxRenderer& renderer, const Rect rect
   if (tabsAtBottom) {
     char time[9] = "--:--";
     TimeUtils::formatCurrentTime(time, sizeof(time), SETTINGS.clockFormat == 1);
-    renderer.drawText(numericFontId, std::max(rect.x, edgeInset), textY, time);
+    const int clockX = std::max(rect.x, edgeInset);
+    renderer.drawText(numericFontId, clockX, textY, time);
   }
   drawBatteryRight(renderer, Rect{right - metrics.batteryWidth, textY, metrics.batteryWidth, metrics.batteryHeight},
                    SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS,

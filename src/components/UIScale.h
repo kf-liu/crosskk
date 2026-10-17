@@ -5,7 +5,7 @@
 
 // FreeInkUI font slots. Row heights, header height, and touch sizes are not
 // chosen here: FreeInkApp derives its default metric tokens from the body
-// font's line height. Only INX retains CrossMux's historical UI_10 body;
+// font's line height. INX and KK retain CrossMux's historical UI_10 body;
 // other themes use the upstream UI_12 body. Titles remain UI_12.
 struct UIScaleSpec {
   int smallFontId;
@@ -17,7 +17,7 @@ inline UIScaleSpec uiScaleSpec(bool upstreamStyle = false) {
   UIScaleSpec spec{};
   spec.smallFontId = UI_10_FONT_ID;
   spec.bodyFontId =
-      !upstreamStyle && SETTINGS.uiTheme == CrossPointSettings::UI_THEME::INX ? UI_10_FONT_ID : UI_12_FONT_ID;
+      !upstreamStyle && SETTINGS.usesInxChrome() ? UI_10_FONT_ID : UI_12_FONT_ID;
   // Titles use the UI font, not a reader font: fui headers draw book and
   // directory titles, and the built-in Ubuntu UI fonts cover Hebrew (plus the
   // size-matched SD CJK fallback) where the NotoSans reader subsets do not.

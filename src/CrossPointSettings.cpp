@@ -359,7 +359,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc) {
       uint8_t v = doc[info.key] | fieldDefault;
       if (info.type == SettingType::ENUM) {
         const uint8_t count = info.valuePtr == &CrossPointSettings::uiTheme
-                                  ? static_cast<uint8_t>(COVER_GRID + 1)
+                                  ? static_cast<uint8_t>(KK + 1)
                                   : static_cast<uint8_t>(info.enumLabels().size());
         v = clamp(v, count, fieldDefault);
       } else if (info.type == SettingType::TOGGLE) {

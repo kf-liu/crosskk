@@ -22,8 +22,9 @@ MappedInputManager::Labels Activity::mainTabButtonLabels(const char* back, const
   }
 
   if (activityManager.getMainTabFocus() == MainTabFocus::Tabs) {
-    const char* tabBack =
-        mainTab() == MainTab::Recent ? (SETTINGS.standbyShortcutEnabled ? tr(STR_STANDBY_TITLE) : "") : tr(STR_BACK);
+    const char* tabBack = mainTab() == MainTabs::homeTab(SETTINGS.usesKkTheme())
+                              ? (SETTINGS.standbyShortcutEnabled ? tr(STR_STANDBY_TITLE) : "")
+                              : tr(STR_BACK);
     return mappedInput.mapLabels(tabBack, tr(STR_SELECT), showTabDirections ? tr(STR_DIR_LEFT) : "",
                                  showTabDirections ? tr(STR_DIR_RIGHT) : "");
   }
@@ -38,10 +39,14 @@ bool Activity::showMainTabContentSelection() const {
 
 // Retain the instance-facing Activity layout API.
 // cppcheck-suppress functionStatic
-bool Activity::mainTabsAtBottom() const { return SETTINGS.inxTabPosition == CrossPointSettings::INX_TAB_BOTTOM; }
+bool Activity::mainTabsAtBottom() const {
+  return SETTINGS.usesKkTheme() || SETTINGS.inxTabPosition == CrossPointSettings::INX_TAB_BOTTOM;
+}
 
 bool Activity::hasMainTabStatusBar() const {
-  return MainTabs::showsStatusBar(usesMainTabBar(), mappedInput.hasTouch(), mainTabsAtBottom());
+  // KK 的标签固定在底部，无触摸的设备也留出顶栏放时钟和电量，避免和封面叠在一起。
+  return MainTabs::showsStatusBar(usesMainTabBar(), SETTINGS.usesKkTheme() || mappedInput.hasTouch(),
+                                  mainTabsAtBottom());
 }
 
 MainTabLayout Activity::mainTabLayout() const {

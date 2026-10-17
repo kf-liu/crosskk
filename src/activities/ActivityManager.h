@@ -122,6 +122,8 @@ class ActivityManager {
   void goToReadingStatsMenu();
   void goToReadingStats();
   void goToInxRecent();
+  void goToKkHome();
+  void goToKkShelf();
   void goToMainTab(MainTab tab);
   void goToFileBrowser(std::string path = {});
   void goToLibrary();

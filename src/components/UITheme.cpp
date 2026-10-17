@@ -24,6 +24,7 @@
 #include "components/SelectionCursorPolicy.h"
 #include "components/themes/BaseTheme.h"
 #include "components/themes/inx/InxTheme.h"
+#include "components/themes/kk/KkTheme.h"
 #include "components/themes/lyra/Lyra3CoversTheme.h"
 #include "components/themes/lyra/LyraCarouselTheme.h"
 #include "components/themes/lyra/LyraTheme.h"
@@ -72,7 +73,7 @@ UITheme::UITheme() {
 }
 
 void UITheme::reload() {
-  const bool inx = SETTINGS.uiTheme == CrossPointSettings::INX;
+  const bool inx = SETTINGS.usesInxChrome();
 #ifdef CROSSMUX_UI_PROFILE_HIGH_DPI
   (void)inx;
   ui18RegularFont.data = &notosans_16_regular;
@@ -127,6 +128,11 @@ void UITheme::setTheme(CrossPointSettings::UI_THEME type) {
       nextTheme = makeUniqueNoThrow<InxTheme>();
       nextMetrics = &InxMetrics::values;
       break;
+    case CrossPointSettings::UI_THEME::KK:
+      LOG_DBG("UI", "Using KK theme");
+      nextTheme = makeUniqueNoThrow<KkTheme>();
+      nextMetrics = &InxMetrics::values;
+      break;
     default:
       LOG_ERR("UI", "Unknown theme %d, falling back to Classic", static_cast<int>(type));
       nextTheme = makeUniqueNoThrow<BaseTheme>();
@@ -169,7 +175,9 @@ bool UITheme::showSelectionCursor() const {
 #ifdef CROSSPOINT_EMULATED
   return true;
 #else
-  return SelectionCursorPolicy::visible(currentType == CrossPointSettings::UI_THEME::INX, gpio.hasTouch(),
+  return SelectionCursorPolicy::visible(currentType == CrossPointSettings::UI_THEME::INX ||
+                                            currentType == CrossPointSettings::UI_THEME::KK,
+                                        gpio.hasTouch(),
                                         gpio.lastInputModality());
 #endif
 }

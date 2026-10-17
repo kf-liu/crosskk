@@ -47,6 +47,8 @@
 #include "home/FileBrowserActivity.h"
 #include "home/HomeActivity.h"
 #include "home/InxRecentActivity.h"
+#include "home/KkHomeActivity.h"
+#include "home/KkShelfActivity.h"
 #include "home/RecentBooksActivity.h"
 #include "library/LibraryListActivity.h"
 #include "network/CrossPointWebServerActivity.h"
@@ -319,10 +321,11 @@ void ActivityManager::resetHomeStandbyInput() {
 }
 
 bool ActivityManager::handleHomeStandbyInput() {
-  const bool eligible =
-      currentActivity && (currentActivity->isHomeActivity() ||
-                          (currentActivity->usesMainTabBar() && currentActivity->mainTab() == MainTab::Recent &&
-                           mainTabFocus == MainTabFocus::Tabs));
+  const bool eligible = currentActivity &&
+                        (currentActivity->isHomeActivity() ||
+                         (currentActivity->usesMainTabBar() &&
+                          currentActivity->mainTab() == MainTabs::homeTab(SETTINGS.usesKkTheme()) &&
+                          mainTabFocus == MainTabFocus::Tabs));
   if (!eligible || !SETTINGS.standbyShortcutEnabled) {
     resetHomeStandbyInput();
     return false;
@@ -372,7 +375,8 @@ bool ActivityManager::handleMainTabInput() {
   int y = 0;
   if (mappedInput.wasScreenTapped(x, y)) {
     if (insideTabs(x, y)) {
-      const MainTab target = MainTabs::fromX(x - tabBar.x, tabBar.width);
+      const MainTab target = SETTINGS.usesKkTheme() ? MainTabs::fromXIn(MainTabs::kkValues, x - tabBar.x, tabBar.width)
+                                                   : MainTabs::fromX(x - tabBar.x, tabBar.width);
       if (target != MainTab::None) {
         mainTabFocus = MainTabFocus::Content;
         if (target != currentTab)
@@ -405,11 +409,13 @@ bool ActivityManager::handleMainTabInput() {
   switch (mainTabFocus) {
     case MainTabFocus::Tabs:
       if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-        goToMainTab(MainTabs::adjacent(currentTab, -1));
+        goToMainTab(SETTINGS.usesKkTheme() ? MainTabs::adjacentIn(MainTabs::kkValues, currentTab, -1)
+                                           : MainTabs::adjacent(currentTab, -1));
         return true;
       }
       if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
-        goToMainTab(MainTabs::adjacent(currentTab, 1));
+        goToMainTab(SETTINGS.usesKkTheme() ? MainTabs::adjacentIn(MainTabs::kkValues, currentTab, 1)
+                                           : MainTabs::adjacent(currentTab, 1));
         return true;
       }
       if (mappedInput.isPressed(MappedInputManager::Button::Left) ||
@@ -439,10 +445,10 @@ bool ActivityManager::handleMainTabInput() {
         return true;
       }
 
-      // Recent's Back is owned by the shared home Standby handler.
-      if (currentTab == MainTab::Recent) return false;
+      // 首页标签的返回键交给待机手势。
+      if (currentTab == MainTabs::homeTab(SETTINGS.usesKkTheme())) return false;
       if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-        goToMainTab(MainTabs::backTarget(currentTab));
+        goToMainTab(MainTabs::backTargetFor(MainTabs::homeTab(SETTINGS.usesKkTheme()), currentTab));
         return true;
       }
       return mappedInput.isPressed(MappedInputManager::Button::Back);
@@ -519,11 +525,21 @@ void ActivityManager::goToRecentBooks() { replaceActivityWith<RecentBooksActivit
 
 void ActivityManager::goToInxRecent() { replaceActivityWith<InxRecentActivity>(); }
 
+void ActivityManager::goToKkHome() { replaceActivityWith<KkHomeActivity>(); }
+
+void ActivityManager::goToKkShelf() { replaceActivityWith<KkShelfActivity>(); }
+
 void ActivityManager::goToMainTab(const MainTab tab) {
   mainTabEntryReleasePending = false;
   switch (tab) {
     case MainTab::Recent:
       goToInxRecent();
+      return;
+    case MainTab::Home:
+      goToKkHome();
+      return;
+    case MainTab::Bookshelf:
+      goToKkShelf();
       return;
     case MainTab::Library:
       goToFileBrowser();
@@ -602,6 +618,12 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
   }
   if (!CrossPointSettings::requiresOnboarding(SETTINGS.onboardingVersion)) {
     UserGuide::installIfPending(static_cast<Language>(SETTINGS.language) == Language::ZH_CN);
+  }
+  if (SETTINGS.usesKkTheme()) {
+    mainTabFocus = MainTabFocus::Tabs;
+    mainTabEntryReleasePending = false;
+    goToKkHome();
+    return;
   }
   if (SETTINGS.uiTheme == CrossPointSettings::UI_THEME::INX) {
     mainTabFocus = MainTabFocus::Tabs;

@@ -329,7 +329,7 @@ bool MappedInputManager::listItemFromPoint(const int x, const int y, int& index,
   const int row = (y - listTop) / rowStep;
   const int touched = pageStart + row;
   if (row < 0 || row >= pageItems || touched >= itemCount) return false;
-  if (SETTINGS.uiTheme != CrossPointSettings::INX) {
+  if (!SETTINGS.usesInxChrome()) {
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int gap = hasTouch() ? std::max(6, metrics.listRowGap) : metrics.listRowGap;
     if ((y - listTop) % rowStep >= rowStep - gap) return false;

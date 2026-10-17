@@ -198,12 +198,13 @@ inline std::vector<StrId> buildLongPressMenuValues() {
 }
 
 inline std::vector<StrId> homeThemeValues() {
+  // 下标必须等于 UI_THEME 的值。KK 接在 Cover Grid 后面，不能再把最后一项裁掉，
+  // 否则无 PSRAM 的设备会丢掉 KK。Cover Grid 在无 PSRAM 时由 setTheme 退回 Lyra。
   static constexpr StrId VALUES[] = {StrId::STR_THEME_CLASSIC,       StrId::STR_THEME_LYRA,
                                      StrId::STR_THEME_LYRA_EXTENDED, StrId::STR_THEME_ROUNDEDRAFF,
                                      StrId::STR_THEME_LYRA_CAROUSEL, StrId::STR_THEME_INX,
-                                     StrId::STR_THEME_COVER_GRID};
-  const size_t count = UITheme::supportsCoverGrid() ? std::size(VALUES) : std::size(VALUES) - 1;
-  return {VALUES, VALUES + count};
+                                     StrId::STR_THEME_COVER_GRID,    StrId::STR_THEME_KK};
+  return {VALUES, VALUES + std::size(VALUES)};
 }
 
 // Shared settings list used by both the device settings UI and the web settings API.

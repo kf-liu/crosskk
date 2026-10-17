@@ -31,13 +31,16 @@ program = r'''
 #define LOG_DBG(...) ((void)0)
 #define LOG_ERR(...) ((void)0)
 bool psram = false, oom = false;
-struct CrossPointSettings { @ENUM@ int uiTheme=0; } SETTINGS;
+struct CrossPointSettings { @ENUM@ int uiTheme=0;
+ bool usesInxChrome() const { return uiTheme==INX || uiTheme==KK; }
+} SETTINGS;
 enum class StrId { @IDS@ };
 struct HalMemory { struct Heap {size_t totalBytes;}; static Heap getPsramHeap(){return {psram?8388608u:0u};} };
 struct ThemeMetrics {};
 struct BaseTheme {virtual ~BaseTheme()=default;};
 struct LyraTheme:BaseTheme{}; struct RoundedRaffTheme:BaseTheme{};
 struct Lyra3CoversTheme:BaseTheme{}; struct LyraCarouselTheme:BaseTheme{}; struct InxTheme:BaseTheme{};
+struct KkTheme:BaseTheme{};
 namespace BaseMetrics {const ThemeMetrics values{};}
 namespace LyraMetrics {const ThemeMetrics values{};}
 namespace RoundedRaffMetrics {const ThemeMetrics values{};}
@@ -61,11 +64,11 @@ struct UITheme {
 @METHODS@
 @LABELS@
 int main(){
- static_assert(CrossPointSettings::LYRA_CAROUSEL==4 && CrossPointSettings::INX==5 && CrossPointSettings::COVER_GRID==6);
- for(bool available:{false,true}) for(int saved=0;saved<=6;++saved){
+ static_assert(CrossPointSettings::LYRA_CAROUSEL==4 && CrossPointSettings::INX==5 && CrossPointSettings::COVER_GRID==6 && CrossPointSettings::KK==7);
+ for(bool available:{false,true}) for(int saved=0;saved<=7;++saved){
   psram=available; SETTINGS.uiTheme=saved; UITheme theme;
   theme.reload();
-  const bool inx=saved==5;
+  const bool inx=saved==5 || saved==7;
   assert(ui18RegularFont.data==(inx?&fallback:&notosans_18_regular));
   assert(ui18BoldFont.data==(inx?&fallback:&notosans_18_bold));
   assert(ui10RegularFont.data==&ubuntu_10_regular && ui10BoldFont.data==&ubuntu_10_bold);
@@ -73,9 +76,9 @@ int main(){
   assert(SETTINGS.uiTheme==saved);
   assert(theme.currentType==(saved==6&&!psram?1:saved));
   assert(UITheme::hasCoverGridHome()==(saved==6&&psram));
-  const auto values=homeThemeValues(); assert(values.size()==(psram?7:6));
+  const auto values=homeThemeValues(); assert(values.size()==8);
   assert(values[4]==StrId::STR_THEME_LYRA_CAROUSEL && values[5]==StrId::STR_THEME_INX);
-  if(psram) assert(values[6]==StrId::STR_THEME_COVER_GRID);
+  assert(values[6]==StrId::STR_THEME_COVER_GRID && values[7]==StrId::STR_THEME_KK);
  }
  oom=true; SETTINGS.uiTheme=6; UITheme theme; theme.setTheme(CrossPointSettings::COVER_GRID);
  assert(theme.currentTheme==&theme.fallbackTheme && theme.currentType==CrossPointSettings::CLASSIC);

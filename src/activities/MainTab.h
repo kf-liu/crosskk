@@ -8,7 +8,7 @@
 #include "components/Rect.h"
 #include "components/UiHighDpiProfile.h"
 
-enum class MainTab : uint8_t { None, Recent, Library, Apps, Settings, Statistics };
+enum class MainTab : uint8_t { None, Recent, Library, Apps, Settings, Statistics, Home, Bookshelf };
 enum class MainTabFocus : uint8_t { Tabs, Content };
 enum class MainTabContentEdge : uint8_t { First, Last };
 
@@ -24,6 +24,26 @@ inline constexpr int statusBarHeight = UiHighDpiProfile::enabled ? UiHighDpiProf
 inline constexpr int bottomBarHeight = UiHighDpiProfile::enabled ? UiHighDpiProfile::navigationHeight : 56;
 inline constexpr std::array<MainTab, 5> values = {MainTab::Recent, MainTab::Library, MainTab::Apps, MainTab::Settings,
                                                   MainTab::Statistics};
+inline constexpr std::array<MainTab, 5> kkValues = {MainTab::Home, MainTab::Bookshelf, MainTab::Apps, MainTab::Library,
+                                                    MainTab::Settings};
+
+constexpr MainTab homeTab(const bool kk) { return kk ? MainTab::Home : MainTab::Recent; }
+
+constexpr MainTab backTargetFor(const MainTab home, const MainTab tab) { return tab == home ? MainTab::None : home; }
+
+template <size_t N>
+constexpr int indexOfIn(const std::array<MainTab, N>& tabs, const MainTab tab) {
+  const auto found = std::find(tabs.begin(), tabs.end(), tab);
+  return found == tabs.end() ? -1 : static_cast<int>(found - tabs.begin());
+}
+
+template <size_t N>
+constexpr MainTab adjacentIn(const std::array<MainTab, N>& tabs, const MainTab tab, const int direction) {
+  const int index = indexOfIn(tabs, tab);
+  if (index < 0) return MainTab::None;
+  const int count = static_cast<int>(N);
+  return tabs[(index + (direction < 0 ? count - 1 : 1)) % count];
+}
 
 constexpr int indexOf(const MainTab tab) {
   const auto found = std::find(values.begin(), values.end(), tab);
@@ -52,6 +72,17 @@ constexpr MainTab fromX(const int x, const int width) {
   for (size_t i = 0; i < values.size(); ++i) {
     const auto bounds = tabBounds(static_cast<int>(i), width);
     if (x >= bounds.left && x < bounds.right) return values[i];
+  }
+  return MainTab::None;
+}
+
+template <size_t N>
+constexpr MainTab fromXIn(const std::array<MainTab, N>& tabs, const int x, const int width) {
+  static_assert(N == values.size(), "标签命中按五个等分槽计算");
+  if (x < 0 || width <= 0 || x >= width) return MainTab::None;
+  for (size_t i = 0; i < N; ++i) {
+    const auto bounds = tabBounds(static_cast<int>(i), width);
+    if (x >= bounds.left && x < bounds.right) return tabs[i];
   }
   return MainTab::None;
 }

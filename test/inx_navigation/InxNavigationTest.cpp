@@ -44,6 +44,21 @@ constexpr bool isSolid(const InxAppIcons::Icon& icon, const uint8_t value) {
 }
 }  // namespace
 
+TEST(InxNavigation, KkTabsWrapAroundHome) {
+  EXPECT_EQ(MainTabs::adjacentIn(MainTabs::kkValues, MainTab::Home, -1), MainTab::Settings);
+  EXPECT_EQ(MainTabs::adjacentIn(MainTabs::kkValues, MainTab::Settings, 1), MainTab::Home);
+  EXPECT_EQ(MainTabs::adjacentIn(MainTabs::kkValues, MainTab::Bookshelf, 1), MainTab::Apps);
+  EXPECT_EQ(MainTabs::fromXIn(MainTabs::kkValues, 50, 500), MainTab::Home);
+  EXPECT_EQ(MainTabs::fromXIn(MainTabs::kkValues, 150, 500), MainTab::Bookshelf);
+  EXPECT_EQ(MainTabs::fromXIn(MainTabs::kkValues, 250, 500), MainTab::Apps);
+  EXPECT_EQ(MainTabs::fromXIn(MainTabs::kkValues, 350, 500), MainTab::Library);
+  EXPECT_EQ(MainTabs::fromXIn(MainTabs::kkValues, 450, 500), MainTab::Settings);
+  EXPECT_EQ(MainTabs::backTargetFor(MainTab::Home, MainTab::Library), MainTab::Home);
+  EXPECT_EQ(MainTabs::backTargetFor(MainTab::Home, MainTab::Home), MainTab::None);
+  EXPECT_EQ(MainTabs::homeTab(true), MainTab::Home);
+  EXPECT_EQ(MainTabs::homeTab(false), MainTab::Recent);
+}
+
 TEST(InxNavigation, WrapsAcrossFiveTabs) {
   EXPECT_EQ(MainTabs::adjacent(MainTab::Recent, -1), MainTab::Statistics);
   EXPECT_EQ(MainTabs::adjacent(MainTab::Statistics, 1), MainTab::Recent);

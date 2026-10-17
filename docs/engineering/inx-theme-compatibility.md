@@ -16,8 +16,10 @@ styling. Page headers, text fields and button hints retain the active theme.
 Existing popup properties already specify
 INX fonts, alignment and spacing; avoid redundant overrides.
 
-INX alone keeps the UI_10 body font, theme-grid list sizing, emphasized/value
-styles, legacy scroll inset and separator/selection geometry. Other themes use
+INX and KK keep the UI_10 body font, theme-grid list sizing, emphasized/value
+styles, legacy scroll inset and separator/selection geometry. KK reuses that
+chrome with the tab bar fixed at the bottom: Home, Bookshelf, Apps, Files and
+Settings. Apps, Files and Settings are the existing INX screens. Other themes use
 the reviewed upstream UI_12 body font and list defaults, including the small
 value font, button-device minimum row height and one safe-area compensation.
 SDK ThemeRow-specific selected/dimmed styling must not affect Content layouts.
