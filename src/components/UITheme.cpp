@@ -273,6 +273,27 @@ int UITheme::getProgressBarHeight() {
   return sb.showsProgressBar() ? (sb.progressBarHeightPx + metrics.progressBarMarginTop) : 0;
 }
 
+int UITheme::getStatusBarTextOrigin(const GfxRenderer& renderer, const int paddingBottom) {
+  int orientedMarginTop = 0;
+  int orientedMarginRight = 0;
+  int orientedMarginBottom = 0;
+  int orientedMarginLeft = 0;
+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                   &orientedMarginLeft);
+  (void)orientedMarginTop;
+  (void)orientedMarginRight;
+  (void)orientedMarginLeft;
+  int textY = renderer.getScreenHeight() - getStatusBarHeight() - orientedMarginBottom - paddingBottom;
+  textY += getStatusBarTextTopPadding(renderer);
+#if !FREEINK_DEVICE_READPICO
+  textY -= 4;
+#endif
+#if FREEINK_DEVICE_EEGO_A4
+  textY -= 4;
+#endif
+  return textY;
+}
+
 int UITheme::getStatusBarTextTopPadding(const GfxRenderer& renderer) {
   if (!UiHighDpiProfile::enabled) return 0;
 #if FREEINK_DEVICE_READPICO

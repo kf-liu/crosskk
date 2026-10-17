@@ -1086,16 +1086,12 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
   renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
                                    &orientedMarginLeft);
+  (void)orientedMarginTop;
   const auto sb = SETTINGS.statusBarSpec();
   const bool showStatusBarTextLane = sb.textLaneVisible();
 
-  // Draw Progress Text
-  const auto screenHeight = renderer.getScreenHeight();
-  auto textY = screenHeight - UITheme::getInstance().getStatusBarHeight() - orientedMarginBottom - paddingBottom;
-  textY += UITheme::getStatusBarTextTopPadding(renderer);
-#if !FREEINK_DEVICE_READPICO
-  textY -= 4;
-#endif
+  // Draw Progress Text. The origin includes the same lifts a partial clear uses.
+  int textY = UITheme::getStatusBarTextOrigin(renderer, paddingBottom);
 
   int leftClusterX = metrics.statusBarHorizontalMargin + orientedMarginLeft + 1;
   int rightClusterX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin - orientedMarginRight;
@@ -1103,12 +1099,10 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   // The EEGO A4 panel has physically rounded corners; the status bar text must
   // stay inside the 28 px UI content inset (eego-a4-template-firmware
   // SAFE_AREA spec), so clamp the left/right text clusters out of the corner
-  // cutouts. The bottom ~4 px of the bar is covered by the bezel, so the whole
-  // cluster is also lifted by that amount (measured on device).
+  // cutouts. The vertical lift for the bezel lives in getStatusBarTextOrigin.
   constexpr int kEegoStatusBarSafeInset = 28;
   leftClusterX = std::max(leftClusterX, kEegoStatusBarSafeInset);
   rightClusterX = std::min(rightClusterX, renderer.getScreenWidth() - kEegoStatusBarSafeInset);
-  textY -= 4;
 #endif
   int leftClusterWidth = 0;
   int rightClusterWidth = 0;

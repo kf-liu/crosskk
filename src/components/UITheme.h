@@ -45,6 +45,9 @@ class UITheme {
   static UIIcon getFileIcon(const std::string& filename);
   static int getStatusBarHeight();
   static int getStatusBarTextTopPadding(const GfxRenderer& renderer);
+  // Top of the reader status-bar text, including the lifts drawStatusBar applies
+  // above the reserved band. Partial repaints must clear from here.
+  static int getStatusBarTextOrigin(const GfxRenderer& renderer, int paddingBottom = 0);
   static int getProgressBarHeight();
 
  private:
