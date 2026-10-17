@@ -5,7 +5,8 @@ Nightly slug `metalio-eink4`. Hardware reference: `metalio-hw-test` 2.0.51,
 `main/hal/metalio-e-ink-4/config.h`, `IOExpander.hpp`, and its SSD1677 driver.
 The port was developed on SDK `5faf69e8` and rebased onto the current CrossMux
 SDK dependency, including its SD-capacity fix; it does not migrate the reference's
-ESP-IDF/LVGL application or add its audio, cellular or IMU features. Global touch
+ESP-IDF/LVGL application or add its audio or cellular features. The SC7A20H
+accelerometer drives the existing tilt/shake page-turn setting. Global touch
 haptic feedback is supported as described below.
 
 ```sh
@@ -315,7 +316,7 @@ uncommitted changes; the SDK gitlink is unchanged.
 | Gauge / charger | BQ27220 at 0x55 and optional CX25601N at 0x6B agree. At this audit, charger control was intentionally deferred; the current boot-time configuration above supersedes that decision. |
 | RTC | Retain PCF8563 at 0x51 and system-UTC restore/writeback. |
 | Audio / microphone | Reference external BT audio module uses UART TX48/RX47 and I²S BCLK6/WS43/DOUT7/DIN17. CrossMux leaves audio/mic capabilities disabled and PA off; codec/module control needs a separate port. |
-| IMU | Reference SC7A20H at 0x19, interrupt on TCA9555 P1.4. CrossMux keeps IMU disabled; no substitute QMI8658 driver or automatic rotation is enabled. |
+| IMU | SC7A20H at 0x19 (fallback 0x18), 100 Hz, ±2 g, polled. TCA9555 P1.4 interrupt is unused. Tilt/shake page turn reuses `HalTiltSensor`'s gravity-rate gesture; automatic rotation is not enabled. |
 | Cellular | Reference NT26 UART TX12/RX11, MRDY21/SRDY5. No CrossMux modem service is introduced. |
 | USB camera | Reference switches P0.0 LOW for camera host use. CrossMux keeps HIGH for existing native-USB debug/MSC; no UVC host driver. |
 | Wi-Fi / BLE | Retain existing CrossMux Wi-Fi and BLE page-turner paths, not the reference voice/network application. |
@@ -455,3 +456,26 @@ flash is performed for publication. Detailed recorded 100-page/video acceptance
 remains pending. The shared document carries current test and rollback commands
 and the default rollout on Sticky, both SSD1677 Murphy M4 batches and Waveshare
 3.97. Those panels' independent optical acceptance remains pending.
+
+## Shake page turn (SC7A20H)
+
+Controls →「倾斜翻页」is the existing flick gesture (`tiltPageTurn`: Off / Normal /
+Inverted). Metalio shows the row only after `Imu::begin()` identifies the
+SC7A20H. The sensor stays in sleep until that setting is on and a reader
+activity is current, then samples at 100 Hz. `HalTiltSensor` differentiates the
+left/right gravity component (portrait `ax`, landscape `ay`) and uses the same
+270 dps-equivalent threshold as the X3 gyro and Read Pico accelerometer. One
+flick produces one page turn; the device must return near neutral before the
+next flick, with a 600 ms cooldown.
+
+Axis signs are not corrected in the board profile. If Normal turns pages
+backwards, use Inverted. A flick that does nothing on either setting means the
+mounted axis is not the one this gesture reads; that still needs a physical
+check with each face up. The expander interrupt on P1.4 is not armed, and shake
+does not wake the device from sleep.
+
+Host coverage: `freeink-sdk/libs/hardware/Imu/test/host/run.sh` (identity, 100 Hz
+setup, scaling, data-ready, sleep/wake) and `python3 test/hal_tilt/test_hal_tilt.py`
+(20 ms cadence and the shared gravity-rate state machine). Physical acceptance
+is pending: confirm address 0x19 or 0x18, about 1 g at rest, Normal/Inverted
+direction in portrait and landscape, and that the part is quiet in the home UI.
