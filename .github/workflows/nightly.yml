@@ -148,6 +148,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      previous_index: ${{ steps.previous_global.outputs.present }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
@@ -159,15 +161,21 @@ jobs:
           name: firmware-release-notes
           path: notes
       - name: Load previous global Nightly index
+        id: previous_global
         if: needs.prepare.outputs.channel == 'nightly'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p previous/global
-          gh release download nightly --repo "$GITHUB_REPOSITORY" \
-            --pattern release-index.json --dir previous/global
+          if gh release download nightly --repo "$GITHUB_REPOSITORY" \
+            --pattern release-index.json --dir previous/global; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No previous Nightly index; GitHub cleanup will be skipped"
+          fi
       - uses: actions/upload-artifact@v4
-        if: needs.prepare.outputs.channel == 'nightly'
+        if: needs.prepare.outputs.channel == 'nightly' && steps.previous_global.outputs.present == 'true'
         with:
           name: previous-global-index
           path: previous/global/release-index.json
@@ -221,8 +229,16 @@ jobs:
             gh release delete-asset "$CHANNEL" firmware-cn.bin --repo "$GITHUB_REPOSITORY" --yes
           fi
 
-  publish_cn:
+  select_cn_runner:
     needs: [prepare, notes, build]
+    uses: ./.github/workflows/select-build-runner.yml
+    secrets:
+      runner_status_token: ${{ secrets.H2O_RUNNER_TOKEN }}
+
+  publish_cn:
+    needs: [prepare, notes, build, select_cn_runner]
+    if: contains(needs.select_cn_runner.outputs['runs-on'], 'h2o')
+    continue-on-error: true
     runs-on: [self-hosted, Linux, X64, h2o]
     permissions:
       contents: read
@@ -316,16 +332,22 @@ jobs:
 
   verify_publish:
     needs: [prepare, publish_github, publish_cn]
+    if: always() && needs.publish_github.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Verify published indexes and assets
+      - name: Verify published GitHub index and assets
         env:
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
           python3 scripts/verify_nightly_release.py --channel "$CHANNEL" \
             --index-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${CHANNEL}/release-index.json?run=${GITHUB_RUN_ID}" \
             --expected-sha "$GITHUB_SHA"
+      - name: Verify published China index and assets
+        if: needs.publish_cn.result == 'success'
+        env:
+          CHANNEL: ${{ needs.prepare.outputs.channel }}
+        run: |
           python3 scripts/verify_nightly_release.py --channel "$CHANNEL" \
             --index-url "https://assets.crossmux.cn/firmware/releases/${CHANNEL}/index.json?run=${GITHUB_RUN_ID}" \
             --expected-sha "$GITHUB_SHA"
@@ -365,7 +387,7 @@ jobs:
           fi
 
   cleanup_github:
-    if: needs.prepare.outputs.channel == 'nightly'
+    if: needs.prepare.outputs.channel == 'nightly' && needs.publish_github.outputs.previous_index == 'true'
     needs: [prepare, verify_publish, publish_github]
     runs-on: ubuntu-latest
     permissions:
@@ -393,7 +415,7 @@ jobs:
           done < obsolete-github-builds.txt
 
   cleanup_cn:
-    if: needs.prepare.outputs.channel == 'nightly'
+    if: always() && needs.prepare.outputs.channel == 'nightly' && needs.publish_cn.result == 'success' && needs.verify_publish.result == 'success'
     needs: [prepare, verify_publish, publish_cn]
     runs-on: [self-hosted, Linux, X64, h2o]
     permissions:

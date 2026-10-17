@@ -66,9 +66,13 @@ The global and China publish jobs run independently. Each writes in this order:
 3. rolling regional indexes.
 
 Every target selected for a channel must build successfully before either region
-publishes. Nightly also requires its previous rolling index because that index
-protects the immediately preceding build during cleanup. Once both regions
-publish, CI resolves every manifest and verifies each distinct asset's size and
+publishes. Nightly uses its previous rolling index to protect the immediately
+preceding build during cleanup. A missing previous GitHub index does not block
+publication; GitHub cleanup is skipped for that run. The China publish job runs
+only when H2O is online and idle after the build. If H2O is unavailable, or the
+COS upload fails, GitHub publication and verification still complete. China
+index verification and COS cleanup run only after a successful China publish.
+CI resolves every published manifest and verifies each distinct asset's size and
 SHA-256. Cleanup then runs for Nightly only; Stable builds are retained.
 
 The global index is the `release-index.json` asset of the rolling `stable` or

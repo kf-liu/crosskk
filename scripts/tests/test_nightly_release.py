@@ -157,7 +157,11 @@ class NightlyTargetTest(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/nightly.yml').read_text()
         self.assertIn("group: firmware-${{ github.event_name == 'push'", workflow)
         self.assertIn("if: needs.prepare.outputs.channel == 'stable'", workflow)
-        self.assertEqual(workflow.count("if: needs.prepare.outputs.channel == 'nightly'"), 6)
+        self.assertEqual(workflow.count("if: needs.prepare.outputs.channel == 'nightly'"), 5)
+        self.assertIn(
+            "always() && needs.prepare.outputs.channel == 'nightly' && needs.publish_cn.result == 'success'",
+            workflow,
+        )
         self.assertNotIn("if: always() && needs.prepare.result == 'success'", workflow)
         self.assertNotIn('--dir previous/global || true', workflow)
         self.assertNotIn('-o previous/cn.json || true', workflow)
@@ -169,7 +173,17 @@ class NightlyTargetTest(unittest.TestCase):
         self.assertGreater(rolling.index('legacy_assets='), rolling.index('xteink-firmware.bin'))
         verify = workflow.split('  verify_publish:', 1)[1]
         self.assertIn('needs: [prepare, publish_github, publish_cn]', verify)
+        self.assertIn("if: always() && needs.publish_github.result == 'success'", verify)
+        self.assertIn("if: needs.publish_cn.result == 'success'", verify)
         self.assertEqual(verify.count('python3 scripts/verify_nightly_release.py'), 2)
+        china = workflow.split('  publish_cn:\n', 1)[1].split('  verify_publish:\n', 1)[0]
+        self.assertIn('continue-on-error: true', china)
+        self.assertIn("contains(needs.select_cn_runner.outputs['runs-on'], 'h2o')", china)
+        self.assertIn('previous_index: ${{ steps.previous_global.outputs.present }}', workflow)
+        self.assertIn(
+            "needs.prepare.outputs.channel == 'nightly' && needs.publish_github.outputs.previous_index == 'true'",
+            workflow,
+        )
         self.assertIn(
             '  cleanup_github:\n    if:', workflow
         )
