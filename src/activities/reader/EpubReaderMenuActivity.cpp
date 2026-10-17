@@ -45,10 +45,10 @@ void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, const 
                                             const bool hasBookmarks, const bool canHighlight) {
   items.clear();
   items.reserve(MAX_MENU_ITEMS);
+  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   if (canHighlight) {
     items.push_back({MenuAction::HIGHLIGHT, StrId::STR_WEREAD_HIGHLIGHT});
   }
-  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
