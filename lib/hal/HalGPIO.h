@@ -149,12 +149,6 @@ class HalGPIO {
   bool restoreTouchAfterDisplayReset();
   void setSharedConfirmPowerShortPressEmitsPower(bool enabled);
 
-  // Verify that the physical power button remains held through input debounce.
-  // Returns true if verification succeeded, false if device should return to sleep.
-  // Should only be called when wakeup reason is PowerButton.
-  bool verifyPowerButtonWakeup();
-  bool verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed);
-
   // Check if USB is connected
   bool isUsbConnected() const;
 

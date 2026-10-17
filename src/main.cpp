@@ -762,13 +762,6 @@ void setup() {
   powerManager.begin();
 
   const auto wakeupReason = gpio.getWakeupReason();
-  // Sample the wake hold now — a click wake is released within milliseconds of
-  // boot — but defer the sleep-or-boot decision until SETTINGS is loaded below:
-  // click-to-wake is a setting, and an X4 battery power-off cuts all power, so
-  // only SD state survives to the next boot.
-#if !FREEINK_DEVICE_EEGO_A4
-  const bool wakeHoldVerified = wakeupReason != HalGPIO::WakeupReason::PowerButton || gpio.verifyPowerButtonWakeup();
-#endif
 
   // IMU bring-up on every target. Read Pico's SC7A20H is an accelerometer with no
   // gyroscope, so HalTiltSensor differentiates the gravity component for the tilt
@@ -863,21 +856,12 @@ void setup() {
 
   switch (wakeupReason) {
     case HalGPIO::WakeupReason::PowerButton:
-#if FREEINK_DEVICE_EEGO_A4
-      LOG_DBG("MAIN", "Verifying power button press duration");
-      if (!gpio.verifyPowerButtonWakeup(SETTINGS.getPowerButtonDuration(),
-                                        SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP)) {
-        powerManager.startDeepSleep(gpio);
-      }
-#else
-      // With Short Power Button Press = Sleep, a single click wakes on any
-      // device; otherwise the button must still be held (ghost-wake debounce).
-      if (!wakeHoldVerified && SETTINGS.shortPwrBtn != CrossPointSettings::SHORT_PWRBTN::SLEEP) {
-        LOG_DBG("MAIN", "Power-button wake not held through verification, sleeping");
-        Storage.prepareForDeepSleep();
-        powerManager.startDeepSleep(gpio);
-      }
-#endif
+      // The wake itself is the press: a button-energized cold boot, or a GPIO
+      // wake from sleep. Continue even if the button was already released, so a
+      // short press turns the device on. Requiring it to still be held rejected
+      // every click shorter than this point in setup(). wakePowerReleasePending
+      // keeps that same hold from also counting as an in-app long press.
+      LOG_DBG("MAIN", "Wakeup reason: Power button");
       wakePowerReleasePending = true;
       break;
     case HalGPIO::WakeupReason::AfterUSBPower:

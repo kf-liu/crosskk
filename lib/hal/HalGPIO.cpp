@@ -439,49 +439,6 @@ bool HalGPIO::isXteinkDevice() const {
          BoardConfig::ACTIVE.board == BoardConfig::Board::XteinkX4;
 }
 
-bool HalGPIO::verifyPowerButtonWakeup() {
-  // M5Paper v1.1: the classic ESP32's reset-to-setup() latency exceeds a normal
-  // wheel click, so a click wake is always released before this samples and
-  // verification would re-sleep on every wake. Its wheel has hard external
-  // pull-ups, so the ghost-wake debounce this implements is not needed.
-  if (BoardConfig::isPaperMono() || BoardConfig::isM5PaperV11() || BoardConfig::ACTIVE.input.power < 0) {
-    return true;
-  }
-
-  constexpr unsigned long POWER_WAKE_STABILITY_MS = 10;
-  const bool heldAtFirstSample = inputMgr.isPowerButtonPhysicallyPressed();
-  const unsigned long sampleStart = millis();
-  inputMgr.update();
-  while (millis() - sampleStart < POWER_WAKE_STABILITY_MS || inputMgr.isDebouncePending()) {
-    delay(1);
-    inputMgr.update();
-  }
-  return heldAtFirstSample && inputMgr.isPowerButtonPhysicallyPressed();
-}
-
-bool HalGPIO::verifyPowerButtonWakeup(const uint16_t requiredDurationMs, const bool shortPressAllowed) {
-  if (BoardConfig::isX4Pro() || FREEINK_DEVICE_X4CLASSIC || BoardConfig::isPaperMono() || BoardConfig::isM5PaperV11() ||
-      BoardConfig::ACTIVE.input.power < 0 || shortPressAllowed) {
-    return true;
-  }
-
-  const unsigned long calibration = millis();
-  const unsigned long calibratedDuration = calibration < requiredDurationMs ? requiredDurationMs - calibration : 1;
-  const unsigned long start = millis();
-  inputMgr.update();
-  while (!inputMgr.isPressed(BTN_POWER) && millis() - start < 1000) {
-    delay(10);
-    inputMgr.update();
-  }
-  if (!inputMgr.isPressed(BTN_POWER)) return false;
-
-  do {
-    delay(10);
-    inputMgr.update();
-  } while (inputMgr.isPressed(BTN_POWER) && inputMgr.getPowerButtonHeldTime() < calibratedDuration);
-  return inputMgr.getPowerButtonHeldTime() >= calibratedDuration;
-}
-
 #if FREEINK_DEVICE_WAVESHARE_EPAPER_397 || FREEINK_DEVICE_METALIO_EINK4
 // Keep the last positive USB Serial/JTAG SOF result across nearby polls.
 static bool usbHostSofActive() {
