@@ -48,8 +48,16 @@ bool takeApply(ApplyRequest& out);
 void dismissChoice();
 bool formatWhen(uint32_t epoch, char* buffer, size_t size);
 
-// 每轮主循环推进一步。不占阅读画面，也不清空字形缓存。
-void step();
+// 建好 wrBeat。模拟器没有这条任务，返回 false，调用方在当前线程走。
+bool ensureWorker();
+// 主循环只叫醒后台任务。进度同步的 HTTPS 在 wrBeat 上走，不挡翻页。
+void serviceOnMain();
+// 章节正在分页。后台不要同时读 SD。
+bool isPaused();
+
+// 同步空闲时跑一拍阅读侧的后台工作（划线、心跳）。返回 true 表示马上再来一拍。
+using IdleHook = bool (*)();
+void setIdleHook(IdleHook hook);
 
 }  // namespace WeReadBackgroundSync
 

@@ -7,9 +7,14 @@
 #include <Memory.h>
 #include <WeReadHttpClient.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "util/BackgroundWork.h"
 #include "util/TimeUtils.h"
@@ -32,7 +37,6 @@ struct Job {
   bool exitJob = false;
   bool exitRetried = false;
   bool choiceHeld = false;
-  bool clockTried = false;
   char bookId[64] = {};
   WeReadClient::ProgressSyncInput input{};
   WeReadProtocol::RemoteProgress remote{};
@@ -41,10 +45,33 @@ struct Job {
   uint16_t localPages = 0;
   unsigned long nextStepMs = 0;
   unsigned long offlineSinceMs = 0;
+  unsigned long clockSinceMs = 0;
   bool progressNoted = false;
 };
 
+enum class PendingKind : uint8_t { None, Enter, Exit, Direction, Release };
+
+struct PendingCmd {
+  PendingKind kind = PendingKind::None;
+  WeReadClient::ProgressSyncMode mode = WeReadClient::ProgressSyncMode::Compare;
+  WeReadClient::ProgressSyncInput input{};
+  uint32_t localEpoch = 0;
+  uint16_t localSpine = 0;
+  uint16_t localPages = 0;
+  char bookId[64] = {};
+};
+
+enum class StepPace : uint8_t { Idle, Wait, Again };
+
 Job job;
+PendingCmd pending;
+std::atomic<bool> pauseRequested{false};
+std::atomic<bool> inFlight{false};
+std::atomic<bool> clockNeeded{false};
+SemaphoreHandle_t jobMu = nullptr;
+TaskHandle_t worker = nullptr;
+std::atomic<IdleHook> idleHook{nullptr};
+bool clockRequestArmed = false;
 
 void rememberBook(const char* bookId) {
   job.bookId[0] = '\0';
@@ -69,7 +96,7 @@ void idle() {
   job.exitJob = false;
   job.exitRetried = false;
   job.choiceHeld = false;
-  job.clockTried = false;
+  job.clockSinceMs = 0;
   job.nextStepMs = 0;
   job.offlineSinceMs = 0;
 }
@@ -89,7 +116,7 @@ void queue(const WeReadClient::ProgressSyncMode mode, const bool exitJob) {
   job.exitJob = exitJob;
   job.exitRetried = false;
   job.choiceHeld = false;
-  job.clockTried = false;
+  job.clockSinceMs = 0;
   job.nextStepMs = 0;
   job.offlineSinceMs = 0;
   job.phase = Phase::Syncing;
@@ -128,7 +155,7 @@ void finishOutcome(const WeReadClient::ProgressSyncResult& result) {
           job.exitRetried = true;
           job.mode = WeReadClient::ProgressSyncMode::UploadLocal;
           job.phase = Phase::Syncing;
-          job.clockTried = false;
+          job.clockSinceMs = 0;
           job.nextStepMs = 0;
           LOG_INF("WRSync", "exit upload conflicted; retrying once");
           return;
@@ -150,6 +177,201 @@ void finishOutcome(const WeReadClient::ProgressSyncResult& result) {
   }
 }
 
+bool lockJob() {
+  if (!jobMu) jobMu = xSemaphoreCreateMutex();
+  if (!jobMu) {
+    LOG_ERR("WRSync", "进度同步锁创建失败");
+    return false;
+  }
+  xSemaphoreTake(jobMu, portMAX_DELAY);
+  return true;
+}
+
+void unlockJob() {
+  if (jobMu) xSemaphoreGive(jobMu);
+}
+
+void copyPendingBook(const char* bookId) {
+  pending.bookId[0] = '\0';
+  if (!bookId) return;
+  strncpy(pending.bookId, bookId, sizeof(pending.bookId) - 1);
+  pending.bookId[sizeof(pending.bookId) - 1] = '\0';
+}
+
+bool syncBusyLocked() {
+  return inFlight.load() || job.phase != Phase::Idle || job.choiceHeld || pending.kind != PendingKind::None;
+}
+
+void applyPendingLocked() {
+  if (inFlight.load()) return;
+  switch (pending.kind) {
+    case PendingKind::None:
+      return;
+    case PendingKind::Release:
+      idle();
+      job.operation.reset();
+      job.bookId[0] = '\0';
+      pending.kind = PendingKind::None;
+      return;
+    case PendingKind::Enter:
+      rememberBook(pending.bookId);
+      job.input = pending.input;
+      job.localEpoch = pending.localEpoch;
+      job.localSpine = pending.localSpine;
+      job.localPages = pending.localPages;
+      queue(WeReadClient::ProgressSyncMode::Compare, false);
+      pending.kind = PendingKind::None;
+      LOG_INF("WRSync", "background enter queued");
+      return;
+    case PendingKind::Exit:
+      if (job.phase == Phase::Syncing && job.exitJob && sameBook(pending.bookId)) {
+        pending.kind = PendingKind::None;
+        return;
+      }
+      rememberBook(pending.bookId);
+      job.input = pending.input;
+      queue(WeReadClient::ProgressSyncMode::UploadLocal, true);
+      pending.kind = PendingKind::None;
+      LOG_INF("WRSync", "background exit queued");
+      return;
+    case PendingKind::Direction:
+      if (job.bookId[0] == '\0') {
+        pending.kind = PendingKind::None;
+        return;
+      }
+      queue(pending.mode, false);
+      pending.kind = PendingKind::None;
+      LOG_INF("WRSync", "background direction queued: mode=%u", static_cast<unsigned>(pending.mode));
+      return;
+  }
+}
+
+StepPace stepWork() {
+  if (!lockJob()) return StepPace::Idle;
+  job.paused = pauseRequested.load();
+  applyPendingLocked();
+  if (inFlight.load()) {
+    unlockJob();
+    return StepPace::Wait;
+  }
+  if (job.paused || job.phase != Phase::Syncing || !job.operation) {
+    const StepPace pace = job.phase == Phase::Syncing ? StepPace::Wait : StepPace::Idle;
+    unlockJob();
+    return pace;
+  }
+  if (job.nextStepMs != 0 && static_cast<long>(millis() - job.nextStepMs) < 0) {
+    unlockJob();
+    return StepPace::Wait;
+  }
+
+  if (!WeReadHttpClient::networkReady()) {
+    if (job.offlineSinceMs == 0) job.offlineSinceMs = millis();
+    else if (static_cast<long>(millis() - job.offlineSinceMs) > static_cast<long>(kOfflineGiveUpMs)) {
+      LOG_INF("WRSync", "background sync skipped: still offline");
+      idle();
+      unlockJob();
+      return StepPace::Idle;
+    }
+    job.nextStepMs = millis() + kOfflineRetryMs;
+    unlockJob();
+    return StepPace::Wait;
+  }
+  job.offlineSinceMs = 0;
+
+  if (!TimeUtils::isClockValid()) {
+    if (job.clockSinceMs == 0) job.clockSinceMs = millis();
+    if (static_cast<long>(millis() - job.clockSinceMs) > 10000) {
+      LOG_ERR("WRSync", "后台对时失败");
+      clockNeeded.store(false);
+      idle();
+      unlockJob();
+      return StepPace::Idle;
+    }
+    // 对时留给主循环。这里不调用 syncNow，避免和 HalClock::update 抢 SNTP。
+    clockNeeded.store(true);
+    job.nextStepMs = millis() + 250;
+    unlockJob();
+    return StepPace::Wait;
+  }
+  job.clockSinceMs = 0;
+  clockNeeded.store(false);
+
+  if (!job.operation->active()) {
+    if (!job.operation->beginProgressSync(job.bookId, job.input, job.mode)) {
+      LOG_ERR("WRSync", "background sync could not start: error=%u", static_cast<unsigned>(job.operation->error()));
+      idle();
+      unlockJob();
+      return StepPace::Idle;
+    }
+    unlockJob();
+    return StepPace::Again;
+  }
+
+  inFlight.store(true);
+  unlockJob();
+  const auto event = job.operation->step();
+  if (!lockJob()) {
+    inFlight.store(false);
+    return StepPace::Idle;
+  }
+  inFlight.store(false);
+  if (pending.kind != PendingKind::None) {
+    applyPendingLocked();
+    unlockJob();
+    return StepPace::Again;
+  }
+
+  StepPace pace = StepPace::Idle;
+  switch (event) {
+    case WeReadClient::Operation::Event::None:
+      pace = StepPace::Wait;
+      break;
+    case WeReadClient::Operation::Event::Authenticated:
+    case WeReadClient::Operation::Event::DetailReady:
+    case WeReadClient::Operation::Event::ChapterComplete:
+    case WeReadClient::Operation::Event::QrReady:
+    case WeReadClient::Operation::Event::ChapterRangeReady:
+      pace = StepPace::Again;
+      break;
+    case WeReadClient::Operation::Event::Cancelled:
+      LOG_INF("WRSync", "background sync cancelled");
+      idle();
+      pace = StepPace::Idle;
+      break;
+    case WeReadClient::Operation::Event::Failed:
+      LOG_ERR("WRSync", "background sync failed: error=%u", static_cast<unsigned>(job.operation->error()));
+      idle();
+      pace = StepPace::Idle;
+      break;
+    case WeReadClient::Operation::Event::Complete: {
+      const auto result = job.operation->progressSyncResult();
+      job.operation->reset();
+      finishOutcome(result);
+      pace = job.phase == Phase::Syncing ? StepPace::Again : StepPace::Idle;
+      break;
+    }
+  }
+  unlockJob();
+  return pace;
+}
+
+void workerMain(void*) {
+  for (;;) {
+    const StepPace pace = stepWork();
+    bool more = false;
+    if (pace != StepPace::Again) {
+      if (const IdleHook hook = idleHook.load()) more = hook();
+    }
+    if (pace == StepPace::Again || more) continue;
+    const uint32_t waitMs = pace == StepPace::Wait ? 200 : 1000;
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(waitMs));
+  }
+}
+
+void kickWorker() {
+  if (worker) xTaskNotify(worker, 0, eIncrement);
+}
+
 }  // namespace
 
 bool formatWhen(const uint32_t epoch, char* buffer, const size_t size) {
@@ -162,50 +384,106 @@ bool formatWhen(const uint32_t epoch, char* buffer, const size_t size) {
   return length > 0 && static_cast<size_t>(length) < size;
 }
 
-bool busy() { return job.phase != Phase::Idle || job.choiceHeld; }
+bool busy() {
+  if (inFlight.load()) return true;
+  if (!lockJob()) return true;
+  const bool held = syncBusyLocked();
+  unlockJob();
+  return held;
+}
 
-void setPaused(const bool paused) { job.paused = paused; }
+void setPaused(const bool paused) { pauseRequested.store(paused); }
+
+bool isPaused() { return pauseRequested.load(); }
+
+void setIdleHook(const IdleHook hook) { idleHook.store(hook); }
 
 void release() {
-  idle();
-  job.operation.reset();
-  job.bookId[0] = '\0';
+  if (!lockJob()) return;
+  pending.kind = PendingKind::Release;
+  const bool hasWorker = worker != nullptr;
+  if (!hasWorker) applyPendingLocked();
+  unlockJob();
+  if (!hasWorker) return;
+  kickWorker();
+  // 手动同步要独占这条 TLS。只等到当前这一拍 HTTPS 结束，不在阅读循环里主动调用。
+  const unsigned long start = millis();
+  while (static_cast<long>(millis() - start) < 25000) {
+    if (!lockJob()) return;
+    const bool done =
+        !inFlight.load() && pending.kind == PendingKind::None && job.phase == Phase::Idle && !job.operation;
+    unlockJob();
+    if (done) return;
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  LOG_ERR("WRSync", "手动同步等待后台请求结束超时");
 }
 
 BeginResult beginEnter(const char* bookId, const WeReadClient::ProgressSyncInput& input, const uint32_t localEpoch,
                        const uint16_t localSpine, const uint16_t localPages) {
-  if (busy()) return BeginResult::Busy;
-  if (!ensureOperation()) return BeginResult::Failed;
-  rememberBook(bookId);
-  job.input = input;
-  job.localEpoch = localEpoch;
-  job.localSpine = localSpine;
-  job.localPages = localPages;
-  queue(WeReadClient::ProgressSyncMode::Compare, false);
-  LOG_INF("WRSync", "background enter queued");
+  if (!lockJob()) return BeginResult::Failed;
+  if (syncBusyLocked()) {
+    unlockJob();
+    return BeginResult::Busy;
+  }
+  if (!ensureOperation()) {
+    unlockJob();
+    return BeginResult::Failed;
+  }
+  pending.kind = PendingKind::Enter;
+  pending.input = input;
+  pending.localEpoch = localEpoch;
+  pending.localSpine = localSpine;
+  pending.localPages = localPages;
+  copyPendingBook(bookId);
+  unlockJob();
+  kickWorker();
   return BeginResult::Started;
 }
 
 BeginResult beginExit(const char* bookId, const WeReadClient::ProgressSyncInput& input) {
-  if (job.phase == Phase::Syncing && job.exitJob && sameBook(bookId)) return BeginResult::Started;
-  if (!ensureOperation()) return BeginResult::Failed;
-  rememberBook(bookId);
-  job.input = input;
-  queue(WeReadClient::ProgressSyncMode::UploadLocal, true);
-  LOG_INF("WRSync", "background exit queued");
+  if (!lockJob()) return BeginResult::Failed;
+  if (!ensureOperation()) {
+    unlockJob();
+    return BeginResult::Failed;
+  }
+  const bool sameExit = (job.phase == Phase::Syncing && job.exitJob && sameBook(bookId)) ||
+                        (pending.kind == PendingKind::Exit && bookId && strcmp(pending.bookId, bookId) == 0);
+  if (sameExit) {
+    unlockJob();
+    return BeginResult::Started;
+  }
+  pending.kind = PendingKind::Exit;
+  pending.input = input;
+  copyPendingBook(bookId);
+  unlockJob();
+  kickWorker();
   return BeginResult::Started;
 }
 
 BeginResult beginDirection(const WeReadClient::ProgressSyncMode mode) {
-  if (job.bookId[0] == '\0' || job.phase == Phase::Syncing) return BeginResult::Busy;
-  if (!ensureOperation()) return BeginResult::Failed;
-  queue(mode, false);
-  LOG_INF("WRSync", "background direction queued: mode=%u", static_cast<unsigned>(mode));
+  if (!lockJob()) return BeginResult::Failed;
+  if (job.bookId[0] == '\0' || job.phase == Phase::Syncing || inFlight.load() || pending.kind != PendingKind::None) {
+    unlockJob();
+    return BeginResult::Busy;
+  }
+  if (!ensureOperation()) {
+    unlockJob();
+    return BeginResult::Failed;
+  }
+  pending.kind = PendingKind::Direction;
+  pending.mode = mode;
+  unlockJob();
+  kickWorker();
   return BeginResult::Started;
 }
 
 bool takeChoice(Choice& out) {
-  if (job.phase != Phase::Choice) return false;
+  if (!lockJob()) return false;
+  if (job.phase != Phase::Choice) {
+    unlockJob();
+    return false;
+  }
   out.remote = job.remote;
   out.localFraction = job.input.localFraction;
   out.localEpoch = job.localEpoch;
@@ -215,85 +493,68 @@ bool takeChoice(Choice& out) {
   job.phase = Phase::Idle;
   // 选择框还开着时不要让心跳把本地位置先传上去。
   job.choiceHeld = true;
+  unlockJob();
   return true;
 }
 
-void dismissChoice() { job.choiceHeld = false; }
+void dismissChoice() {
+  if (!lockJob()) return;
+  job.choiceHeld = false;
+  unlockJob();
+}
 
 bool takeApply(ApplyRequest& out) {
-  if (job.phase != Phase::Apply) return false;
+  if (!lockJob()) return false;
+  if (job.phase != Phase::Apply) {
+    unlockJob();
+    return false;
+  }
   out.remote = job.remote;
   out.localSpineIndex = job.localSpine;
   out.localPageCount = job.localPages;
   job.phase = Phase::Idle;
   noteProgress(false);
+  unlockJob();
   return true;
 }
 
-void step() {
-  if (job.paused || job.phase != Phase::Syncing || !job.operation) return;
-  if (job.nextStepMs != 0 && static_cast<long>(millis() - job.nextStepMs) < 0) return;
+bool ensureWorker() {
+#if defined(SIMULATOR)
+  return false;
+#else
+  if (worker) return true;
+  // 8192 与评论任务相同：一拍 HTTPS 的缓冲在堆上，这条栈只跑请求本身。阅读循环不再调用。
+  if (xTaskCreate(workerMain, "wrBeat", 8192, nullptr, 1, &worker) != pdPASS) {
+    LOG_ERR("WRSync", "阅读后台任务创建失败，栈 8192 字节");
+    worker = nullptr;
+    return false;
+  }
+  return true;
+#endif
+}
 
-  if (!WeReadHttpClient::networkReady()) {
-    if (job.offlineSinceMs == 0) job.offlineSinceMs = millis();
-    else if (static_cast<long>(millis() - job.offlineSinceMs) > static_cast<long>(kOfflineGiveUpMs)) {
-      LOG_INF("WRSync", "background sync skipped: still offline");
-      idle();
-      return;
+void serviceOnMain() {
+  if (clockNeeded.load()) {
+    if (TimeUtils::isClockValid()) {
+      clockNeeded.store(false);
+      clockRequestArmed = false;
+    } else if (!clockRequestArmed) {
+      clockRequestArmed = halClock.requestSync();
     }
-    job.nextStepMs = millis() + kOfflineRetryMs;
+  } else {
+    clockRequestArmed = false;
+  }
+#if defined(SIMULATOR)
+  if (clockNeeded.load() || busy()) stepWork();
+#else
+  // 没有进度同步、对时或已经建好的任务时，不占那 8KB 栈。
+  if (!worker && !clockNeeded.load() && !busy()) return;
+  if (!ensureWorker()) {
+    stepWork();
     return;
   }
-  job.offlineSinceMs = 0;
-
-  if (!TimeUtils::isClockValid()) {
-    if (job.clockTried) {
-      LOG_ERR("WRSync", "background clock sync failed");
-      idle();
-      return;
-    }
-    job.clockTried = true;
-    if (!halClock.syncNow()) {
-      LOG_ERR("WRSync", "background clock sync failed");
-      idle();
-      return;
-    }
-  }
-
-  if (!job.operation->active()) {
-    if (!job.operation->beginProgressSync(job.bookId, job.input, job.mode)) {
-      LOG_ERR("WRSync", "background sync could not start: error=%u", static_cast<unsigned>(job.operation->error()));
-      idle();
-      return;
-    }
-    // 开始和第一段网络拆开，避免和打开或离开挤在同一次循环里。
-    return;
-  }
-
-  const auto event = job.operation->step();
-  switch (event) {
-    case WeReadClient::Operation::Event::None:
-    case WeReadClient::Operation::Event::Authenticated:
-    case WeReadClient::Operation::Event::DetailReady:
-    case WeReadClient::Operation::Event::ChapterComplete:
-    case WeReadClient::Operation::Event::QrReady:
-    case WeReadClient::Operation::Event::ChapterRangeReady:
-      return;
-    case WeReadClient::Operation::Event::Cancelled:
-      LOG_INF("WRSync", "background sync cancelled");
-      idle();
-      return;
-    case WeReadClient::Operation::Event::Failed:
-      LOG_ERR("WRSync", "background sync failed: error=%u", static_cast<unsigned>(job.operation->error()));
-      idle();
-      return;
-    case WeReadClient::Operation::Event::Complete:
-      break;
-  }
-
-  const auto result = job.operation->progressSyncResult();
-  job.operation->reset();
-  finishOutcome(result);
+  kickWorker();
+#endif
 }
 
 }  // namespace WeReadBackgroundSync

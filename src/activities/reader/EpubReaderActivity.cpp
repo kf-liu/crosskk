@@ -360,6 +360,7 @@ void EpubReaderActivity::onGoHome(const HomeMenuItem item) {
 void EpubReaderActivity::onExit() {
 #ifdef ENABLE_CHINESE_VERSION
   noteReadingTime(false);
+  cancelHighlightJobs();
   detachLiveReading();
   // 退出上传还在走时先留着无线电，同步结束再关。
   if (!WeReadBackgroundSync::busy()) NetworkStartup::releaseReadingRadio();
@@ -387,23 +388,6 @@ void EpubReaderActivity::onExit() {
 }
 
 #ifdef ENABLE_CHINESE_VERSION
-void EpubReaderActivity::refreshWeReadHighlightsIfNeeded() {
-  if (highlightRefreshAttempted_ || wereadBookId_[0] == '\0') return;
-  if (!WeReadHttpClient::networkReady()) return;
-  highlightRefreshAttempted_ = true;
-  switch (WeReadHighlight::refreshMine(wereadBookId_)) {
-    case WeReadHighlight::RefreshResult::Updated:
-      WeReadHighlightOverlay::invalidate();
-      requestUpdate();
-      break;
-    case WeReadHighlight::RefreshResult::Failed:
-      LOG_ERR("WR", "Highlight refresh failed; keeping the previous cache");
-      break;
-    case WeReadHighlight::RefreshResult::Skipped:
-      break;
-  }
-}
-
 bool EpubReaderActivity::handleWeReadHighlightSheet() {
   if (!highlightSheetOpen_) return false;
   overlayPopup.handleInput(mappedInput, [this] { requestUpdate(); });
@@ -419,19 +403,21 @@ bool EpubReaderActivity::handleWeReadHighlightSheet() {
   return true;
 }
 
+namespace {
+bool enqueueHighlightDelete(const char* bookId, const char* bookmarkId, bool& replacedRefresh);
+bool enqueueHighlightCreate(const char* bookId, const char* path, uint32_t chapterUid, uint32_t chapterIdx,
+                            uint32_t start, uint32_t end, bool& replacedRefresh);
+}  // namespace
+
 void EpubReaderActivity::removeOpenWeReadHighlight() {
   if (wereadBookId_[0] == '\0' || highlightBookmarkId_[0] == '\0') return;
-  switch (WeReadHighlight::deleteMine(wereadBookId_, highlightBookmarkId_)) {
-    case WeReadHighlight::RefreshResult::Updated:
-      WeReadHighlightOverlay::invalidate();
-      highlightNotice_ = HighlightNotice::Removed;
-      break;
-    case WeReadHighlight::RefreshResult::Failed:
-    case WeReadHighlight::RefreshResult::Skipped:
-      highlightNotice_ = HighlightNotice::Failed;
-      break;
+  bool replacedRefresh = false;
+  if (!enqueueHighlightDelete(wereadBookId_, highlightBookmarkId_, replacedRefresh)) {
+    highlightNotice_ = HighlightNotice::Failed;
+    highlightNoticeTime_ = millis();
+    return;
   }
-  highlightNoticeTime_ = millis();
+  if (replacedRefresh) highlightRefreshAttempted_ = false;
 }
 
 void EpubReaderActivity::beginWeReadHighlightSelect() {
@@ -545,17 +531,13 @@ void EpubReaderActivity::submitWeReadHighlight() {
     highlightNoticeTime_ = millis();
     return;
   }
-  switch (WeReadHighlight::createMine(wereadBookId_, path, chapterUid, chapterIdx, start, end)) {
-    case WeReadHighlight::RefreshResult::Updated:
-      WeReadHighlightOverlay::invalidate();
-      highlightNotice_ = HighlightNotice::Added;
-      break;
-    case WeReadHighlight::RefreshResult::Failed:
-    case WeReadHighlight::RefreshResult::Skipped:
-      highlightNotice_ = HighlightNotice::AddFailed;
-      break;
+  bool replacedRefresh = false;
+  if (!enqueueHighlightCreate(wereadBookId_, path, chapterUid, chapterIdx, start, end, replacedRefresh)) {
+    highlightNotice_ = HighlightNotice::AddFailed;
+    highlightNoticeTime_ = millis();
+    return;
   }
-  highlightNoticeTime_ = millis();
+  if (replacedRefresh) highlightRefreshAttempted_ = false;
 }
 
 bool EpubReaderActivity::highlightAllowsPageTurn(const bool forward) {
@@ -877,7 +859,6 @@ bool EpubReaderActivity::loadBook() {
       }
     }
   }
-  refreshWeReadHighlightsIfNeeded();
 #endif
   bool hasSavedProgress = false;
 
@@ -1204,7 +1185,7 @@ void EpubReaderActivity::loop() {
 #ifdef ENABLE_CHINESE_VERSION
   if (maybeOfferCompleteChineseFont()) return;
   WeReadBackgroundSync::setPaused(section && section->isBuilding());
-  refreshWeReadHighlightsIfNeeded();
+  pollHighlightJobs();
   pollLiveReading();
   refreshBusyFooter();
   if (WeReadCommentOverlay::takeDirty()) requestUpdate();
@@ -1923,10 +1904,10 @@ bool EpubReaderActivity::launchKOReaderSync() {
 
 #ifdef ENABLE_CHINESE_VERSION
 void EpubReaderActivity::noteReadingTime(const bool on) {
-  if (on == readingTimeBusy_) return;
+  bool expected = !on;
+  if (!readingTimeBusy_.compare_exchange_strong(expected, on)) return;
   if (on) BackgroundWork::begin(BackgroundWork::Kind::SyncReadingTime);
   else BackgroundWork::end(BackgroundWork::Kind::SyncReadingTime);
-  readingTimeBusy_ = on;
 }
 
 void EpubReaderActivity::refreshBusyFooter() {
@@ -1948,38 +1929,254 @@ void EpubReaderActivity::refreshBusyFooter() {
 
 namespace {
 std::atomic<bool> liveReadingPaused{false};
+std::atomic<bool> heartbeatInFlight{false};
 SemaphoreHandle_t liveLock = nullptr;
-TaskHandle_t liveTask = nullptr;
 EpubReaderActivity* liveOwner = nullptr;
+
+enum class HighlightSlot : uint8_t { Empty, Refresh, Create, Delete };
+
+struct HighlightArgs {
+  HighlightSlot kind = HighlightSlot::Empty;
+  char bookId[64] = {};
+  char bookmarkId[32] = {};
+  char path[160] = {};
+  uint32_t chapterUid = 0;
+  uint32_t chapterIdx = 0;
+  uint32_t start = 0;
+  uint32_t end = 0;
+};
+
+struct HighlightState {
+  HighlightArgs pending{};
+  HighlightSlot running = HighlightSlot::Empty;
+  uint32_t epoch = 1;
+  HighlightSlot resultKind = HighlightSlot::Empty;
+  WeReadHighlight::RefreshResult result = WeReadHighlight::RefreshResult::Skipped;
+  uint32_t resultEpoch = 0;
+  bool resultReady = false;
+};
+
+HighlightState highlights;
+SemaphoreHandle_t radioMu = nullptr;
+
+void copyField(char* dest, const size_t size, const char* src) {
+  if (!dest || size == 0) return;
+  dest[0] = '\0';
+  if (!src) return;
+  strncpy(dest, src, size - 1);
+  dest[size - 1] = '\0';
+}
+
+bool lockRadio() {
+  if (!radioMu) radioMu = xSemaphoreCreateMutex();
+  if (!radioMu) {
+    LOG_ERR("WR", "划线任务锁创建失败");
+    return false;
+  }
+  xSemaphoreTake(radioMu, portMAX_DELAY);
+  return true;
+}
+
+void unlockRadio() {
+  if (radioMu) xSemaphoreGive(radioMu);
+}
+
+void startHighlightWorker() {
+#if !defined(SIMULATOR)
+  // 先放开划线锁再建任务，避免 wrBeat 立刻来取队列时和这里互等。
+  WeReadBackgroundSync::ensureWorker();
+#endif
+}
+
+bool enqueueHighlight(const HighlightArgs& args, bool& replacedRefresh) {
+  replacedRefresh = false;
+  if (!lockRadio()) return false;
+  if (args.kind == HighlightSlot::Refresh) {
+    if (highlights.pending.kind != HighlightSlot::Empty || highlights.running != HighlightSlot::Empty) {
+      unlockRadio();
+      return false;
+    }
+    highlights.pending = args;
+    unlockRadio();
+    startHighlightWorker();
+    return true;
+  }
+  if (highlights.pending.kind == HighlightSlot::Create || highlights.pending.kind == HighlightSlot::Delete) {
+    unlockRadio();
+    return false;
+  }
+  if ((highlights.running == HighlightSlot::Create || highlights.running == HighlightSlot::Delete) &&
+      highlights.pending.kind != HighlightSlot::Empty) {
+    unlockRadio();
+    return false;
+  }
+  if (highlights.pending.kind == HighlightSlot::Refresh) replacedRefresh = true;
+  highlights.pending = args;
+  unlockRadio();
+  startHighlightWorker();
+  return true;
+}
+
+bool enqueueHighlightDelete(const char* bookId, const char* bookmarkId, bool& replacedRefresh) {
+  HighlightArgs args;
+  args.kind = HighlightSlot::Delete;
+  copyField(args.bookId, sizeof(args.bookId), bookId);
+  copyField(args.bookmarkId, sizeof(args.bookmarkId), bookmarkId);
+  return enqueueHighlight(args, replacedRefresh);
+}
+
+bool enqueueHighlightCreate(const char* bookId, const char* path, const uint32_t chapterUid, const uint32_t chapterIdx,
+                            const uint32_t start, const uint32_t end, bool& replacedRefresh) {
+  HighlightArgs args;
+  args.kind = HighlightSlot::Create;
+  copyField(args.bookId, sizeof(args.bookId), bookId);
+  copyField(args.path, sizeof(args.path), path);
+  args.chapterUid = chapterUid;
+  args.chapterIdx = chapterIdx;
+  args.start = start;
+  args.end = end;
+  return enqueueHighlight(args, replacedRefresh);
+}
+
+bool runOneHighlight() {
+  if (WeReadBackgroundSync::isPaused()) return false;
+  if (!lockRadio()) return false;
+  if (highlights.running != HighlightSlot::Empty || highlights.pending.kind == HighlightSlot::Empty) {
+    unlockRadio();
+    return false;
+  }
+  const HighlightArgs args = highlights.pending;
+  const uint32_t epoch = highlights.epoch;
+  highlights.pending.kind = HighlightSlot::Empty;
+  highlights.running = args.kind;
+  unlockRadio();
+
+  WeReadHighlight::RefreshResult result = WeReadHighlight::RefreshResult::Skipped;
+  switch (args.kind) {
+    case HighlightSlot::Empty:
+      break;
+    case HighlightSlot::Refresh:
+      result = WeReadHighlight::refreshMine(args.bookId);
+      break;
+    case HighlightSlot::Create:
+      result =
+          WeReadHighlight::createMine(args.bookId, args.path, args.chapterUid, args.chapterIdx, args.start, args.end);
+      break;
+    case HighlightSlot::Delete:
+      result = WeReadHighlight::deleteMine(args.bookId, args.bookmarkId);
+      break;
+  }
+
+  if (!lockRadio()) return true;
+  highlights.running = HighlightSlot::Empty;
+  if (epoch == highlights.epoch) {
+    highlights.resultKind = args.kind;
+    highlights.result = result;
+    highlights.resultEpoch = epoch;
+    highlights.resultReady = true;
+  }
+  const bool more = highlights.pending.kind != HighlightSlot::Empty;
+  unlockRadio();
+  return more;
+}
+
 }  // namespace
 
-void EpubReaderActivity::liveReadingTaskMain(void*) {
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
-    if (!liveLock) continue;
-    for (;;) {
-      if (xSemaphoreTake(liveLock, pdMS_TO_TICKS(200)) != pdTRUE) break;
-      EpubReaderActivity* owner = liveOwner;
-      const bool more = owner && owner->stepLiveReading();
-      xSemaphoreGive(liveLock);
-      if (!more) break;
-    }
+void EpubReaderActivity::ensureLiveReadingTask() {
+  WeReadBackgroundSync::setIdleHook(&EpubReaderActivity::runBackgroundRadio);
+#if !defined(SIMULATOR)
+  if (!liveLock) liveLock = xSemaphoreCreateMutex();
+#else
+  (void)liveLock;
+#endif
+}
+
+void EpubReaderActivity::pollHighlightJobs() {
+  ensureLiveReadingTask();
+  if (!highlightRefreshAttempted_ && wereadBookId_[0] != '\0' && WeReadHttpClient::networkReady() &&
+      !(section && section->isBuilding())) {
+    HighlightArgs args;
+    args.kind = HighlightSlot::Refresh;
+    copyField(args.bookId, sizeof(args.bookId), wereadBookId_);
+    bool replacedRefresh = false;
+    if (enqueueHighlight(args, replacedRefresh)) highlightRefreshAttempted_ = true;
+  }
+#if !defined(SIMULATOR)
+  // 离线、也没有划线或同步要做时，不建这 8KB 任务。
+  if (highlightRefreshAttempted_ || NetworkStartup::smartOnlineReading()) WeReadBackgroundSync::ensureWorker();
+#endif
+
+#if defined(SIMULATOR)
+  // 模拟器没有 wrBeat，这一拍就在阅读循环里做完再收结果。
+  runOneHighlight();
+#endif
+  if (!lockRadio()) return;
+  if (!highlights.resultReady || highlights.resultEpoch != highlights.epoch) {
+    highlights.resultReady = false;
+    unlockRadio();
+    return;
+  }
+  const HighlightSlot kind = highlights.resultKind;
+  const WeReadHighlight::RefreshResult result = highlights.result;
+  const uint32_t resultEpoch = highlights.resultEpoch;
+  const uint32_t epoch = highlights.epoch;
+  highlights.resultReady = false;
+  unlockRadio();
+  if (resultEpoch != epoch) return;
+
+  switch (kind) {
+    case HighlightSlot::Empty:
+      break;
+    case HighlightSlot::Refresh:
+      if (result == WeReadHighlight::RefreshResult::Updated) {
+        WeReadHighlightOverlay::invalidate();
+        requestUpdate();
+      } else if (result == WeReadHighlight::RefreshResult::Failed) {
+        LOG_ERR("WR", "划线列表拉取失败，保留上一份缓存");
+      }
+      break;
+    case HighlightSlot::Create:
+      highlightNotice_ = result == WeReadHighlight::RefreshResult::Updated ? HighlightNotice::Added
+                                                                           : HighlightNotice::AddFailed;
+      if (result == WeReadHighlight::RefreshResult::Updated) WeReadHighlightOverlay::invalidate();
+      highlightNoticeTime_ = millis();
+      requestUpdate();
+      break;
+    case HighlightSlot::Delete:
+      highlightNotice_ = result == WeReadHighlight::RefreshResult::Updated ? HighlightNotice::Removed
+                                                                           : HighlightNotice::Failed;
+      if (result == WeReadHighlight::RefreshResult::Updated) WeReadHighlightOverlay::invalidate();
+      highlightNoticeTime_ = millis();
+      requestUpdate();
+      break;
   }
 }
 
-void EpubReaderActivity::ensureLiveReadingTask() {
+void EpubReaderActivity::cancelHighlightJobs() {
+  if (!lockRadio()) return;
+  highlights.epoch++;
+  highlights.pending.kind = HighlightSlot::Empty;
+  highlights.resultReady = false;
+  unlockRadio();
+}
+
+bool EpubReaderActivity::runBackgroundRadio() {
+  if (runOneHighlight()) return true;
+  if (WeReadBackgroundSync::busy() || WeReadBackgroundSync::isPaused()) return false;
 #if !defined(SIMULATOR)
-  if (!liveLock) liveLock = xSemaphoreCreateMutex();
-  if (liveTask || !liveLock) return;
-  // 8192 与评论任务相同：HTTPS 放在这条栈上，阅读循环只负责到点登记。
-  if (xTaskCreate(liveReadingTaskMain, "wrBeat", 8192, nullptr, 1, &liveTask) != pdPASS) {
-    LOG_ERR("WR", "阅读心跳任务创建失败，栈 8192 字节");
-    liveTask = nullptr;
-  }
-#else
-  (void)liveLock;
-  (void)liveTask;
+  if (!liveLock || xSemaphoreTake(liveLock, pdMS_TO_TICKS(50)) != pdTRUE) return false;
 #endif
+  EpubReaderActivity* owner = liveOwner;
+  const bool run = owner && !liveReadingPaused.load() && owner->wereadHeartbeat_ && owner->wereadHeartbeat_->active();
+  if (run) heartbeatInFlight.store(true);
+#if !defined(SIMULATOR)
+  xSemaphoreGive(liveLock);
+#endif
+  if (!run) return false;
+  // 请求期间不占锁，阅读循环还能登记下一拍。对象要等这一拍结束才销毁。
+  const bool more = owner->stepLiveReading();
+  heartbeatInFlight.store(false);
+  return more;
 }
 
 void EpubReaderActivity::detachLiveReading() {
@@ -1987,6 +2184,12 @@ void EpubReaderActivity::detachLiveReading() {
   if (liveLock) xSemaphoreTake(liveLock, portMAX_DELAY);
 #endif
   if (liveOwner == this) liveOwner = nullptr;
+#if !defined(SIMULATOR)
+  if (liveLock) xSemaphoreGive(liveLock);
+  while (heartbeatInFlight.load()) vTaskDelay(pdMS_TO_TICKS(10));
+  if (liveLock) xSemaphoreTake(liveLock, portMAX_DELAY);
+#endif
+  noteReadingTime(false);
   wereadHeartbeat_.reset();
 #if !defined(SIMULATOR)
   if (liveLock) xSemaphoreGive(liveLock);
@@ -2013,7 +2216,7 @@ void EpubReaderActivity::pollLiveReading() {
   liveReadingPaused.store(section && section->isBuilding());
 #if !defined(SIMULATOR)
   if (wereadBookId_[0] != '\0' && NetworkStartup::smartOnlineReading()) ensureLiveReadingTask();
-  // 后台正在收发时这一轮不登记，翻页不等那一拍结束。
+  // 锁只包住登记。拿不到就等下一轮，翻页不等 HTTPS。
   if (liveLock && xSemaphoreTake(liveLock, 0) != pdTRUE) return;
   if (wereadBookId_[0] != '\0') liveOwner = this;
 #endif
@@ -2024,6 +2227,8 @@ void EpubReaderActivity::pollLiveReading() {
   } else if (WeReadBackgroundSync::busy()) {
     // 进度同步和心跳共用一条 TLS，进行中不再另开一拍。
     noteReadingTime(false);
+  } else if (heartbeatInFlight.load()) {
+    noteReadingTime(true);
   } else if (wereadHeartbeat_ && wereadHeartbeat_->active()) {
     noteReadingTime(true);
     wake = !liveReadingPaused.load();
@@ -2072,12 +2277,15 @@ void EpubReaderActivity::pollLiveReading() {
   }
 #if !defined(SIMULATOR)
   if (liveLock) xSemaphoreGive(liveLock);
-  if (wake && liveTask) {
-    xTaskNotify(liveTask, 0, eIncrement);
-    return;
+  // wrBeat 在本轮主循环末尾被叫醒。任务没建成时才在这里走一拍，避免和后台各发一次。
+  if (wake && !WeReadBackgroundSync::ensureWorker()) {
+    heartbeatInFlight.store(true);
+    stepLiveReading();
+    heartbeatInFlight.store(false);
   }
-#endif
+#else
   if (wake) stepLiveReading();
+#endif
 }
 
 bool EpubReaderActivity::syncProgressBeforeLeave(const std::string& nextPath) {
@@ -2163,8 +2371,7 @@ void EpubReaderActivity::armBackgroundExit() {
     WeReadBackgroundSync::dismissChoice();
   }
   enterSyncWaiting_ = false;
-  noteReadingTime(false);
-  wereadHeartbeat_.reset();
+  detachLiveReading();
   if (!epub || wereadBookId_[0] == '\0') return;
   if (!NetworkStartup::smartOnlineReading()) {
     LOG_INF("WRSync", "skip auto sync: offline");

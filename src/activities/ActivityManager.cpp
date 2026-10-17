@@ -305,7 +305,7 @@ void ActivityManager::loop() {
 
 #ifdef ENABLE_CHINESE_VERSION
   // 进入比较和退出上传不占阅读画面。退出后阅读器已经销毁，步骤还要在这里继续。
-  WeReadBackgroundSync::step();
+  WeReadBackgroundSync::serviceOnMain();
   // 进度同步走完、人也不在阅读里，再关掉这条阅读连接。
   if (NetworkStartup::stayConnected() && !isReaderActivity() && !WeReadBackgroundSync::busy()) {
     NetworkStartup::releaseReadingRadio();

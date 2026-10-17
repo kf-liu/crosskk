@@ -134,7 +134,6 @@ class EpubReaderActivity final : public ReaderActivity {
   unsigned long highlightEdgeSince_ = 0;
   int highlightEdgeDir_ = 0;
   bool maybeOfferCompleteChineseFont();
-  void refreshWeReadHighlightsIfNeeded();
   bool handleWeReadHighlightSheet();
   bool handleWeReadHighlightTap();
   void removeOpenWeReadHighlight();
@@ -299,7 +298,10 @@ class EpubReaderActivity final : public ReaderActivity {
   bool stepLiveReading();
   void ensureLiveReadingTask();
   void detachLiveReading();
-  static void liveReadingTaskMain(void*);
+  // wrBeat 在进度同步空闲时调用。划线和心跳都在这条任务上，不在阅读循环里发请求。
+  static bool runBackgroundRadio();
+  void pollHighlightJobs();
+  void cancelHighlightJobs();
   void noteReadingTime(bool on);
   void refreshBusyFooter();
   // 进入比较和退出上传都不换画面。Started 才会记下这次打开已经同步过。
@@ -315,7 +317,7 @@ class EpubReaderActivity final : public ReaderActivity {
   bool enterSyncWaiting_ = false;
   std::unique_ptr<WeReadClient::Operation> wereadHeartbeat_;
   unsigned long wereadHeartbeatDueMs_ = 0;
-  bool readingTimeBusy_ = false;
+  std::atomic<bool> readingTimeBusy_{false};
   uint32_t busyFooterGen_ = 0;
 #endif
   unsigned long confirmLongPressThreshold() const;
