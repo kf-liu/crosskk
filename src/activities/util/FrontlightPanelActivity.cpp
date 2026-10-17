@@ -13,10 +13,16 @@
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "activities/MainTab.h"
+#include "components/HeaderBackTapTarget.h"
 #include "components/UITheme.h"
 #include "components/UIThemeTokens.h"
 #include "components/icons/customListIcons.h"
 #include "components/icons/listIcons.h"
+#include "components/themes/BaseTheme.h"
+#include "fontIds.h"
+#include "util/BackgroundWork.h"
+#include "util/TimeUtils.h"
 
 namespace fui = freeink::ui;
 
@@ -51,6 +57,22 @@ uint8_t percentFromPermille(const int16_t permille) {
   if (value < 0) value = 0;
   if (value > 100) value = 100;
   return static_cast<uint8_t>(value);
+}
+
+// One status row inside the sheet. The home header is a taller band and would
+// paint a second strip under this row.
+void drawPanelStatusRow(const GfxRenderer& renderer, const fui::Rect& band) {
+  constexpr int fontId = UiHighDpiProfile::enabled ? SMALL_FONT_ID : BaseTheme::STATUS_NUMERIC_FONT_ID;
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int textY = band.y + std::max(0, (band.height - renderer.getLineHeight(fontId)) / 2);
+  char time[9] = "--:--";
+  TimeUtils::formatCurrentTime(time, sizeof(time), SETTINGS.clockFormat == 1);
+  renderer.drawText(fontId, band.x, textY, time);
+  const int batteryX = band.x + band.width - metrics.batteryWidth;
+  // Percent shares the clock line. drawBatteryRight drops the icon below that origin.
+  GUI.drawBatteryRight(renderer, Rect{batteryX, textY, metrics.batteryWidth, metrics.batteryHeight},
+                       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS,
+                       fontId);
 }
 }  // namespace
 
@@ -281,11 +303,9 @@ void FrontlightPanelActivity::loop() {
 
 int FrontlightPanelActivity::computePanelBottom() const {
   const auto tokens = uiThemeTokens(uiTarget, true);
-  const auto& metrics = uiThemeMetrics(true);
   const int16_t lineHeight = uiTarget.lineHeight(tokens.smallText.font);
-  // Slim battery band + the air around it (mirrors buildPanelScreen).
-  const int y0 = std::max<int>(metrics.batteryHeight, lineHeight);
-  int y = tokens.spaceMd + y0 + tokens.spaceMd;
+  // One status row, the same height as the home top bar (mirrors buildPanelScreen).
+  int y = tokens.spaceMd + MainTabs::statusBarHeight + tokens.spaceMd;
   if (Frontlight.present()) {
     // Screen::sliderRow reserves caption + spaceMd + control band, then a
     // spaceMd gap; addSliderRow() adds one more spaceMd of air after each row.
@@ -299,6 +319,16 @@ int FrontlightPanelActivity::computePanelBottom() const {
   // sheet is exactly the frontlight controls.
   const int tileCount = mappedInput.hasTouch() ? kTileCount : 0;
   y += fui::tileGridHeight(static_cast<uint16_t>(tileCount), kTileCols, kTileHeight, kTileGap);
+  // Screen::tileGrid consumes a trailing spaceSm that the buttons sit above.
+  if (tileCount > 0) y += tokens.spaceSm;
+  const char* busyLabels[BackgroundWork::kMax];
+  const int busyCount = BackgroundWork::copyLabels(busyLabels, BackgroundWork::kMax);
+  // Under those buttons: air (already the tile gap when the grid is present),
+  // a rule, then one line per task. Mirrors the block at the end of buildPanelScreen().
+  if (busyCount > 0) {
+    if (tileCount == 0) y += tokens.spaceSm;
+    y += 1 + tokens.spaceSm + busyCount * (lineHeight + tokens.spaceSm);
+  }
   // The sheet's grabber band: content margin + grabber + air to the edge.
   // buildPanelScreen() feeds the same theme spacings into SheetProps.
   y += tokens.spaceLg + kGrabberHeight + tokens.spaceLg + tokens.spaceMd;
@@ -360,19 +390,10 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
   screen.sheet(sheetProps, static_cast<int16_t>(panelBottom));
   screen.insetContent(fui::Insets{0, kPanelSideMargin, 0, kPanelSideMargin});
 
-  // Reuse the exact battery renderer and header rectangle used by Home. Call
-  // the base implementation directly because RoundedRaff suppresses its
-  // untitled Home header.
-  {
-    const auto& metrics = uiThemeMetrics(true);
-    screen.spacer(theme.spaceMd);
-    const int16_t bandH = std::max<int16_t>(static_cast<int16_t>(metrics.batteryHeight),
-                                            screen.target().lineHeight(theme.smallText.font));
-    screen.takeTop(bandH, theme.spaceMd);
-    GUI.drawHeaderWithStyle(
-        renderer, Rect{0, metrics.topPadding, renderer.getScreenWidth(), metrics.homeTopPadding - metrics.topPadding},
-        nullptr, nullptr, true, true);
-  }
+  // Clock and battery only. A home header here is a second band under this row.
+  HeaderBackTapTarget::clear();
+  screen.spacer(theme.spaceMd);
+  drawPanelStatusRow(renderer, screen.takeTop(static_cast<int16_t>(MainTabs::statusBarHeight), theme.spaceMd));
 
   if (Frontlight.present()) {
     addSliderRow(screen, tr(STR_BRIGHTNESS), brightness, ACTION_BRIGHTNESS, ACTION_BRIGHTNESS_STEP,
@@ -415,13 +436,37 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
     gridProps.iconOnRight = true;
     screen.tileGrid(gridProps);
   }
+
+  // Task lines stay under the quick-setting buttons. Drawing them under the
+  // status header overlapped that bar and read as a second status bar.
+  const char* busyLabels[BackgroundWork::kMax];
+  const int busyCount = BackgroundWork::copyLabels(busyLabels, BackgroundWork::kMax);
+  if (busyCount > 0) {
+    const int16_t line = screen.target().lineHeight(theme.smallText.font);
+    // The tile grid already left spaceSm under the buttons.
+    if (!mappedInput.hasTouch()) screen.spacer(theme.spaceSm);
+    const fui::Rect rule = screen.takeTop(1, theme.spaceSm);
+    renderer.drawLine(rule.x, rule.y, rule.x + rule.width - 1, rule.y, true);
+    fui::TextStyle style = theme.smallText;
+    style.align = fui::TextAlign::Left;
+    for (int i = 0; i < busyCount; ++i) {
+      screen.target().text(screen.takeTop(line, theme.spaceSm), busyLabels[i], style);
+    }
+  }
 }
 
 void FrontlightPanelActivity::render(RenderLock&&) {
-  panelBottom = computePanelBottom();
+  const int nextBottom = computePanelBottom();
+  // The sheet only fills its new height. A finished task shortens it, and a fast
+  // refresh would leave the old task rows on the glass as a second bar.
+  const bool shrunk = panelBottom > nextBottom;
+  if (shrunk) {
+    renderer.fillRect(0, nextBottom, renderer.getScreenWidth(), panelBottom - nextBottom, false);
+  }
+  panelBottom = nextBottom;
 
   // fui::sheet draws the card body, its bottom rule, and the grabber during
-  // renderUi(); the battery band at the card's top is part of the screen build.
+  // renderUi(); the status row at the card's top is part of the screen build.
   renderUi();
 
   // A tile that rewrote the whole frame (night mode) re-drives every pixel
@@ -430,9 +475,9 @@ void FrontlightPanelActivity::render(RenderLock&&) {
   // flash. Any faint residue clears with the panel's dedicated refresh tile
   // or the next scheduled clean refresh.
 #if FREEINK_DEVICE_EEGO_A4
-  renderer.displayBuffer(cleanRefreshPending ? HalDisplay::FULL_REFRESH : HalDisplay::FAST_REFRESH);
+  renderer.displayBuffer(cleanRefreshPending || shrunk ? HalDisplay::FULL_REFRESH : HalDisplay::FAST_REFRESH);
 #else
-  renderer.displayBuffer(cleanRefreshPending ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+  renderer.displayBuffer(cleanRefreshPending || shrunk ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
 #endif
   cleanRefreshPending = false;
 }
