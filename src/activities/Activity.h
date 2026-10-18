@@ -35,6 +35,8 @@ class Activity {
   // Last chance to queue activity-owned state before sleep events are drained.
   virtual void prepareForSleep() {}
   virtual void loop() {}
+  // loop() 只跑在最上面的画面。盖住阅读页的控制中心仍要让下面的阅读器继续报时长。
+  virtual void serviceWhileCovered() {}
 
   virtual void render(RenderLock&&) {}
 

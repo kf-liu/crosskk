@@ -2237,6 +2237,11 @@ bool EpubReaderActivity::stepLiveReading() {
   return still;
 }
 
+void EpubReaderActivity::serviceWhileCovered() {
+  // 控制中心打开时阅读循环停住。到点的这一拍仍要发出去，状态才能出现在任务区。
+  pollLiveReading();
+}
+
 void EpubReaderActivity::pollLiveReading() {
   liveReadingPaused.store(false);
 #if !defined(SIMULATOR)

@@ -377,6 +377,9 @@ class EpubReaderActivity final : public ReaderActivity {
 
   void onEnter() override;
   void onExit() override;
+#ifdef ENABLE_CHINESE_VERSION
+  void serviceWhileCovered() override;
+#endif
   void onGoHome(HomeMenuItem item = HomeMenuItem::NONE) override;
   void loop() override;
   void render(RenderLock&& lock) override;

@@ -203,6 +203,14 @@ void ActivityManager::loop() {
 
     // Note: do not hold a lock here, the loop() method must be responsible for acquire one if needed
     if (!handleHomeStandbyInput()) currentActivity->loop();
+#ifdef ENABLE_CHINESE_VERSION
+    // 阅读页被盖住后不再 loop。时长心跳改从这里继续，否则下拉控制中心的整段时间都不会上报。
+    if (!currentActivity->isReaderActivity()) {
+      for (const auto& covered : stackActivities) {
+        if (covered) covered->serviceWhileCovered();
+      }
+    }
+#endif
     // 下拉控制中心的任务区跟着后台动作刷新。阅读页自己刷底部。
     if (currentActivity->name == "FrontlightPanel") {
       static uint32_t seenBackgroundWork = 0;
