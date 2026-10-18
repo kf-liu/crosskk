@@ -121,8 +121,11 @@ on the physical device; this does not extend the earlier display-retention or
 power-cycle acceptance.
 
 The initial held Power gesture and its release are consumed on every boot.
-Subsequent Power gestures and automatic sleep use existing settings. Shutdown
-saves reading state, renders the sleep screen and parks the controller before
+`setup()` latches main power, the power-key hold, and USB routing on the expander
+before serial startup or the touch-reset delays. A press has to outlast the chip
+bootloader plus that I2C write; releasing earlier drops the rail because the
+application is not running yet. Subsequent Power gestures and automatic sleep use existing
+settings. Shutdown saves reading state, renders the sleep screen and parks the controller before
 continuously sending 100 ms high/100 ms low power-key pulses until hardware
 removes power, matching the reference board. MAIN/SCREEN rails stay enabled and
 PA stays off. There is no three-pulse limit or ESP deep-sleep fallback, including
