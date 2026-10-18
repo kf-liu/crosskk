@@ -52,6 +52,7 @@
 #include "KOReaderSyncActivity.h"
 #include "MappedInputManager.h"
 #include "ProgressMapper.h"
+#include "WeReadXhtmlCodec.h"
 #include "QrDisplayActivity.h"
 #include "ReaderActivity.h"
 #include "ReaderFontSizes.h"
@@ -2562,9 +2563,16 @@ void EpubReaderActivity::applyWeReadRemoteProgress(const WeReadProtocol::RemoteP
     LOG_ERR("WRSync", "remote progress could not be mapped");
     return;
   }
-  // 主分支写入的页来自 fromSpineProgress，和状态栏的文件进度同一把尺子。
-  // 章节原生偏移经常大于目录字数，换成可见文字后会更靠前，不用它覆盖这一页。
-  if (!EpubReaderUtils::saveProgress(*epub, target.spineIndex, target.pageNumber, target.totalPages)) {
+  // 页码只是文件进度的估算。原仓库再用章节原生偏移换成可见文字，重开章节时按这个偏移找页。
+  std::optional<uint32_t> visibleTextOffset;
+  uint32_t resolvedVisibleOffset = 0;
+  if (preciseRemote && WeReadXhtmlCodec::nativeToVisibleOffset(
+                           WeReadStore::chapterPath(bookDir, remoteTocIndex), remote.chapterOffset,
+                           resolvedVisibleOffset)) {
+    visibleTextOffset = resolvedVisibleOffset;
+  }
+  if (!EpubReaderUtils::saveProgress(*epub, target.spineIndex, target.pageNumber, target.totalPages,
+                                     visibleTextOffset)) {
     LOG_ERR("WRSync", "could not save remote progress");
     pendingSyncSaveError = true;
     requestUpdate();
@@ -2574,17 +2582,13 @@ void EpubReaderActivity::applyWeReadRemoteProgress(const WeReadProtocol::RemoteP
   {
     RenderLock lock;
     clearDeferredReposition();
-    pendingOffsetJump.reset();
     pendingPercentJump = false;
-    const bool sameSpine = section && currentSpineIndex == target.spineIndex;
+    pendingOffsetJump = visibleTextOffset;
     currentSpineIndex = target.spineIndex;
     cachedSpineIndex = currentSpineIndex;
     nextPageNumber = std::max(0, target.pageNumber);
-    if (!sameSpine) {
-      section.reset();
-    } else if (section) {
-      section->currentPage = nextPageNumber;
-    }
+    // 已经打开的章节不会再走加载时的偏移跳转，丢掉后按 pendingOffsetJump 重开。
+    section.reset();
   }
   requestUpdate();
 }
