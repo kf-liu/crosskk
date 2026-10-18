@@ -57,7 +57,7 @@ jobs:
           RELEASE_TOKEN: ${{ secrets.H2O_RUNNER_TOKEN }}
         run: |
           set -euo pipefail
-          tag="metalio-eink4-${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          tag="metalio-eink4-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"
           printf '%s\n' \
             "Manual Metalio E-Ink 4 package from \`${GITHUB_SHA}\`." \
             "" \
@@ -68,7 +68,7 @@ jobs:
           publish() {
             GH_TOKEN="$1" gh release create "$tag" "${assets[@]}" \
               --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "Metalio E-Ink 4 ${GITHUB_SHA::7}" \
+              --title "Metalio E-Ink 4 ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA::7}" \
               --notes-file release-body.md --prerelease
           }
           # Actions 默认令牌在仓库里经常是只读的，创建 Release 会立刻 403。

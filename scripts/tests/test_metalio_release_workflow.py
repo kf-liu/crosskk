@@ -14,6 +14,15 @@ class MetalioReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn('\n  schedule:', workflow)
         self.assertIn('pio run -e metalio_eink4_nightly', workflow)
         self.assertIn('CROSSPOINT_RC_HASH=${GITHUB_SHA::7}', workflow)
+        self.assertIn(
+            'tag="metalio-eink4-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"',
+            workflow,
+        )
+        self.assertIn(
+            '--title "Metalio E-Ink 4 ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT} ${GITHUB_SHA::7}"',
+            workflow,
+        )
+        self.assertNotIn('metalio-eink4-${GITHUB_SHA::7}-', workflow)
         self.assertIn('python3 scripts/package_nightly_target.py metalio_eink4 \\', workflow)
         self.assertIn('--channel nightly', workflow)
         self.assertIn('--output dist/metalio_eink4', workflow)
