@@ -334,6 +334,19 @@ void FrontlightPanelActivity::loop() {
                                        [this] { adjustBrightness(BRIGHTNESS_STEP); });
 }
 
+int FrontlightPanelActivity::sheetVisualBottom(const int contentHeight) const {
+  // screen.sheet() 把顶边安全区加进卡片高度，底边比内容高度再低这一截。
+  int top = 0;
+  int right = 0;
+  int bottom = 0;
+  int left = 0;
+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+  (void)right;
+  (void)bottom;
+  (void)left;
+  return contentHeight + top;
+}
+
 int FrontlightPanelActivity::computePanelBottom() const {
   const auto tokens = uiThemeTokens(uiTarget, true);
   const int16_t lineHeight = uiTarget.lineHeight(tokens.smallText.font);
@@ -495,11 +508,23 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
 
 void FrontlightPanelActivity::render(RenderLock&&) {
   const int nextBottom = computePanelBottom();
-  // The sheet only fills its new height. A finished task shortens it, and a fast
-  // refresh would leave the old task rows on the glass as a second bar.
-  const bool shrunk = panelBottom > nextBottom;
-  if (shrunk) {
-    renderer.fillRect(0, nextBottom, renderer.getScreenWidth(), panelBottom - nextBottom, false);
+  const int nextVisual = sheetVisualBottom(nextBottom);
+  // 时长心跳在本页 loop 之后才结束，所以缩短的下一帧还会再画一次。那一次用的是
+  // 另一块帧缓冲，里面还留着旧任务行；只清缩短的那一帧，下一帧会把它当第二层状态栏刷回来。
+  if (panelBottom > 0) {
+    const int oldVisual = sheetVisualBottom(panelBottom);
+    if (oldVisual > nextVisual) {
+      if (oldVisual > sheetHighWater_) sheetHighWater_ = oldVisual;
+      tailClearsLeft_ = 2;
+    }
+  }
+  const bool eraseTail = tailClearsLeft_ > 0 && sheetHighWater_ > nextVisual;
+  if (eraseTail) {
+    renderer.fillRect(0, nextVisual, renderer.getScreenWidth(), sheetHighWater_ - nextVisual, false);
+    if (--tailClearsLeft_ == 0) sheetHighWater_ = nextVisual;
+  } else if (nextVisual >= sheetHighWater_) {
+    sheetHighWater_ = nextVisual;
+    tailClearsLeft_ = 0;
   }
   panelBottom = nextBottom;
 
@@ -513,9 +538,9 @@ void FrontlightPanelActivity::render(RenderLock&&) {
   // flash. Any faint residue clears with the panel's dedicated refresh tile
   // or the next scheduled clean refresh.
 #if FREEINK_DEVICE_EEGO_A4
-  renderer.displayBuffer(cleanRefreshPending || shrunk ? HalDisplay::FULL_REFRESH : HalDisplay::FAST_REFRESH);
+  renderer.displayBuffer(cleanRefreshPending || eraseTail ? HalDisplay::FULL_REFRESH : HalDisplay::FAST_REFRESH);
 #else
-  renderer.displayBuffer(cleanRefreshPending || shrunk ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
+  renderer.displayBuffer(cleanRefreshPending || eraseTail ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
 #endif
   cleanRefreshPending = false;
 }

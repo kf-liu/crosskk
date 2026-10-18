@@ -1189,7 +1189,6 @@ void EpubReaderActivity::loop() {
   WeReadBackgroundSync::setPaused(false);
   pollHighlightJobs();
   pollLiveReading();
-  refreshBusyFooter();
   const bool commentsChanged = WeReadCommentOverlay::takeDirty();
   const bool panelChanged = WeReadCommentOverlay::pumpPanel();
   if (commentsChanged || panelChanged) requestUpdate();
@@ -1930,23 +1929,6 @@ void EpubReaderActivity::noteReadingTime(const bool on) {
   if (!readingTimeBusy_.compare_exchange_strong(expected, on)) return;
   if (on) BackgroundWork::begin(BackgroundWork::Kind::SyncReadingTime);
   else BackgroundWork::end(BackgroundWork::Kind::SyncReadingTime);
-}
-
-void EpubReaderActivity::refreshBusyFooter() {
-  const uint32_t generation = BackgroundWork::generation();
-  if (generation == busyFooterGen_) return;
-  // 分页或浮层还占着画面时不刷底部，下一帧整页会带上新文案。
-  if (!epub || !section || section->isBuilding() || overlay != Overlay::None || RenderLock::peek()) return;
-  RenderLock lock(RenderLock::Mode::Try);
-  if (!lock.ownsLock()) return;
-
-  // Clear from the ink origin, not the reserved band. The text sits above that
-  // band, so a short clear left the finished task's glyphs under the title.
-  const int y = std::max(0, UITheme::getStatusBarTextOrigin(renderer, 0));
-  renderer.fillRect(0, y, renderer.getScreenWidth(), renderer.getScreenHeight() - y, false);
-  renderStatusBar();
-  renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-  busyFooterGen_ = generation;
 }
 
 namespace {

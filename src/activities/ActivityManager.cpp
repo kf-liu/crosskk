@@ -211,7 +211,7 @@ void ActivityManager::loop() {
       }
     }
 #endif
-    // 下拉控制中心的任务区跟着后台动作刷新。阅读页自己刷底部。
+    // 下拉控制中心的任务区跟着后台动作刷新。阅读页底部不再写这些任务。
     if (currentActivity->name == "FrontlightPanel") {
       static uint32_t seenBackgroundWork = 0;
       const uint32_t backgroundGeneration = BackgroundWork::generation();

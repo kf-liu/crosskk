@@ -309,7 +309,6 @@ class EpubReaderActivity final : public ReaderActivity {
   void pollHighlightJobs();
   void cancelHighlightJobs();
   void noteReadingTime(bool on);
-  void refreshBusyFooter();
   // 进入比较和退出上传都不换画面。Started 才会记下这次打开已经同步过。
   enum class BackgroundArm : uint8_t { Started, Busy, Skipped };
   BackgroundArm armBackgroundEnter();
@@ -324,7 +323,6 @@ class EpubReaderActivity final : public ReaderActivity {
   std::unique_ptr<WeReadClient::Operation> wereadHeartbeat_;
   unsigned long wereadHeartbeatDueMs_ = 0;
   std::atomic<bool> readingTimeBusy_{false};
-  uint32_t busyFooterGen_ = 0;
 #endif
   unsigned long confirmLongPressThreshold() const;
   void toggleAutoPageTurn(uint8_t requestedPageTurnRate);

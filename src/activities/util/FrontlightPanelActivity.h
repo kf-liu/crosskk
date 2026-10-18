@@ -36,6 +36,9 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   // rather than the Tap default. Seeded from the setting in onEnter().
   uint8_t touchModeRestore = CrossPointSettings::TOUCH_READER_ON;
   int panelBottom = 0;
+  // 任务行缩短后，另一块帧缓冲里还留着旧的底边。两帧都要清，否则下一次刷新会把它再刷出来。
+  int sheetHighWater_ = 0;
+  int tailClearsLeft_ = 0;
   uint32_t busyGen_ = 0;
   bool wifiShown_ = false;
 
@@ -69,6 +72,7 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   void addSliderRow(UiScreen& screen, const char* label, uint8_t value, freeink::ui::ActionId sliderAction,
                     freeink::ui::ActionId stepAction, bool showToggle);
   int computePanelBottom() const;
+  int sheetVisualBottom(int contentHeight) const;
   void adjustBrightness(int delta);
   void adjustWarmth(int delta);
   void toggleLight();
