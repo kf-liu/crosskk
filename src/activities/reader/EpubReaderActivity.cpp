@@ -1831,6 +1831,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
 #endif
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::REFRESH_COMMENTS: {
+#ifdef ENABLE_CHINESE_VERSION
+      if (wereadBookId_[0]) WeReadCommentOverlay::refetchChapter();
+#endif
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::HIGHLIGHT: {
 #ifdef ENABLE_CHINESE_VERSION
       if (wereadBookId_[0]) beginWeReadHighlightSelect();

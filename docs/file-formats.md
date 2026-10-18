@@ -779,6 +779,15 @@ EPUB，不写这个目录。
 `query` 和 `commentTotal` 只在内存语义里使用，不写入 WRN1。写入先写 `ranges.wri.part`，
 完成后再替换；失败删掉 `.part`。重复的 range 只抬高 `markCount`。
 
+同一目录下的 `fetched.at` 记录这一章评论全部拉完的时刻。8 字节，小端：
+
+| 偏移 | 字段 |
+|------|------|
+| 0 | `uint32 magic`（`0x31465257`，字节 `WRF1`） |
+| 4 | `uint32 epoch`（UTC 秒，0 视为没有记录） |
+
+写入先写 `fetched.at.part`，完成后再替换。进入章节时，若这个时间还在 6 小时内，就不再请求；手动重新拉取会删掉它。
+
 ## Reading background cache
 
 `/.crosspoint/background/reading_bg.bin` stores a versioned 1-bit framebuffer

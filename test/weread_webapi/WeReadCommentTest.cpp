@@ -284,4 +284,14 @@ TEST_F(WeReadCommentTest, StoresEveryCandidateWithoutACap) {
   EXPECT_EQ(seen, 70u);
 }
 
+TEST_F(WeReadCommentTest, RecordsWhenAChapterFetchFinishes) {
+  EXPECT_EQ(WeReadComment::chapterFetchedAt("3300003224", 9), 0u);
+  EXPECT_FALSE(WeReadComment::markChapterFetched("3300003224", 9, 0));
+  ASSERT_TRUE(WeReadComment::markChapterFetched("3300003224", 9, 1700000000u));
+  EXPECT_EQ(WeReadComment::chapterFetchedAt("3300003224", 9), 1700000000u);
+  ASSERT_TRUE(WeReadComment::clearChapterFetched("3300003224", 9));
+  EXPECT_EQ(WeReadComment::chapterFetchedAt("3300003224", 9), 0u);
+  EXPECT_TRUE(WeReadComment::clearChapterFetched("3300003224", 9));
+}
+
 }  // namespace

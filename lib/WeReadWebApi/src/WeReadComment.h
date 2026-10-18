@@ -109,6 +109,10 @@ class CandidateFile {
 };
 
 bool candidatesReady(const char* bookId, uint32_t chapterUid);
+// 这一章评论全部落盘的 UTC 秒。没有记录、时钟无效写入，或文件损坏时返回 0。
+uint32_t chapterFetchedAt(const char* bookId, uint32_t chapterUid);
+bool markChapterFetched(const char* bookId, uint32_t chapterUid, uint32_t epochSeconds);
+bool clearChapterFetched(const char* bookId, uint32_t chapterUid);
 // visit 返回 false 时停下。文件不存在视为空表，返回 true。
 bool visitCandidates(const char* bookId, uint32_t chapterUid,
                      bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx);

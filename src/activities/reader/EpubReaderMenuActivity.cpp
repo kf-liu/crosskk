@@ -70,6 +70,7 @@ void EpubReaderMenuActivity::buildMenuItems(std::vector<MenuItem>& items, const 
   items.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
   if (canHighlight) {
     items.push_back({MenuAction::REPORT_READING_TIME, StrId::STR_WEREAD_REPORT_READING_TIME});
+    items.push_back({MenuAction::REFRESH_COMMENTS, StrId::STR_WEREAD_REFRESH_COMMENTS});
   }
   items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
   items.push_back({MenuAction::TEXT_SETTINGS, StrId::STR_TEXT_SETTINGS});

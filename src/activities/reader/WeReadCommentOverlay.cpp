@@ -3,6 +3,7 @@
 #include <Epub.h>
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
+#include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <string>
 
+#include "CrossPointSettings.h"
 #include "WeReadClient.h"
 #include "WeReadComment.h"
 #include "WeReadHighlight.h"
@@ -28,6 +30,7 @@
 #include "WeReadXhtmlCodec.h"
 #include "fontIds.h"
 #include "util/BackgroundWork.h"
+#include "util/TimeUtils.h"
 
 #include <Memory.h>
 
@@ -51,6 +54,8 @@ struct Round {
   bool underlinesReady = false;
   bool underlinesFailed = false;
   bool sessionMissing = false;
+  // 过期后重拉时，已经存过的片段也要再请求一遍。
+  bool refreshStored = false;
   Phase phase = Phase::Idle;
   int settledSpine = -1;
   int settledPage = -1;
@@ -779,6 +784,9 @@ bool rangeHasMore(const char* bookId, const uint32_t chapterUid, const uint32_t 
   return comment.hasMore;
 }
 
+// 整章拉完后 6 小时内不再请求。够覆盖一次阅读和当天返回，隔夜再进章会更新。
+constexpr uint32_t kCommentFreshSeconds = 6 * 60 * 60;
+
 enum class WorkKind : uint8_t { None, Underlines, Range, More };
 
 struct Assignment {
@@ -805,16 +813,36 @@ struct PendingHit {
   WeReadComment::Candidate item;
 };
 
-bool firstPending(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
-  auto* hit = static_cast<PendingHit*>(raw);
-  if (!WeReadHighlight::rangesOverlap(hit->pageStart, hit->pageEnd, item.start, item.end)) return true;
-  if (item.query != WeReadComment::CandidateQuery::Unknown && item.query != WeReadComment::CandidateQuery::Partial) {
+struct ChapterScan {
+  bool refreshStored = false;
+  bool found = false;
+  bool anyFailed = false;
+  uint32_t index = 0;
+  WeReadComment::Candidate item;
+};
+
+bool scanChapter(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
+  auto* hit = static_cast<ChapterScan*>(raw);
+  if (item.query == WeReadComment::CandidateQuery::Failed) {
+    hit->anyFailed = true;
     return true;
   }
+  const bool open = item.query == WeReadComment::CandidateQuery::Unknown ||
+                    item.query == WeReadComment::CandidateQuery::Partial ||
+                    (hit->refreshStored && item.query == WeReadComment::CandidateQuery::Stored);
+  if (!open) return true;
   hit->found = true;
   hit->index = index;
   hit->item = item;
   return false;
+}
+
+bool chapterFetchFresh(const char* bookId, const uint32_t chapterUid) {
+  const uint32_t now = TimeUtils::getCurrentValidTimestamp();
+  if (now == 0 || !WeReadComment::candidatesReady(bookId, chapterUid)) return false;
+  const uint32_t fetchedAt = WeReadComment::chapterFetchedAt(bookId, chapterUid);
+  if (fetchedAt == 0 || fetchedAt > now) return false;
+  return now - fetchedAt < kCommentFreshSeconds;
 }
 
 bool rememberCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, const uint32_t start,
@@ -835,7 +863,8 @@ bool pickWork(Assignment& work) {
   lockState();
   Job& current = job();
   work.generation = current.generation;
-  bool scanPage = false;
+  bool scanChapterWork = false;
+  bool refreshStored = false;
   if (moreState.load() == kMoreWanted) {
     const MoreRequest& request = moreRequest();
     if (request.generation != current.generation || request.end <= request.start) {
@@ -859,21 +888,38 @@ bool pickWork(Assignment& work) {
     Round& state = round();
     if (!state.underlinesReady && !state.underlinesFailed) {
       work.kind = WorkKind::Underlines;
-    } else if (state.underlinesReady && current.bounds) {
-      scanPage = true;
+    } else if (state.underlinesReady) {
+      scanChapterWork = true;
+      refreshStored = state.refreshStored;
     }
   }
   unlockState();
-  if (scanPage) {
-    PendingHit hit;
-    hit.pageStart = work.nativeStart;
-    hit.pageEnd = work.nativeEnd;
-    if (WeReadComment::visitCandidates(work.bookId, work.chapterUid, firstPending, &hit) && hit.found) {
+  if (scanChapterWork) {
+    ChapterScan hit;
+    hit.refreshStored = refreshStored;
+    const bool visited = WeReadComment::visitCandidates(work.bookId, work.chapterUid, scanChapter, &hit);
+    if (visited && hit.found) {
       work.kind = WorkKind::Range;
       work.rangeIndex = hit.index;
       work.start = hit.item.start;
       work.end = hit.item.end;
       work.copyExisting = hit.item.query == WeReadComment::CandidateQuery::Partial;
+    } else if (visited && !hit.found) {
+      const uint32_t now = TimeUtils::getCurrentValidTimestamp();
+      const bool marked = !hit.anyFailed && now != 0 &&
+                          WeReadComment::markChapterFetched(work.bookId, work.chapterUid, now);
+      lockState();
+      if (work.generation != job().generation) {
+        unlockState();
+        if (marked) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+      } else {
+        job().fetch = false;
+        round().refreshStored = false;
+        round().phase = hit.anyFailed ? Phase::Failed : Phase::Idle;
+        dirty.store(true);
+        unlockState();
+        if (!hit.anyFailed) LOG_INF("WR", "本章评论已拉完");
+      }
     }
   }
   if (work.kind == WorkKind::Range && work.copyExisting) {
@@ -1016,7 +1062,12 @@ bool stepOnce() {
 
 void workerMain(void*) {
   for (;;) {
-    if (!stepOnce()) ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+    if (!stepOnce()) {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+      continue;
+    }
+    // 一段一段往后拉，留给翻页和退出。
+    vTaskDelay(pdMS_TO_TICKS(300));
   }
 }
 
@@ -1046,12 +1097,13 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   Round& state = round();
   Job& current = job();
   const bool sessionMissing = state.sessionMissing;
-  // 往前、往后、跳章都算翻页。落到新页就拉这一页的评论。
-  const bool blocked = !online || sessionMissing;
-  const bool same = current.active && current.spine == spineIndex && current.page == pageNumber &&
-                    strncmp(current.bookId, bookId, sizeof(current.bookId)) == 0;
+  // 同一章翻页不再发请求。换章才决定要不要在后台把整章拉完。
+  const bool sameChapter = current.active && current.spine == spineIndex &&
+                           strncmp(current.bookId, bookId, sizeof(current.bookId)) == 0;
+  // 离线进来之后网络恢复，补一次本章拉取。翻页本身不再发请求。
+  const bool resumeOffline = sameChapter && state.phase == Phase::Offline && online && !sessionMissing;
   unlockState();
-  if (same && !blocked) return false;
+  if (sameChapter && !resumeOffline) return false;
 
   uint32_t tocIndex = 0;
   uint32_t chapterUid = 0;
@@ -1069,7 +1121,9 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   uint32_t nativeStart = 0;
   uint32_t nativeEnd = 0;
   const bool bounds = pageNativeBounds(path, pageStart, pageEnd, nativeStart, nativeEnd);
-  const bool ready = WeReadComment::candidatesReady(bookId, chapterUid);
+  const bool fresh = chapterFetchFresh(bookId, chapterUid);
+  const bool haveCandidates = WeReadComment::candidatesReady(bookId, chapterUid);
+  const bool blocked = !online || sessionMissing;
 
   lockState();
   const Phase previous = state.phase;
@@ -1077,7 +1131,6 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
       strncmp(state.bookId, bookId, sizeof(state.bookId)) != 0) {
     beginChapter(state, bookId, chapterUid);
     current.generation++;
-    state.underlinesReady = ready;
   }
   strncpy(current.bookId, bookId, sizeof(current.bookId) - 1);
   current.bookId[sizeof(current.bookId) - 1] = '\0';
@@ -1088,13 +1141,29 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   current.spine = spineIndex;
   current.page = pageNumber;
   current.active = true;
-  current.fetch = !blocked && bounds;
-  if (sessionMissing || state.underlinesFailed) state.phase = Phase::Failed;
-  else if (!online) state.phase = state.underlinesReady ? Phase::Idle : Phase::Offline;
-  else state.phase = Phase::Loading;
+  if (fresh) {
+    state.underlinesReady = true;
+    state.refreshStored = false;
+    current.fetch = false;
+    state.phase = Phase::Idle;
+    LOG_INF("WR", "本章评论 6 小时内已拉完，跳过");
+  } else if (blocked) {
+    state.underlinesReady = haveCandidates;
+    state.refreshStored = false;
+    current.fetch = false;
+    if (sessionMissing) state.phase = Phase::Failed;
+    else state.phase = haveCandidates ? Phase::Idle : Phase::Offline;
+  } else {
+    state.underlinesReady = false;
+    state.underlinesFailed = false;
+    state.refreshStored = true;
+    current.fetch = true;
+    state.phase = Phase::Loading;
+  }
   const bool phaseChanged = state.phase != previous;
+  const bool fetch = current.fetch;
   unlockState();
-  if (current.fetch) notifyWorker();
+  if (fetch) notifyWorker();
   return phaseChanged;
 }
 
@@ -1127,8 +1196,46 @@ void showRange(Panel& view) {
 
 bool syncPage(const char* bookId, const Epub& epub, const int spineIndex, const int pageNumber,
               const uint32_t pageStart, const uint32_t pageEnd) {
-  // 只登记当前页。underlines / readreviews 在 wrCmt 任务里，一次一页。
+  // 只登记当前章。underlines / readreviews 在 wrCmt 任务里，一次一段。
   return publishPage(bookId, epub, spineIndex, pageNumber, pageStart, pageEnd);
+}
+
+void refetchChapter() {
+  if (!stateLock) return;
+  lockState();
+  Round& state = round();
+  if (!state.haveChapter || state.bookId[0] == '\0') {
+    unlockState();
+    return;
+  }
+  char bookId[64];
+  strncpy(bookId, state.bookId, sizeof(bookId) - 1);
+  bookId[sizeof(bookId) - 1] = '\0';
+  const uint32_t chapterUid = state.chapterUid;
+  const bool sessionMissing = state.sessionMissing;
+  unlockState();
+
+  WeReadComment::clearChapterFetched(bookId, chapterUid);
+  const bool online = WeReadHttpClient::networkReady();
+  lockState();
+  if (!state.haveChapter || state.chapterUid != chapterUid ||
+      strncmp(state.bookId, bookId, sizeof(state.bookId)) != 0) {
+    unlockState();
+    return;
+  }
+  Job& current = job();
+  state.underlinesReady = false;
+  state.underlinesFailed = false;
+  state.refreshStored = true;
+  current.generation++;
+  current.fetch = online && !sessionMissing;
+  if (sessionMissing) state.phase = Phase::Failed;
+  else if (!online) state.phase = Phase::Offline;
+  else state.phase = Phase::Loading;
+  const bool fetch = current.fetch;
+  unlockState();
+  dirty.store(true);
+  if (fetch) notifyWorker();
 }
 
 const char* chapterStatus() {
@@ -1345,23 +1452,42 @@ bool handlePanel(MappedInputManager& input, const GfxRenderer& renderer) {
   return false;
 }
 
+// 界面短句留在内置小号。引用、作者和评论走当前阅读字体：完整字库装上之后，
+// 常用字表以外的字和正文是同一套字形，不再画成方框。
+int proseFontId(const GfxRenderer& renderer) {
+  const int readerId = SETTINGS.getReaderFontId();
+  if (readerId != 0 && renderer.getFontMap().count(readerId) != 0) return readerId;
+  return UI_10_FONT_ID;
+}
+
+void warmProse(const GfxRenderer& renderer, const int fontId, const char* text) {
+  if (!text || text[0] == '\0') return;
+  if (FontCacheManager* cache = renderer.getFontCacheManager()) {
+    cache->prewarmCache(fontId, text, 0x01, true);
+  }
+  renderer.ensureSdCardFontReady(fontId, text, 0x01);
+}
+
 void drawFullPage(GfxRenderer& renderer, Panel& view) {
-  // 评论页不跟阅读正文字号，整页用界面小号。
-  const int fontId = UI_10_FONT_ID;
+  const int uiFont = UI_10_FONT_ID;
+  const int proseFont = proseFontId(renderer);
   const int width = renderer.getScreenWidth();
   const int height = renderer.getScreenHeight();
   const int margin = 16;
-  const int lineHeight = renderer.getLineHeight(fontId);
+  const int uiHeight = renderer.getLineHeight(uiFont);
+  const int proseHeight = renderer.getLineHeight(proseFont);
   renderer.fillRect(0, 0, width, height, false);
-  renderer.drawText(fontId, margin, margin, tr(STR_BACK));
-  int y = margin + lineHeight + 8;
-  if (view.comment.author[0]) {
-    renderer.drawText(fontId, margin, y, view.comment.author);
-    y += lineHeight + 6;
+  renderer.drawText(uiFont, margin, margin, tr(STR_BACK));
+  int y = margin + uiHeight + 8;
+  warmProse(renderer, proseFont, view.comment.author);
+  warmProse(renderer, proseFont, view.text);
+  if (view.comment.author[0] && proseHeight > 0) {
+    renderer.drawText(proseFont, margin, y, view.comment.author);
+    y += proseHeight + 6;
   }
   uint32_t shown = 0;
   const int bottom = height - margin;
-  drawWrapped(renderer, fontId, view.text, view.window, margin, y, width - margin * 2, bottom, shown);
+  drawWrapped(renderer, proseFont, view.text, view.window, margin, y, width - margin * 2, bottom, shown);
   view.shown = shown;
   view.total = countCodepoints(view.text);
 }
@@ -1430,9 +1556,11 @@ void drawPanel(GfxRenderer& renderer) {
     drawFullPage(renderer, view);
     return;
   }
-  // 引用、人数、评论和全文都用同一档小号。
+  // 「返回」、人数、全文这些界面短句用小号。引用和评论用阅读字体。
   const int fontId = UI_10_FONT_ID;
+  const int proseId = proseFontId(renderer);
   const int lineHeight = renderer.getLineHeight(fontId);
+  const int proseHeight = renderer.getLineHeight(proseId);
   const int screenW = renderer.getScreenWidth();
   const int screenH = renderer.getScreenHeight();
   constexpr int side = 16;
@@ -1444,7 +1572,7 @@ void drawPanel(GfxRenderer& renderer) {
   view.cardW = static_cast<int16_t>(screenW - side * 2);
   view.cardH = static_cast<int16_t>(screenH - topInset - side);
   view.hitCount = 0;
-  if (lineHeight <= 0 || view.cardW < 40 || view.cardH < 40) return;
+  if (lineHeight <= 0 || proseHeight <= 0 || view.cardW < 40 || view.cardH < 40) return;
 
   paintRoundBox(renderer, view.cardX, view.cardY, view.cardW, view.cardH, cardRadius, 1);
 
@@ -1458,7 +1586,7 @@ void drawPanel(GfxRenderer& renderer) {
   const int smallHeight = lineHeight;
   int contentY = 0;
   view.nextScroll = -1;
-  int overlap = lineHeight * 2;
+  int overlap = std::max(lineHeight, proseHeight) * 2;
   if (overlap > viewH / 4) overlap = viewH / 4;
   int overlapRow = -1;
 
@@ -1481,11 +1609,12 @@ void drawPanel(GfxRenderer& renderer) {
 
   int quoteTop = -1;
   int quoteBottom = -1;
-  forWrappedLines(renderer, fontId, view.quote, quoteW, [&](const char* line) {
-    place(lineHeight, [&](const int y) {
+  warmProse(renderer, proseId, view.quote);
+  forWrappedLines(renderer, proseId, view.quote, quoteW, [&](const char* line) {
+    place(proseHeight, [&](const int y) {
       if (quoteTop < 0) quoteTop = y;
-      quoteBottom = y + lineHeight;
-      renderer.drawText(fontId, quoteX, y, line);
+      quoteBottom = y + proseHeight;
+      renderer.drawText(proseId, quoteX, y, line);
     });
     return true;
   });
@@ -1529,6 +1658,8 @@ void drawPanel(GfxRenderer& renderer) {
   bool anyComment = false;
   for (uint32_t index = 0; index < view.comment.count && view.nextScroll < 0; ++index) {
     if (!readPanelText(view, index)) continue;
+    warmProse(renderer, proseId, view.comment.author);
+    warmProse(renderer, proseId, view.text);
     if (anyComment) {
       place(10, [&](const int y) { renderer.fillRect(innerX, y + 4, innerW, 1, true); });
     }
@@ -1536,7 +1667,7 @@ void drawPanel(GfxRenderer& renderer) {
     anyComment = true;
 
     int bodyLines = 0;
-    forWrappedLines(renderer, fontId, view.text, innerW, [&](const char*) {
+    forWrappedLines(renderer, proseId, view.text, innerW, [&](const char*) {
       ++bodyLines;
       return true;
     });
@@ -1545,27 +1676,28 @@ void drawPanel(GfxRenderer& renderer) {
     int hitBottom = -1;
     int shown = 0;
     if (view.comment.author[0] || truncated) {
-      place(lineHeight, [&](const int y) {
+      const int rowHeight = view.comment.author[0] ? proseHeight : lineHeight;
+      place(rowHeight, [&](const int y) {
         if (hitTop < 0) hitTop = y;
-        hitBottom = y + lineHeight;
+        hitBottom = y + rowHeight;
         int authorRight = innerX + innerW;
         if (truncated) {
           authorRight = innerX + innerW - fullWidth - 8;
-          const int labelY = y + std::max(0, (lineHeight - smallHeight) / 2);
+          const int labelY = y + std::max(0, (rowHeight - smallHeight) / 2);
           renderer.drawText(fontId, innerX + innerW - fullWidth, labelY, fullLabel);
         }
         if (view.comment.author[0] &&
-            renderer.getTextAdvanceX(fontId, view.comment.author, EpdFontFamily::REGULAR) <= authorRight - innerX) {
-          renderer.drawText(fontId, innerX, y, view.comment.author);
+            renderer.getTextAdvanceX(proseId, view.comment.author, EpdFontFamily::REGULAR) <= authorRight - innerX) {
+          renderer.drawText(proseId, innerX, y, view.comment.author);
         }
       });
     }
-    forWrappedLines(renderer, fontId, view.text, innerW, [&](const char* line) {
+    forWrappedLines(renderer, proseId, view.text, innerW, [&](const char* line) {
       if (shown >= kPreviewLines || view.nextScroll >= 0) return false;
-      place(lineHeight, [&](const int y) {
+      place(proseHeight, [&](const int y) {
         if (hitTop < 0) hitTop = y;
-        hitBottom = y + lineHeight;
-        renderer.drawText(fontId, innerX, y, line);
+        hitBottom = y + proseHeight;
+        renderer.drawText(proseId, innerX, y, line);
       });
       ++shown;
       return view.nextScroll < 0 && shown < kPreviewLines;

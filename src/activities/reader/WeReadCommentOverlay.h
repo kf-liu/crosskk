@@ -10,9 +10,12 @@ class Page;
 
 namespace WeReadCommentOverlay {
 
-// 把当前页登记给后台任务。网络不在阅读循环里发。返回 true 表示点线需要重画。
+// 把当前章登记给后台任务。翻页不再发网络。返回 true 表示点线需要重画。
 bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumber, uint32_t pageStart,
               uint32_t pageEnd);
+
+// 忽略新鲜期，从当前章重新拉评论。没有章节时不做任何事。
+void refetchChapter();
 
 // 后台写入了新评论。阅读循环用来刷新画面，本身不发请求。
 bool takeDirty();

@@ -397,6 +397,61 @@ bool candidatesReady(const char* bookId, const uint32_t chapterUid) {
   return openCandidate(bookId, chapterUid, file, header);
 }
 
+constexpr uint32_t kFetchedMagic = 0x31465257;  // WRF1
+
+struct FetchedStamp {
+  uint32_t magic = kFetchedMagic;
+  uint32_t epoch = 0;
+};
+static_assert(sizeof(FetchedStamp) == 8, "chapter fetch stamp is 8 bytes");
+
+std::string fetchedPath(const char* bookId, const uint32_t chapterUid, const bool create) {
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, create)) return "";
+  return directory + "/fetched.at";
+}
+
+uint32_t chapterFetchedAt(const char* bookId, const uint32_t chapterUid) {
+  const std::string path = fetchedPath(bookId, chapterUid, false);
+  if (path.empty() || !Storage.exists(path.c_str())) return 0;
+  HalFile file;
+  FetchedStamp stamp;
+  if (!Storage.openFileForRead("WR", path, file) ||
+      file.read(&stamp, sizeof(stamp)) != static_cast<int>(sizeof(stamp)) || stamp.magic != kFetchedMagic) {
+    return 0;
+  }
+  return stamp.epoch;
+}
+
+bool markChapterFetched(const char* bookId, const uint32_t chapterUid, const uint32_t epochSeconds) {
+  if (epochSeconds == 0) return false;
+  const std::string finalPath = fetchedPath(bookId, chapterUid, true);
+  if (finalPath.empty()) return false;
+  const std::string partPath = finalPath + ".part";
+  HalFile file;
+  if (!Storage.openFileForWrite("WR", partPath, file)) return false;
+  FetchedStamp stamp;
+  stamp.epoch = epochSeconds;
+  if (file.write(&stamp, sizeof(stamp)) != sizeof(stamp)) {
+    file.close();
+    Storage.remove(partPath.c_str());
+    return false;
+  }
+  file.flush();
+  file.close();
+  if (!WeReadStore::atomicReplace(partPath, finalPath)) {
+    Storage.remove(partPath.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool clearChapterFetched(const char* bookId, const uint32_t chapterUid) {
+  const std::string path = fetchedPath(bookId, chapterUid, false);
+  if (path.empty() || !Storage.exists(path.c_str())) return true;
+  return Storage.remove(path.c_str());
+}
+
 bool visitCandidates(const char* bookId, const uint32_t chapterUid,
                      bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx) {
   if (!visit || !isStandardBook(bookId)) return false;
