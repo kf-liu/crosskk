@@ -61,7 +61,9 @@ layout, app-slot size, and SHA-256 before emitting the manifests.
 
 A separate manual workflow,
 [`.github/workflows/metalio-eink4-release.yml`](../../.github/workflows/metalio-eink4-release.yml),
-packages only Metalio E-Ink 4. It builds `metalio_eink4_nightly`, runs
+packages only Metalio E-Ink 4. Checkout reads `.gitmodules`, which points at
+`kf-liu/freeink-sdk` because the pinned SDK commit is not on
+`0x1abin/freeink-sdk`. It builds `metalio_eink4_nightly`, runs
 `scripts/package_nightly_target.py metalio_eink4 --channel nightly`, checks the
 SHA-256 file, and publishes that package as its own prerelease. It does not
 update the rolling Nightly index or the China catalog.
