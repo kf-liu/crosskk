@@ -2,10 +2,6 @@ name: Metalio E-Ink 4 release
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/metalio-eink4-release.yml
 
 concurrency:
   group: metalio-eink4-release
