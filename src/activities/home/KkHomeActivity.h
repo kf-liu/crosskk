@@ -50,6 +50,8 @@ class KkHomeActivity final : public Activity {
   bool titleEllipsis = false;
   char titleEllipsisText[192]{};
   char authorLine[160]{};
+  int titleSlotHeight = 0;
+  int authorSlotHeight = 0;
   int headingHeight = 0;
   int bookColumnHeight = 0;
   // 最多两页已排好的正文。进入主页时读一次，离开时释放。

@@ -437,14 +437,37 @@ bool paintAreaAveragedCover(const GfxRenderer& renderer, const Bitmap& bitmap, c
   return true;
 }
 
+// 中文会落到比 UI 字号更高的字面上。drawText 会把这块字在 UI 行高里居中，
+// 高出的部分向上越界。排版和绘制都用实际字面高度，并把绘制坐标补回居中偏移。
+int inkLineHeight(const GfxRenderer& renderer, const int fontId, const char* text, const EpdFontFamily::Style style) {
+  return std::max(1, renderer.getTextLineHeight(fontId, text, style));
+}
+
+int inkDrawY(const GfxRenderer& renderer, const int fontId, const char* text, const EpdFontFamily::Style style,
+             const int slotY) {
+  const int uiHeight = renderer.getLineHeight(fontId);
+  const int inkHeight = inkLineHeight(renderer, fontId, text, style);
+  if (inkHeight <= uiHeight) return slotY;
+  return slotY - (uiHeight - inkHeight) / 2;
+}
+
 void drawStat(const GfxRenderer& renderer, const Rect cell, const char* label, const char* value) {
+  if (cell.width <= 0 || cell.height <= 0) return;
   const int innerWidth = std::max(1, cell.width);
-  const GfxRenderer::ClipScope clip(renderer, cell.x, cell.y, innerWidth, std::max(1, cell.height));
-  const int labelHeight = renderer.getLineHeight(SMALL_FONT_ID);
-  const std::string shownLabel = renderer.truncatedText(SMALL_FONT_ID, label, innerWidth);
-  const std::string shownValue = renderer.truncatedText(UI_10_FONT_ID, value, innerWidth, EpdFontFamily::BOLD);
-  renderer.drawText(SMALL_FONT_ID, cell.x, cell.y, shownLabel.c_str());
-  renderer.drawText(UI_10_FONT_ID, cell.x, cell.y + labelHeight + 2, shownValue.c_str(), true, EpdFontFamily::BOLD);
+  const GfxRenderer::ClipScope clip(renderer, cell.x, cell.y, innerWidth, cell.height);
+  char shownLabel[64];
+  char shownValue[32];
+  fitInto(renderer, SMALL_FONT_ID, EpdFontFamily::REGULAR, label, innerWidth, shownLabel, sizeof(shownLabel));
+  fitInto(renderer, UI_10_FONT_ID, EpdFontFamily::BOLD, value, innerWidth, shownValue, sizeof(shownValue));
+  const int labelHeight = inkLineHeight(renderer, SMALL_FONT_ID, shownLabel, EpdFontFamily::REGULAR);
+  const int labelY = inkDrawY(renderer, SMALL_FONT_ID, shownLabel, EpdFontFamily::REGULAR, cell.y);
+  renderer.drawText(SMALL_FONT_ID, cell.x, labelY, shownLabel);
+  const int valueY = cell.y + labelHeight + 2;
+  if (valueY < cell.y + cell.height) {
+    renderer.drawText(UI_10_FONT_ID, cell.x,
+                      inkDrawY(renderer, UI_10_FONT_ID, shownValue, EpdFontFamily::BOLD, valueY), shownValue, true,
+                      EpdFontFamily::BOLD);
+  }
 }
 }  // namespace
 
@@ -528,6 +551,8 @@ void KkHomeActivity::onEnter() {
   titleEllipsis = false;
   titleEllipsisText[0] = '\0';
   authorLine[0] = '\0';
+  titleSlotHeight = 0;
+  authorSlotHeight = 0;
   headingHeight = 0;
   bookColumnHeight = 0;
   coverBook[0] = '\0';
@@ -564,6 +589,8 @@ void KkHomeActivity::layoutHeading(const RecentBook* book) {
   titleEllipsis = false;
   titleEllipsisText[0] = '\0';
   authorLine[0] = '\0';
+  titleSlotHeight = 0;
+  authorSlotHeight = 0;
   headingHeight = 0;
   bookColumnHeight = 0;
   if (!book) return;
@@ -581,15 +608,15 @@ void KkHomeActivity::layoutHeading(const RecentBook* book) {
   normalizeAuthorLine(book->author.c_str(), normalizedAuthor, sizeof(normalizedAuthor));
   fitInto(renderer, UI_10_FONT_ID, EpdFontFamily::REGULAR, normalizedAuthor, statsW, authorLine, sizeof(authorLine));
 
-  const int titleLineHeight = std::max(1, renderer.getLineHeight(UI_12_FONT_ID));
-  const int authorLineHeight = renderer.getLineHeight(UI_10_FONT_ID);
-  const int authorBlock = authorLine[0] ? kTitleAuthorGap + authorLineHeight : 0;
-  const int statRow = renderer.getLineHeight(SMALL_FONT_ID) + 2 + renderer.getLineHeight(UI_10_FONT_ID);
-  const int statsMin = statRow * 2 + kGap;
-  const int roomForTitle = maxInner - statsMin - kHeadingStatsGap - authorBlock;
-  const int fittedLines = roomForTitle > 0 ? roomForTitle / titleLineHeight : 1;
-  const int maxLines = std::clamp(fittedLines, 1, kMaxTitleLines);
   const char* title = book->title.empty() ? book->path.c_str() : book->title.c_str();
+  titleSlotHeight = inkLineHeight(renderer, UI_12_FONT_ID, title, EpdFontFamily::BOLD);
+  authorSlotHeight =
+      authorLine[0] ? inkLineHeight(renderer, UI_10_FONT_ID, authorLine, EpdFontFamily::REGULAR) : 0;
+  const int authorBlock = authorSlotHeight > 0 ? kTitleAuthorGap + authorSlotHeight : 0;
+  // 书名和作者先占高度。四个指标只用封面列里剩下的区域，不再反过来挤占标题。
+  const int roomForTitle = maxInner - kHeadingStatsGap - authorBlock;
+  const int fittedLines = roomForTitle > 0 ? roomForTitle / titleSlotHeight : 1;
+  const int maxLines = std::clamp(fittedLines, 1, kMaxTitleLines);
   LineSpan lines[kMaxTitleLines];
   wrapTitle(renderer, title, statsW, maxLines, lines, titleLineCount, titleEllipsis, titleEllipsisText,
             sizeof(titleEllipsisText));
@@ -599,8 +626,8 @@ void KkHomeActivity::layoutHeading(const RecentBook* book) {
     titleSpans[i].end = lines[i].end;
   }
   titleLineCount = storedLines;
-  headingHeight = titleLineCount * titleLineHeight + authorBlock + kHeadingStatsGap;
-  bookColumnHeight = std::max(coverH, headingHeight + statsMin);
+  headingHeight = titleLineCount * titleSlotHeight + authorBlock + kHeadingStatsGap;
+  bookColumnHeight = std::max(coverH, headingHeight);
 }
 
 Rect KkHomeActivity::readingPreviewRect() const {
@@ -825,10 +852,9 @@ void KkHomeActivity::render(RenderLock&&) {
         const int statsX = innerX + coverW + kGap;
         const int statsW = std::max(1, innerX + innerW - statsX);
         const char* title = book->title.empty() ? book->path.c_str() : book->title.c_str();
-        const int titleHeight = renderer.getLineHeight(UI_12_FONT_ID);
-        const int headingClip = std::max(1, headingHeight - kHeadingStatsGap);
+        const int headingInk = std::max(1, headingHeight - kHeadingStatsGap);
         {
-          const GfxRenderer::ClipScope clip(renderer, statsX, innerY, statsW, headingClip);
+          const GfxRenderer::ClipScope clip(renderer, statsX, innerY, statsW, headingInk);
           int titleY = innerY;
           for (int line = 0; line < titleLineCount; ++line) {
             char shown[kMeasureBytes];
@@ -842,11 +868,16 @@ void KkHomeActivity::render(RenderLock&&) {
               memcpy(shown, title + begin, length);
               shown[length] = '\0';
             }
-            renderer.drawText(UI_12_FONT_ID, statsX, titleY, text, true, EpdFontFamily::BOLD);
-            titleY += titleHeight;
+            renderer.drawText(UI_12_FONT_ID, statsX,
+                              inkDrawY(renderer, UI_12_FONT_ID, text, EpdFontFamily::BOLD, titleY), text, true,
+                              EpdFontFamily::BOLD);
+            titleY += titleSlotHeight;
           }
           if (authorLine[0]) {
-            renderer.drawText(UI_10_FONT_ID, statsX, titleY + kTitleAuthorGap, authorLine);
+            const int authorY = titleY + kTitleAuthorGap;
+            renderer.drawText(UI_10_FONT_ID, statsX,
+                              inkDrawY(renderer, UI_10_FONT_ID, authorLine, EpdFontFamily::REGULAR, authorY),
+                              authorLine);
           }
         }
 
@@ -866,17 +897,20 @@ void KkHomeActivity::render(RenderLock&&) {
 
         const int gridY = innerY + headingHeight;
         const int columnH = std::max(1, panel.height - pad * 2);
-        const int gridH = std::max(1, columnH - headingHeight);
-        const int cellW = std::max(1, (statsW - kGap) / 2);
-        const int cellH = std::max(1, (gridH - kGap) / 2);
-        const char* statLabels[] = {tr(STR_KK_LOCAL_TIME), tr(STR_KK_UNREPORTED_TIME), tr(STR_KK_WEREAD_TIME),
-                                    tr(STR_KK_TOTAL_PROGRESS)};
-        const char* values[] = {totalText, unreportedText, wereadText, progressText};
-        for (int i = 0; i < 4; ++i) {
-          const int column = i % 2;
-          const int row = i / 2;
-          drawStat(renderer, Rect{statsX + column * (cellW + kGap), gridY + row * (cellH + kGap), cellW, cellH},
-                   statLabels[i], values[i]);
+        const int gridH = columnH - headingHeight;
+        if (gridH > kGap) {
+          const GfxRenderer::ClipScope statsClip(renderer, statsX, gridY, statsW, gridH);
+          const int cellW = std::max(1, (statsW - kGap) / 2);
+          const int cellH = std::max(1, (gridH - kGap) / 2);
+          const char* statLabels[] = {tr(STR_KK_LOCAL_TIME), tr(STR_KK_UNREPORTED_TIME), tr(STR_KK_WEREAD_TIME),
+                                      tr(STR_KK_TOTAL_PROGRESS)};
+          const char* values[] = {totalText, unreportedText, wereadText, progressText};
+          for (int i = 0; i < 4; ++i) {
+            const int column = i % 2;
+            const int row = i / 2;
+            drawStat(renderer, Rect{statsX + column * (cellW + kGap), gridY + row * (cellH + kGap), cellW, cellH},
+                     statLabels[i], values[i]);
+          }
         }
       }
 
