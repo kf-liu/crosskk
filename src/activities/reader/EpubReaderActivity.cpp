@@ -2217,7 +2217,10 @@ bool EpubReaderActivity::stepLiveReading() {
     LOG_ERR("WR", "live reading report failed: error=%u", static_cast<unsigned>(wereadHeartbeat_->error()));
     wereadHeartbeatDueMs_ = millis() + intervalMs;
   }
-  return wereadHeartbeat_ && wereadHeartbeat_->active();
+  const bool still = wereadHeartbeat_ && wereadHeartbeat_->active();
+  // 这一拍成功或失败后先收掉。下一拍真正发出去时再亮。
+  if (!still) noteReadingTime(false);
+  return still;
 }
 
 void EpubReaderActivity::pollLiveReading() {
@@ -2249,15 +2252,18 @@ void EpubReaderActivity::pollLiveReading() {
       wereadHeartbeatDueMs_ = millis() + intervalMs;
     }
   } else if (wereadHeartbeatDueMs_ == 0) {
+    noteReadingTime(false);
     wereadHeartbeatDueMs_ = millis() + intervalMs;
   } else if (static_cast<long>(millis() - wereadHeartbeatDueMs_) < 0 || (section && section->isBuilding())) {
-    // 还没到点，或这一章还在分页。
+    // 还没到点，或这一章还在分页。这一拍已经结束，底部回到章节名。
+    noteReadingTime(false);
   } else {
     if (!wereadHeartbeat_) {
       wereadHeartbeat_ = makeUniqueNoThrow<WeReadClient::Operation>();
     }
     if (!wereadHeartbeat_) {
       LOG_ERR("WR", "OOM: live reading report (%u bytes)", static_cast<unsigned>(sizeof(WeReadClient::Operation)));
+      noteReadingTime(false);
       wereadHeartbeatDueMs_ = millis() + intervalMs;
     } else {
       const int currentPage = section ? section->currentPage : nextPageNumber;
@@ -2277,6 +2283,7 @@ void EpubReaderActivity::pollLiveReading() {
           !wereadHeartbeat_->beginProgressSync(wereadBookId_, input, WeReadClient::ProgressSyncMode::LiveReading)) {
         LOG_ERR("WR", "live reading report could not start: error=%u",
                 static_cast<unsigned>(wereadHeartbeat_->error()));
+        noteReadingTime(false);
         wereadHeartbeatDueMs_ = millis() + intervalMs;
       } else {
         wake = wereadHeartbeat_->active();
