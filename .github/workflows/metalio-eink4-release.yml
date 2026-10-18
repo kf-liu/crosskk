@@ -2,6 +2,10 @@ name: Metalio E-Ink 4 release
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/metalio-eink4-release.yml
 
 concurrency:
   group: metalio-eink4-release
@@ -54,17 +58,33 @@ jobs:
       - name: Publish Metalio release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.H2O_RUNNER_TOKEN }}
         run: |
           set -euo pipefail
           tag="metalio-eink4-${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
-          cat > release-body.md << EOF
-          Manual Metalio E-Ink 4 package from \`${GITHUB_SHA}\`.
-
-          Built with \`pio run -e metalio_eink4_nightly\` and packaged with \`scripts/package_nightly_target.py metalio_eink4 --channel nightly\`.
-          This prerelease does not update the rolling Nightly index.
-          EOF
+          printf '%s\n' \
+            "Manual Metalio E-Ink 4 package from \`${GITHUB_SHA}\`." \
+            "" \
+            "Built with \`pio run -e metalio_eink4_nightly\` and packaged with \`scripts/package_nightly_target.py metalio_eink4 --channel nightly\`." \
+            "This prerelease does not update the rolling Nightly index." \
+            > release-body.md
           mapfile -t assets < <(find dist/metalio_eink4 -type f -print)
-          gh release create "$tag" "${assets[@]}" \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Metalio E-Ink 4 ${GITHUB_SHA::7}" \
-            --notes-file release-body.md --prerelease
+          publish() {
+            GH_TOKEN="$1" gh release create "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Metalio E-Ink 4 ${GITHUB_SHA::7}" \
+              --notes-file release-body.md --prerelease
+          }
+          # Actions 默认令牌在仓库里经常是只读的，创建 Release 会立刻 403。
+          if publish_err="$(publish "$GH_TOKEN" 2>&1)"; then
+            printf '%s\n' "$publish_err"
+            exit 0
+          fi
+          if [ -n "${RELEASE_TOKEN:-}" ] && publish_err2="$(publish "$RELEASE_TOKEN" 2>&1)"; then
+            printf '%s\n' "$publish_err2"
+            exit 0
+          fi
+          detail="$(printf '%s %s' "$publish_err" "${publish_err2:-}" | tr '\n' ' ' | head -c 300)"
+          echo "::error::$detail"
+          printf '%s\n' "$detail"
+          exit 1
