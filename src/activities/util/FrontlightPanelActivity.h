@@ -37,6 +37,7 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   uint8_t touchModeRestore = CrossPointSettings::TOUCH_READER_ON;
   int panelBottom = 0;
   uint32_t busyGen_ = 0;
+  bool wifiShown_ = false;
 
   // Quick-setting tiles, in grid order (2 columns): night mode, refresh,
   // orientation, touch, then offline reading / smart online reading.

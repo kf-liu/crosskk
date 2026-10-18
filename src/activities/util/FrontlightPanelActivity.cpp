@@ -71,9 +71,12 @@ void drawPanelStatusRow(const GfxRenderer& renderer, const fui::Rect& band) {
   TimeUtils::formatCurrentTime(time, sizeof(time), SETTINGS.clockFormat == 1);
   renderer.drawText(fontId, band.x, textY, time);
   const int batteryX = band.x + band.width - metrics.batteryWidth;
+  const bool showPercent =
+      SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
+  // Same rule as the home bar: the mark sits left of the battery only while the station is associated.
+  GUI.drawStationWifiLeftOfBattery(renderer, batteryX, textY, showPercent, fontId);
   // Percent shares the clock line. drawBatteryRight drops the icon below that origin.
-  GUI.drawBatteryRight(renderer, Rect{batteryX, textY, metrics.batteryWidth, metrics.batteryHeight},
-                       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS,
+  GUI.drawBatteryRight(renderer, Rect{batteryX, textY, metrics.batteryWidth, metrics.batteryHeight}, showPercent,
                        fontId);
 }
 }  // namespace
@@ -105,6 +108,7 @@ void FrontlightPanelActivity::onEnter() {
   }
 
   busyGen_ = BackgroundWork::generation();
+  wifiShown_ = NetworkStartup::stationConnected();
   resetUi();
   app.on(ACTION_BRIGHTNESS, &FrontlightPanelActivity::onBrightnessEvent, this);
   app.on(ACTION_WARMTH, &FrontlightPanelActivity::onWarmthEvent, this);
@@ -282,6 +286,11 @@ void FrontlightPanelActivity::loop() {
     busyGen_ = generation;
     requestUpdate();
   }
+  const bool connected = NetworkStartup::stationConnected();
+  if (connected != wifiShown_) {
+    wifiShown_ = connected;
+    requestUpdate();
+  }
   const auto touch = routeTouch(mappedInput, false, /*routeHeld=*/true);
   if (touch.routed) {
     if (app.invalidated()) requestUpdate();
@@ -414,7 +423,7 @@ void FrontlightPanelActivity::buildPanelScreen(UiScreen& screen) {
   screen.sheet(sheetProps, static_cast<int16_t>(panelBottom));
   screen.insetContent(fui::Insets{0, kPanelSideMargin, 0, kPanelSideMargin});
 
-  // Clock and battery only. A home header here is a second band under this row.
+  // Clock, and battery with the station mark when associated. A home header here is a second band under this row.
   HeaderBackTapTarget::clear();
   screen.spacer(theme.spaceMd);
   drawPanelStatusRow(renderer, screen.takeTop(static_cast<int16_t>(MainTabs::statusBarHeight), theme.spaceMd));

@@ -134,16 +134,16 @@ bool beginSavedNetwork(GfxRenderer& renderer) {
     return false;
   }
   const auto cred = WIFI_STORE.findCredential(last);
-  if (!cred) {
-    LOG_INF("NET", "stay connected: saved network has no credential");
-    return false;
-  }
   // Copy off the store's strings before the driver starts. Password stays off the log.
+  // An open network is remembered by SSID only: the selection screen does not
+  // write a credential row when there is no password.
   char ssid[33];
-  char pass[64];
-  std::strncpy(ssid, cred->ssid.c_str(), sizeof(ssid) - 1);
+  char pass[64] = {};
+  const char* ssidSrc = cred ? cred->ssid.c_str() : last.c_str();
+  const char* passSrc = cred ? cred->password.c_str() : "";
+  std::strncpy(ssid, ssidSrc, sizeof(ssid) - 1);
   ssid[sizeof(ssid) - 1] = '\0';
-  std::strncpy(pass, cred->password.c_str(), sizeof(pass) - 1);
+  std::strncpy(pass, passSrc, sizeof(pass) - 1);
   pass[sizeof(pass) - 1] = '\0';
 
   WiFi.persistent(false);
