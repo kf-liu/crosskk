@@ -1020,6 +1020,12 @@ bool pickWork(Assignment& work) {
   return work.kind != WorkKind::None;
 }
 
+#ifdef ENABLE_CHINESE_VERSION
+void noteCommentFetch(bool on);
+#else
+inline void noteCommentFetch(bool) {}
+#endif
+
 void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult result, const uint32_t totalCount,
                       const uint32_t markCount) {
   const bool hasMore = result == WeReadComment::CollectResult::Stored &&
@@ -1027,6 +1033,7 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   lockState();
   if (work.generation != job().generation) {
     unlockState();
+    noteCommentFetch(false);
     return;
   }
   unlockState();
@@ -1058,6 +1065,7 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   lockState();
   if (work.generation != job().generation) {
     unlockState();
+    noteCommentFetch(false);
     return;
   }
   if (work.kind == WorkKind::More) {
@@ -1082,7 +1090,7 @@ void noteCommentFetch(const bool on) {
 bool stepOnce() {
 #ifdef ENABLE_CHINESE_VERSION
   Assignment work;
-  if (!pickWork(work)) {
+  if (!pickWork(work) || work.generation != job().generation) {
     noteCommentFetch(false);
     lockState();
     Round& state = round();

@@ -4185,20 +4185,10 @@ void EpubReaderActivity::renderStatusBar() const {
   std::string title;
   int textYOffset = 0;
   const auto sb = SETTINGS.statusBarSpec();
-  const char* busy = BackgroundWork::foregroundLabel();
-#ifdef ENABLE_CHINESE_VERSION
-  // 整章评论在后台一段一段拉，进行中可能要好几分钟。阅读页保持章节名。
-  if (busy && strcmp(busy, tr(STR_BUSY_FETCH_COMMENTS)) == 0) busy = nullptr;
-  const char* commentStatus = WeReadCommentOverlay::chapterStatus();
-#else
-  const char* commentStatus = nullptr;
-#endif
+  // 拉取评论、同步进度、同步时长可能要很久，结束前也会占着这一行。底部只留章节名，
+  // 这些任务改到下拉控制中心去看。
 
-  if (commentStatus && commentStatus[0] != '\0') {
-    title = commentStatus;
-  } else if (busy && busy[0] != '\0') {
-    title = busy;
-  } else if (automaticPageTurnActive) {
+  if (automaticPageTurnActive) {
     title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);
     const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
     if (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()) {
