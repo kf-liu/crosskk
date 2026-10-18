@@ -23,7 +23,8 @@ struct ReadingBookStats {
   std::string chapterTitle;
   std::vector<ReadingDayStats> readingDays;
   uint64_t totalReadingMs = 0;
-  // Milliseconds already sent to WeRead. The rest of totalReadingMs is still unreported.
+  // Milliseconds already handed to WeRead, including the in-reader heartbeat.
+  // The rest of totalReadingMs is still unreported.
   uint64_t reportedReadingMs = 0;
   uint32_t sessions = 0;
   uint32_t lastSessionMs = 0;
@@ -158,6 +159,8 @@ class ReadingStatsStore {
   // Whole seconds of this book's local reading time that have not been reported yet.
   uint32_t unreportedReadingSeconds(const std::string& path) const;
   uint64_t reportedReadingMs(const std::string& path) const;
+  // Records milliseconds already handed to WeRead. Returns how many fit in totalReadingMs.
+  uint64_t applyReportedReadingMs(const std::string& path, uint64_t readingMs);
   // Advances the reported watermark after a duration upload leaves the device.
   bool markReadingReported(const std::string& path, uint32_t seconds);
 

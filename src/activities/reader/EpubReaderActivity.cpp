@@ -376,6 +376,10 @@ void EpubReaderActivity::onExit() {
   }
 
   READING_STATS.endSession();
+#ifdef ENABLE_CHINESE_VERSION
+  // 会话先把这一段读入总时长，自动心跳里已经发出去的毫秒才能记成已上报。
+  commitLiveReportedMs();
+#endif
   ACHIEVEMENTS.recordSessionEnded(READING_STATS.getLastSessionSnapshot());
 #if FREEINK_DEVICE_READPICO
   // Four frames of PSRAM; the reader is the only owner and gives them back here.
@@ -1221,6 +1225,9 @@ void EpubReaderActivity::loop() {
   }
 
   READING_STATS.tickActiveSession();
+#ifdef ENABLE_CHINESE_VERSION
+  commitLiveReportedMs();
+#endif
   rememberBookOnceRendered();
 
   // Someone else turned the screen while this reader was stacked (the control
@@ -2193,6 +2200,20 @@ bool EpubReaderActivity::runBackgroundRadio() {
   return more;
 }
 
+void EpubReaderActivity::commitLiveReportedMs() {
+  const uint32_t pendingMs = pendingLiveReportedMs_.exchange(0);
+  if (pendingMs == 0) return;
+  if (bookPath.empty()) {
+    pendingLiveReportedMs_.fetch_add(pendingMs);
+    return;
+  }
+  const uint64_t before = READING_STATS.reportedReadingMs(bookPath);
+  READING_STATS.applyReportedReadingMs(bookPath, pendingMs);
+  const uint64_t after = READING_STATS.reportedReadingMs(bookPath);
+  const uint64_t applied = after > before ? after - before : 0;
+  if (applied < pendingMs) pendingLiveReportedMs_.fetch_add(static_cast<uint32_t>(pendingMs - applied));
+}
+
 void EpubReaderActivity::detachLiveReading() {
 #if !defined(SIMULATOR)
   if (liveLock) xSemaphoreTake(liveLock, portMAX_DELAY);
@@ -2208,13 +2229,20 @@ void EpubReaderActivity::detachLiveReading() {
 #if !defined(SIMULATOR)
   if (liveLock) xSemaphoreGive(liveLock);
 #endif
+  // 等后台这一拍结束再记账，避免写 SD 时还握着心跳锁。
+  commitLiveReportedMs();
 }
 
 bool EpubReaderActivity::stepLiveReading() {
   if (liveReadingPaused.load() || !wereadHeartbeat_ || !wereadHeartbeat_->active()) return false;
   noteReadingTime(true);
   const unsigned long intervalMs = WeReadClient::Operation::kLiveReadingIntervalSeconds * 1000UL;
+  const bool alreadySent = wereadHeartbeat_->readingTimeConsumed();
   const auto event = wereadHeartbeat_->step();
+  // 这一拍里时长刚离开设备就算已上报，包括发出去之后这次请求失败。下一拍不会再带这 30 秒。
+  if (!alreadySent && wereadHeartbeat_->readingTimeConsumed()) {
+    pendingLiveReportedMs_.fetch_add(WeReadClient::Operation::kLiveReadingIntervalSeconds * 1000u);
+  }
   if (event == WeReadClient::Operation::Event::Complete) {
     LOG_INF("WR", "live reading report sent: seconds=%u",
             static_cast<unsigned>(WeReadClient::Operation::kLiveReadingIntervalSeconds));
@@ -2235,6 +2263,7 @@ void EpubReaderActivity::serviceWhileCovered() {
 }
 
 void EpubReaderActivity::pollLiveReading() {
+  commitLiveReportedMs();
   if (WeReadCommentOverlay::manualRefreshState() == WeReadCommentOverlay::ManualRefresh::Running) {
     liveReadingPaused.store(true);
     noteReadingTime(false);

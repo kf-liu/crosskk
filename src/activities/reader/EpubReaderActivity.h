@@ -322,6 +322,10 @@ class EpubReaderActivity final : public ReaderActivity {
   bool enterSyncWaiting_ = false;
   std::unique_ptr<WeReadClient::Operation> wereadHeartbeat_;
   unsigned long wereadHeartbeatDueMs_ = 0;
+  // 心跳在后台任务里把这一拍标成已上报。毫秒先记在这里，阅读循环再写入统计。
+  // 本地总时长还没跟上时先留着，等会话把这段时间记上再入账。
+  std::atomic<uint32_t> pendingLiveReportedMs_{0};
+  void commitLiveReportedMs();
   std::atomic<bool> readingTimeBusy_{false};
 #endif
   unsigned long confirmLongPressThreshold() const;

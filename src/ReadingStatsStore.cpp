@@ -942,17 +942,22 @@ uint64_t ReadingStatsStore::reportedReadingMs(const std::string& path) const {
   return std::min(book->reportedReadingMs, book->totalReadingMs);
 }
 
-bool ReadingStatsStore::markReadingReported(const std::string& path, const uint32_t seconds) {
-  if (seconds == 0) return false;
+uint64_t ReadingStatsStore::applyReportedReadingMs(const std::string& path, const uint64_t readingMs) {
+  if (readingMs == 0) return 0;
   const size_t index = findBookIndexByPath(path);
-  if (index >= books.size()) return false;
+  if (index >= books.size()) return 0;
   auto& book = books[index];
   const uint64_t room = book.totalReadingMs > book.reportedReadingMs ? book.totalReadingMs - book.reportedReadingMs : 0;
-  const uint64_t add = std::min(static_cast<uint64_t>(seconds) * 1000ULL, room);
-  if (add == 0) return false;
+  const uint64_t add = std::min(readingMs, room);
+  if (add == 0) return 0;
   book.reportedReadingMs += add;
   markDirty();
-  return saveToFile();
+  saveToFile();
+  return add;
+}
+
+bool ReadingStatsStore::markReadingReported(const std::string& path, const uint32_t seconds) {
+  return applyReportedReadingMs(path, static_cast<uint64_t>(seconds) * 1000ULL) > 0;
 }
 
 bool ReadingStatsStore::adjustBookReadingTime(const std::string& path, const uint32_t dayOrdinal,
