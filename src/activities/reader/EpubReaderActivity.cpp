@@ -4170,6 +4170,8 @@ void EpubReaderActivity::renderStatusBar() const {
   const auto sb = SETTINGS.statusBarSpec();
   const char* busy = BackgroundWork::foregroundLabel();
 #ifdef ENABLE_CHINESE_VERSION
+  // 整章评论在后台一段一段拉，进行中可能要好几分钟。阅读页保持章节名。
+  if (busy && strcmp(busy, tr(STR_BUSY_FETCH_COMMENTS)) == 0) busy = nullptr;
   const char* commentStatus = WeReadCommentOverlay::chapterStatus();
 #else
   const char* commentStatus = nullptr;

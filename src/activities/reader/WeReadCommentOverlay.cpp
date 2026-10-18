@@ -1098,6 +1098,7 @@ bool stepOnce() {
     lockState();
     if (work.generation != job().generation) {
       unlockState();
+      noteCommentFetch(false);
       return true;
     }
     Round& state = round();
@@ -1363,13 +1364,12 @@ const char* chapterStatus() {
     unlockState();
   }
   switch (phase) {
-    case Phase::Loading:
-      return tr(STR_WEREAD_COMMENTS_LOADING);
-    case Phase::Failed:
-      return tr(STR_WEREAD_COMMENTS_FAILED);
     case Phase::Offline:
       return tr(STR_WEREAD_PASSAGE_COMMENT_OFFLINE);
+    case Phase::Loading:
+    case Phase::Failed:
     case Phase::Idle:
+      // 整章拉取要很多段。进行中和失败都不占阅读页底部，章节名留着。
       break;
   }
   return nullptr;
@@ -1867,6 +1867,7 @@ void reset() {
   job() = {};
   job().generation = generation;
   unlockState();
+  noteCommentFetch(false);
   // 退出时这一轮还没拉完。去掉完成时间，评论文件留下，下次进入再试。
   if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
   moreState.store(kMoreIdle);
