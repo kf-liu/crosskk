@@ -107,6 +107,11 @@ bool readingHold = false;
 
 bool smartOnlineReading() { return SETTINGS.wifiStayConnected != 0; }
 
+bool stationConnected() {
+  const wifi_mode_t mode = WiFi.getMode();
+  return (mode & WIFI_MODE_STA) != 0 && WiFi.status() == WL_CONNECTED;
+}
+
 bool stayConnected() { return readingHold; }
 
 void holdReadingRadio(const bool hold) { readingHold = hold; }

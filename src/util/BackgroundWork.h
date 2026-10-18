@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // 进行中的后台动作。下拉控制中心在快捷按钮下方的任务区列出全部。阅读页底部用最近
-// 开始的一条替换章节或书名，整章评论拉取除外。顶栏只放时钟和电量。
+// 开始的一条替换章节或书名，整章评论拉取除外。顶栏只放时钟、电量，以及已经连上的 Wi-Fi 标。
 namespace BackgroundWork {
 
 enum class Kind : uint8_t { FetchComments, SyncProgress, SyncReadingTime, Count };

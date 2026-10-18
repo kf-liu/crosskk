@@ -31,6 +31,7 @@
 #endif
 #include "fontIds.h"
 #include "images/Logo120.h"
+#include "NetworkStartup.h"
 #include "util/TimeUtils.h"
 
 freeink::ui::BitmapRef BaseTheme::checkboxIcon(const bool checked) {
@@ -250,6 +251,59 @@ bool BaseTheme::drawCoverThumbFill(const GfxRenderer& renderer, const Bitmap& bi
   const bool drawn = renderer.drawBitmap(bitmap, x, y, bitmap.getWidth(), bitmap.getHeight());
   renderer.setClipRect(clip[0], clip[1], clip[2], clip[3]);
   return drawn;
+}
+
+namespace {
+constexpr int kWifiMarkSize = 24;
+constexpr int kWifiMarkGap = 8;
+
+void drawWifiGlyph(const GfxRenderer& renderer, const int x, const int y) {
+  const freeink::Icon& icon = icon_wifi_24;
+  const int stride = (icon.w + 7) / 8;
+  for (int row = 0; row < icon.h; ++row) {
+    for (int column = 0; column < icon.w; ++column) {
+      if ((icon.bits[row * stride + column / 8] & (0x80U >> (column % 8))) == 0) {
+        renderer.drawPixel(x + column, y + row, true);
+      }
+    }
+  }
+}
+}  // namespace
+
+void BaseTheme::drawReaderWifiCorner(const GfxRenderer& renderer, const bool clearSlot) const {
+  int top = 0;
+  int right = 0;
+  int bottom = 0;
+  int left = 0;
+  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
+  (void)bottom;
+  (void)left;
+  constexpr int pad = 2;
+  // 底边停在正文边距上，默认边距装得下，不盖第一行。
+  const int contentTop = top + static_cast<int>(SETTINGS.screenMargin);
+  int y = contentTop - kWifiMarkSize;
+  if (y < top + pad) y = top + pad;
+  const int x = renderer.getScreenWidth() - right - pad - kWifiMarkSize;
+  if (x < 0 || y < 0) return;
+  const bool connected = NetworkStartup::stationConnected();
+  if (clearSlot || connected) renderer.fillRect(x, y, kWifiMarkSize, kWifiMarkSize, false);
+  if (connected) drawWifiGlyph(renderer, x, y);
+}
+
+void BaseTheme::drawStationWifiLeftOfBattery(const GfxRenderer& renderer, const int batteryX, const int rowY,
+                                             const bool showPercentage, const int numericFontId) const {
+  if (!NetworkStartup::stationConnected()) return;
+  const int percentGap = UiHighDpiProfile::enabled ? UiHighDpiProfile::controlGap : batteryPercentSpacing;
+  int clusterLeft = batteryX;
+  if (showPercentage) {
+    const auto percentageText = std::to_string(powerManager.getBatteryPercentage()) + "%";
+    clusterLeft -= renderer.getTextWidth(numericFontId, percentageText.c_str()) + percentGap;
+  }
+  const int x = clusterLeft - kWifiMarkGap - kWifiMarkSize;
+  if (x < 0) return;
+  const int line = renderer.getLineHeight(numericFontId);
+  const int y = rowY + std::max(0, (line - kWifiMarkSize) / 2);
+  drawWifiGlyph(renderer, x, y);
 }
 
 void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const bool showPercentage,
@@ -675,6 +729,18 @@ void BaseTheme::drawHeaderWithStyle(const GfxRenderer& renderer, Rect rect, cons
     props.styles.normal.borderWidth = tokens.headerUnderline;
   }
   fui::header(ui.frame, band, props);
+  if (!props.status.showBattery || props.status.batteryLeft || !NetworkStartup::stationConnected()) return;
+  const int percentGap = UiHighDpiProfile::enabled ? UiHighDpiProfile::controlGap : batteryPercentSpacing;
+  int reserve = props.status.battery.glyphWidth + 2;
+  if (props.status.battery.label) {
+    reserve += percentGap + renderer.getTextWidth(SMALL_FONT_ID, props.status.battery.label);
+  }
+  const int inset = props.status.edgeInset < 0 ? 6 : props.status.edgeInset;
+  const int clusterLeft = rect.x + rect.width - inset - reserve;
+  const int x = clusterLeft - kWifiMarkGap - kWifiMarkSize;
+  if (x < 0) return;
+  const int y = rect.y + std::max(0, (props.status.stripHeight - kWifiMarkSize) / 2);
+  drawWifiGlyph(renderer, x, y);
 }
 
 void BaseTheme::drawMainTabBar(const GfxRenderer&, Rect, MainTab) const {}

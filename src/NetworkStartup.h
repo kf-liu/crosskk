@@ -19,6 +19,9 @@ bool setMode(GfxRenderer& renderer, wifi_mode_t mode);
 // 下拉窗「智能在线阅读」。只表示用户选了这个模式，主页不会因此连着无线电。
 bool smartOnlineReading();
 
+// STA 已经连上一个网络。与「在线阅读 / 离线阅读」无关，热点模式也不算。
+bool stationConnected();
+
 // 一次阅读会话还握着这条连接（含退出后的进度同步）。其它画面用完无线电就关掉。
 bool stayConnected();
 

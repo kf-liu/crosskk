@@ -322,6 +322,11 @@ class BaseTheme {
                        bool showPercentage = true) const;  // Left aligned (reader mode)
   void drawBatteryRight(const GfxRenderer& renderer, Rect rect, bool showPercentage = true,
                         int numericFontId = STATUS_NUMERIC_FONT_ID) const;
+  // 阅读页右上角。clearSlot 时先涂白，没关联就不再画。
+  void drawReaderWifiCorner(const GfxRenderer& renderer, bool clearSlot = false) const;
+  // 顶栏电量簇的左侧。没关联时什么都不画，调用方已经清过这块底。
+  void drawStationWifiLeftOfBattery(const GfxRenderer& renderer, int batteryX, int rowY, bool showPercentage,
+                                    int numericFontId) const;
   virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const;
   void drawButtonHintsWithStyle(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                 const char* btn4, bool upstreamStyle) const;

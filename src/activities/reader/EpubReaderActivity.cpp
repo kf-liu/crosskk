@@ -1205,6 +1205,16 @@ void EpubReaderActivity::loop() {
   }
 #endif
 
+  if (wifiCornerShown_ >= 0 && overlay == Overlay::None && section && !section->isBuilding() && !RenderLock::peek() &&
+      NetworkStartup::stationConnected() != (wifiCornerShown_ != 0)) {
+    RenderLock lock(RenderLock::Mode::Try);
+    if (lock.ownsLock()) {
+      GUI.drawReaderWifiCorner(renderer, true);
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      wifiCornerShown_ = NetworkStartup::stationConnected() ? 1 : 0;
+    }
+  }
+
   READING_STATS.tickActiveSession();
   rememberBookOnceRendered();
 
@@ -4209,6 +4219,8 @@ void EpubReaderActivity::renderStatusBar() const {
 
   GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
                     section ? section->isBuilding() : false);
+  GUI.drawReaderWifiCorner(renderer);
+  wifiCornerShown_ = NetworkStartup::stationConnected() ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

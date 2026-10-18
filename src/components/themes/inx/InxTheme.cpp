@@ -116,9 +116,10 @@ void InxTheme::drawHeader(const GfxRenderer& renderer, const Rect rect, const ch
   const bool showBatteryPercentage =
       SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
   const int batteryX = rect.x + rect.width - 12 - InxMetrics::values.batteryWidth;
-  drawBatteryRight(renderer,
-                   Rect{batteryX, rect.y + 5, InxMetrics::values.batteryWidth, InxMetrics::values.batteryHeight},
-                   showBatteryPercentage, UiHighDpiProfile::enabled ? SMALL_FONT_ID : STATUS_NUMERIC_FONT_ID);
+  const int batteryFont = UiHighDpiProfile::enabled ? SMALL_FONT_ID : STATUS_NUMERIC_FONT_ID;
+  drawBatteryRight(renderer, Rect{batteryX, rect.y + 5, InxMetrics::values.batteryWidth, InxMetrics::values.batteryHeight},
+                   showBatteryPercentage, batteryFont);
+  drawStationWifiLeftOfBattery(renderer, batteryX, rect.y + 5, showBatteryPercentage, batteryFont);
 
   const int titleTop = rect.y + InxMetrics::values.batteryBarHeight;
   const int rightPadding = InxMetrics::values.contentSidePadding;
@@ -485,7 +486,10 @@ void InxTheme::drawMainTabStatusBar(const GfxRenderer& renderer, const Rect rect
     const int clockX = std::max(rect.x, edgeInset);
     renderer.drawText(numericFontId, clockX, textY, time);
   }
-  drawBatteryRight(renderer, Rect{right - metrics.batteryWidth, textY, metrics.batteryWidth, metrics.batteryHeight},
-                   SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS,
+  const bool showBatteryPercentage =
+      SETTINGS.hideBatteryPercentage != CrossPointSettings::HIDE_BATTERY_PERCENTAGE::HIDE_ALWAYS;
+  const int batteryX = right - metrics.batteryWidth;
+  drawBatteryRight(renderer, Rect{batteryX, textY, metrics.batteryWidth, metrics.batteryHeight}, showBatteryPercentage,
                    numericFontId);
+  drawStationWifiLeftOfBattery(renderer, batteryX, textY, showBatteryPercentage, numericFontId);
 }
