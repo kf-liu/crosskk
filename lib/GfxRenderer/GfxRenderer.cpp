@@ -2718,6 +2718,14 @@ int GfxRenderer::getFontAscenderSize(int fontId) const {
   return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;
 }
 
+int GfxRenderer::getTextLineHeight(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+  const int uiHeight = std::max(1, getLineHeight(fontId));
+  if (!text || text[0] == '\0') return uiHeight;
+  const int face = resolveTextFontId(fontId, text, style);
+  if (face == fontId) return uiHeight;
+  return std::max(uiHeight, std::max(1, getLineHeight(face)));
+}
+
 int GfxRenderer::getLineHeight(int fontId) const {
   // Row height must follow a rebound id (see setPreferredFont()).
   fontId = resolveFontFamilyId(fontId);

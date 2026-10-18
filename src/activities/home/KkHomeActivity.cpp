@@ -28,6 +28,265 @@
 namespace {
 constexpr int kThumbHeight = InxMetrics::values.homeCoverHeight;
 constexpr int kGap = 12;
+constexpr int kTitleAuthorGap = 4;
+constexpr int kHeadingStatsGap = 8;
+constexpr int kMeasureBytes = 180;
+constexpr char kEllipsis[] = "\xE2\x80\xA6";
+constexpr int kMaxCountryMarks = 6;
+
+size_t utf8UnitBytes(const char* text, const size_t available) {
+  if (!text || available == 0) return 0;
+  const auto lead = static_cast<unsigned char>(text[0]);
+  size_t need = 1;
+  if ((lead & 0x80u) == 0) {
+    need = 1;
+  } else if ((lead & 0xE0u) == 0xC0u) {
+    need = 2;
+  } else if ((lead & 0xF0u) == 0xE0u) {
+    need = 3;
+  } else if ((lead & 0xF8u) == 0xF0u) {
+    need = 4;
+  }
+  return need > available ? 1 : need;
+}
+
+bool textFits(const GfxRenderer& renderer, const int fontId, const EpdFontFamily::Style style, const char* text,
+              const size_t begin, const size_t end, const int maxWidth) {
+  if (!text || end < begin || maxWidth <= 0) return false;
+  const size_t length = end - begin;
+  if (length == 0) return true;
+  if (length >= kMeasureBytes) return false;
+  char probe[kMeasureBytes];
+  memcpy(probe, text + begin, length);
+  probe[length] = '\0';
+  return renderer.getTextWidth(fontId, probe, style) <= maxWidth;
+}
+
+// 末行放不下时写成「前缀…」，结果进调用方缓冲，渲染路径不再分配字符串。
+void ellipsizeInto(const GfxRenderer& renderer, const int fontId, const EpdFontFamily::Style style, const char* text,
+                   const int maxWidth, char* out, const size_t outSize) {
+  if (!out || outSize == 0) return;
+  out[0] = '\0';
+  if (!text || !text[0] || maxWidth <= 0 || outSize < sizeof(kEllipsis)) return;
+  const int ellipsisWidth = renderer.getTextWidth(fontId, kEllipsis, style);
+  if (ellipsisWidth > maxWidth) return;
+
+  char probe[kMeasureBytes];
+  size_t used = 0;
+  size_t accepted = 0;
+  const char* cursor = text;
+  while (*cursor && *cursor != '\n' && used + 4 < kMeasureBytes && used + sizeof(kEllipsis) < outSize) {
+    const size_t unit = utf8UnitBytes(cursor, 4);
+    if (unit == 0 || used + unit >= kMeasureBytes) break;
+    memcpy(probe + used, cursor, unit);
+    used += unit;
+    probe[used] = '\0';
+    char measured[kMeasureBytes + sizeof(kEllipsis)];
+    memcpy(measured, probe, used + 1);
+    memcpy(measured + used, kEllipsis, sizeof(kEllipsis));
+    if (renderer.getTextWidth(fontId, measured, style) > maxWidth) break;
+    accepted = used;
+    cursor += unit;
+  }
+  if (accepted == 0) {
+    memcpy(out, kEllipsis, sizeof(kEllipsis));
+    return;
+  }
+  memcpy(out, probe, accepted);
+  memcpy(out + accepted, kEllipsis, sizeof(kEllipsis));
+}
+
+void fitInto(const GfxRenderer& renderer, const int fontId, const EpdFontFamily::Style style, const char* text,
+             const int maxWidth, char* out, const size_t outSize) {
+  if (!out || outSize == 0) return;
+  out[0] = '\0';
+  if (!text || !text[0] || maxWidth <= 0) return;
+  const size_t length = strlen(text);
+  if (length < outSize && renderer.getTextWidth(fontId, text, style) <= maxWidth) {
+    memcpy(out, text, length + 1);
+    return;
+  }
+  ellipsizeInto(renderer, fontId, style, text, maxWidth, out, outSize);
+}
+
+int countCodepoints(const char* begin, const char* end) {
+  int count = 0;
+  while (begin < end) {
+    const size_t unit = utf8UnitBytes(begin, static_cast<size_t>(end - begin));
+    if (unit == 0) break;
+    begin += unit;
+    ++count;
+  }
+  return count;
+}
+
+const char* findBytes(const char* begin, const char* end, const char* mark, const size_t markLen) {
+  if (!begin || !end || !mark || markLen == 0 || begin >= end) return nullptr;
+  for (const char* cursor = begin; cursor + markLen <= end; ++cursor) {
+    if (memcmp(cursor, mark, markLen) == 0) return cursor;
+  }
+  return nullptr;
+}
+
+// 作者元数据里常见的国籍前缀收成「[国家]作者」。没有这段前缀时只保留作者名。
+void normalizeAuthorLine(const char* author, char* out, const size_t outSize) {
+  if (!out || outSize == 0) return;
+  out[0] = '\0';
+  if (!author || !author[0]) return;
+
+  struct Bracket {
+    const char* open;
+    const char* close;
+    uint8_t openLen;
+    uint8_t closeLen;
+  };
+  const Bracket brackets[] = {
+      {"[", "]", 1, 1},
+      {"［", "］", 3, 3},
+      {"【", "】", 3, 3},
+      {"（", "）", 3, 3},
+      {"(", ")", 1, 1},
+  };
+
+  const char* inner = nullptr;
+  const char* close = nullptr;
+  size_t closeLen = 0;
+  for (const Bracket& bracket : brackets) {
+    if (strncmp(author, bracket.open, bracket.openLen) != 0) continue;
+    inner = author + bracket.openLen;
+    const char* limit = inner;
+    for (int scanned = 0; *limit && scanned < 24; ++scanned) ++limit;
+    close = findBytes(inner, limit, bracket.close, bracket.closeLen);
+    closeLen = bracket.closeLen;
+    break;
+  }
+
+  const char* source = author;
+  char normalized[160];
+  if (inner && close && close > inner && countCodepoints(inner, close) <= kMaxCountryMarks) {
+    const char* rest = close + closeLen;
+    while (*rest == ' ' || strncmp(rest, "\xE3\x80\x80", 3) == 0) {
+      if (*rest == ' ') {
+        ++rest;
+      } else {
+        rest += 3;
+      }
+    }
+    size_t used = 0;
+    normalized[0] = '\0';
+    const size_t innerLen = static_cast<size_t>(close - inner);
+    if (used + 1 + innerLen + 1 < sizeof(normalized)) {
+      normalized[used++] = '[';
+      memcpy(normalized + used, inner, innerLen);
+      used += innerLen;
+      normalized[used++] = ']';
+      normalized[used] = '\0';
+      const size_t restLen = strlen(rest);
+      const size_t room = sizeof(normalized) - 1 - used;
+      const size_t copy = std::min(restLen, room);
+      memcpy(normalized + used, rest, copy);
+      used += copy;
+      normalized[used] = '\0';
+      source = normalized;
+    }
+  }
+
+  const size_t length = strlen(source);
+  const size_t copy = std::min(length, outSize - 1);
+  memcpy(out, source, copy);
+  out[copy] = '\0';
+}
+
+struct LineSpan {
+  uint16_t begin = 0;
+  uint16_t end = 0;
+};
+
+// 中文书名通常没有空格。按词换行会把整段当成一个词截断，所以超宽的词再按字切开。
+void wrapTitle(const GfxRenderer& renderer, const char* title, const int maxWidth, const int maxLines, LineSpan* lines,
+               int& lineCount, bool& ellipsis, char* ellipsisText, const size_t ellipsisSize) {
+  lineCount = 0;
+  ellipsis = false;
+  if (ellipsisText && ellipsisSize > 0) ellipsisText[0] = '\0';
+  if (!title || !title[0] || !lines || maxWidth <= 0 || maxLines <= 0) return;
+
+  const size_t length = strlen(title);
+  size_t index = 0;
+  while (index < length && lineCount < maxLines) {
+    while (index < length && title[index] == ' ') ++index;
+    if (index >= length) break;
+    if (title[index] == '\n') {
+      ++index;
+      continue;
+    }
+
+    const size_t lineStart = index;
+    const bool lastLine = lineCount + 1 >= maxLines;
+    if (lastLine) {
+      size_t lineEnd = index;
+      while (lineEnd < length && title[lineEnd] != '\n') ++lineEnd;
+      if (textFits(renderer, UI_12_FONT_ID, EpdFontFamily::BOLD, title, lineStart, lineEnd, maxWidth) &&
+          lineEnd - lineStart <= 65535) {
+        lines[lineCount].begin = static_cast<uint16_t>(lineStart);
+        lines[lineCount].end = static_cast<uint16_t>(lineEnd);
+        ++lineCount;
+      } else if (ellipsisText && ellipsisSize > 0) {
+        char source[kMeasureBytes];
+        size_t used = 0;
+        size_t cursor = lineStart;
+        while (cursor < lineEnd && used + 4 < sizeof(source)) {
+          const size_t unit = utf8UnitBytes(title + cursor, lineEnd - cursor);
+          if (unit == 0 || used + unit >= sizeof(source)) break;
+          memcpy(source + used, title + cursor, unit);
+          used += unit;
+          cursor += unit;
+        }
+        source[used] = '\0';
+        ellipsizeInto(renderer, UI_12_FONT_ID, EpdFontFamily::BOLD, source, maxWidth, ellipsisText, ellipsisSize);
+        ellipsis = ellipsisText[0] != '\0';
+        if (ellipsis) ++lineCount;
+      }
+      break;
+    }
+
+    size_t lineEnd = lineStart;
+    while (index < length && title[index] != '\n') {
+      size_t wordEnd = index;
+      while (wordEnd < length && title[wordEnd] != ' ' && title[wordEnd] != '\n') {
+        const size_t unit = utf8UnitBytes(title + wordEnd, length - wordEnd);
+        if (unit == 0) break;
+        wordEnd += unit;
+      }
+      if (textFits(renderer, UI_12_FONT_ID, EpdFontFamily::BOLD, title, lineStart, wordEnd, maxWidth)) {
+        lineEnd = wordEnd;
+        index = wordEnd;
+        if (index < length && title[index] == ' ') ++index;
+        continue;
+      }
+      if (lineEnd > lineStart) break;
+      size_t glyph = lineStart;
+      while (glyph < wordEnd) {
+        const size_t unit = utf8UnitBytes(title + glyph, length - glyph);
+        if (unit == 0) break;
+        const size_t next = glyph + unit;
+        if (!textFits(renderer, UI_12_FONT_ID, EpdFontFamily::BOLD, title, lineStart, next, maxWidth)) break;
+        glyph = next;
+      }
+      if (glyph == lineStart) {
+        const size_t unit = utf8UnitBytes(title + lineStart, length - lineStart);
+        glyph = lineStart + (unit == 0 ? 1 : unit);
+      }
+      lineEnd = glyph;
+      index = glyph;
+      break;
+    }
+    if (lineEnd <= lineStart || lineEnd - lineStart > 65535) break;
+    lines[lineCount].begin = static_cast<uint16_t>(lineStart);
+    lines[lineCount].end = static_cast<uint16_t>(lineEnd);
+    ++lineCount;
+    if (index < length && title[index] == '\n') ++index;
+  }
+}
 
 const RecentBook* currentBook() {
   for (const auto& book : RECENT_BOOKS.getBooks()) {
@@ -178,14 +437,37 @@ bool paintAreaAveragedCover(const GfxRenderer& renderer, const Bitmap& bitmap, c
   return true;
 }
 
+// 中文会落到比 UI 字号更高的字面上。drawText 会把这块字在 UI 行高里居中，
+// 高出的部分向上越界。排版和绘制都用实际字面高度，并把绘制坐标补回居中偏移。
+int inkLineHeight(const GfxRenderer& renderer, const int fontId, const char* text, const EpdFontFamily::Style style) {
+  return std::max(1, renderer.getTextLineHeight(fontId, text, style));
+}
+
+int inkDrawY(const GfxRenderer& renderer, const int fontId, const char* text, const EpdFontFamily::Style style,
+             const int slotY) {
+  const int uiHeight = renderer.getLineHeight(fontId);
+  const int inkHeight = inkLineHeight(renderer, fontId, text, style);
+  if (inkHeight <= uiHeight) return slotY;
+  return slotY - (uiHeight - inkHeight) / 2;
+}
+
 void drawStat(const GfxRenderer& renderer, const Rect cell, const char* label, const char* value) {
+  if (cell.width <= 0 || cell.height <= 0) return;
   const int innerWidth = std::max(1, cell.width);
-  const GfxRenderer::ClipScope clip(renderer, cell.x, cell.y, innerWidth, std::max(1, cell.height));
-  const int labelHeight = renderer.getLineHeight(SMALL_FONT_ID);
-  const std::string shownLabel = renderer.truncatedText(SMALL_FONT_ID, label, innerWidth);
-  const std::string shownValue = renderer.truncatedText(UI_10_FONT_ID, value, innerWidth, EpdFontFamily::BOLD);
-  renderer.drawText(SMALL_FONT_ID, cell.x, cell.y, shownLabel.c_str());
-  renderer.drawText(UI_10_FONT_ID, cell.x, cell.y + labelHeight + 2, shownValue.c_str(), true, EpdFontFamily::BOLD);
+  const GfxRenderer::ClipScope clip(renderer, cell.x, cell.y, innerWidth, cell.height);
+  char shownLabel[64];
+  char shownValue[32];
+  fitInto(renderer, SMALL_FONT_ID, EpdFontFamily::REGULAR, label, innerWidth, shownLabel, sizeof(shownLabel));
+  fitInto(renderer, UI_10_FONT_ID, EpdFontFamily::BOLD, value, innerWidth, shownValue, sizeof(shownValue));
+  const int labelHeight = inkLineHeight(renderer, SMALL_FONT_ID, shownLabel, EpdFontFamily::REGULAR);
+  const int labelY = inkDrawY(renderer, SMALL_FONT_ID, shownLabel, EpdFontFamily::REGULAR, cell.y);
+  renderer.drawText(SMALL_FONT_ID, cell.x, labelY, shownLabel);
+  const int valueY = cell.y + labelHeight + 2;
+  if (valueY < cell.y + cell.height) {
+    renderer.drawText(UI_10_FONT_ID, cell.x,
+                      inkDrawY(renderer, UI_10_FONT_ID, shownValue, EpdFontFamily::BOLD, valueY), shownValue, true,
+                      EpdFontFamily::BOLD);
+  }
 }
 }  // namespace
 
@@ -265,6 +547,14 @@ void KkHomeActivity::onEnter() {
   coverPrep = CoverPrep::Pending;
   coverPixelWidth = 0;
   coverPixelHeight = 0;
+  titleLineCount = 0;
+  titleEllipsis = false;
+  titleEllipsisText[0] = '\0';
+  authorLine[0] = '\0';
+  titleSlotHeight = 0;
+  authorSlotHeight = 0;
+  headingHeight = 0;
+  bookColumnHeight = 0;
   coverBook[0] = '\0';
   coverFile[0] = '\0';
   wereadTimeKnown = false;
@@ -289,8 +579,55 @@ Rect KkHomeActivity::bookPanel() const {
   const Rect content = pageContentRect();
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int imageHeight = coverPixelHeight > 0 ? coverPixelHeight : kThumbHeight;
-  const int height = std::min(content.height, imageHeight + metrics.contentSidePadding * 2);
+  const int inner = std::max(imageHeight, bookColumnHeight);
+  const int height = std::min(content.height, inner + metrics.contentSidePadding * 2);
   return Rect{content.x, content.y, content.width, std::max(1, height)};
+}
+
+void KkHomeActivity::layoutHeading(const RecentBook* book) {
+  titleLineCount = 0;
+  titleEllipsis = false;
+  titleEllipsisText[0] = '\0';
+  authorLine[0] = '\0';
+  titleSlotHeight = 0;
+  authorSlotHeight = 0;
+  headingHeight = 0;
+  bookColumnHeight = 0;
+  if (!book) return;
+
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const Rect content = pageContentRect();
+  const int pad = metrics.contentSidePadding;
+  const int coverW = coverPixelWidth > 0 ? coverPixelWidth : kThumbHeight * 3 / 5;
+  const int coverH = coverPixelHeight > 0 ? coverPixelHeight : kThumbHeight;
+  const int innerW = std::max(1, content.width - pad * 2);
+  const int statsW = std::max(1, innerW - coverW - kGap);
+  const int maxInner = std::max(1, content.height - pad * 2);
+
+  char normalizedAuthor[160];
+  normalizeAuthorLine(book->author.c_str(), normalizedAuthor, sizeof(normalizedAuthor));
+  fitInto(renderer, UI_10_FONT_ID, EpdFontFamily::REGULAR, normalizedAuthor, statsW, authorLine, sizeof(authorLine));
+
+  const char* title = book->title.empty() ? book->path.c_str() : book->title.c_str();
+  titleSlotHeight = inkLineHeight(renderer, UI_12_FONT_ID, title, EpdFontFamily::BOLD);
+  authorSlotHeight =
+      authorLine[0] ? inkLineHeight(renderer, UI_10_FONT_ID, authorLine, EpdFontFamily::REGULAR) : 0;
+  const int authorBlock = authorSlotHeight > 0 ? kTitleAuthorGap + authorSlotHeight : 0;
+  // 书名和作者先占高度。四个指标只用封面列里剩下的区域，不再反过来挤占标题。
+  const int roomForTitle = maxInner - kHeadingStatsGap - authorBlock;
+  const int fittedLines = roomForTitle > 0 ? roomForTitle / titleSlotHeight : 1;
+  const int maxLines = std::clamp(fittedLines, 1, kMaxTitleLines);
+  LineSpan lines[kMaxTitleLines];
+  wrapTitle(renderer, title, statsW, maxLines, lines, titleLineCount, titleEllipsis, titleEllipsisText,
+            sizeof(titleEllipsisText));
+  const int storedLines = std::min(titleLineCount, kMaxTitleLines);
+  for (int i = 0; i < storedLines; ++i) {
+    titleSpans[i].begin = lines[i].begin;
+    titleSpans[i].end = lines[i].end;
+  }
+  titleLineCount = storedLines;
+  headingHeight = titleLineCount * titleSlotHeight + authorBlock + kHeadingStatsGap;
+  bookColumnHeight = std::max(coverH, headingHeight);
 }
 
 Rect KkHomeActivity::readingPreviewRect() const {
@@ -474,12 +811,13 @@ void KkHomeActivity::loop() {
 
 void KkHomeActivity::render(RenderLock&&) {
   const RecentBook* book = currentBook();
-  if (book) ensureReadingPreview(*book, readingPreviewRect().height);
   const bool coverReady = book && rememberExistingCover(*book);
   HalFile cover;
   const bool coverOpen = coverReady && Storage.openFileForRead("KK", coverFile, cover);
 
   const auto present = [&](Bitmap* bitmap, bool grayCover, int dstW, int dstH, CoverScratch* scratch) {
+    layoutHeading(book);
+    if (book) ensureReadingPreview(*book, readingPreviewRect().height);
     const auto& metrics = UITheme::getInstance().getMetrics();
     int coverX = 0;
     int coverY = 0;
@@ -514,9 +852,34 @@ void KkHomeActivity::render(RenderLock&&) {
         const int statsX = innerX + coverW + kGap;
         const int statsW = std::max(1, innerX + innerW - statsX);
         const char* title = book->title.empty() ? book->path.c_str() : book->title.c_str();
-        const int titleHeight = renderer.getLineHeight(UI_12_FONT_ID);
-        const std::string shownTitle = renderer.truncatedText(UI_12_FONT_ID, title, statsW, EpdFontFamily::BOLD);
-        renderer.drawText(UI_12_FONT_ID, statsX, innerY, shownTitle.c_str(), true, EpdFontFamily::BOLD);
+        const int headingInk = std::max(1, headingHeight - kHeadingStatsGap);
+        {
+          const GfxRenderer::ClipScope clip(renderer, statsX, innerY, statsW, headingInk);
+          int titleY = innerY;
+          for (int line = 0; line < titleLineCount; ++line) {
+            char shown[kMeasureBytes];
+            const char* text = shown;
+            if (titleEllipsis && line + 1 == titleLineCount) {
+              text = titleEllipsisText;
+            } else {
+              const size_t begin = titleSpans[line].begin;
+              const size_t end = titleSpans[line].end;
+              const size_t length = end > begin ? std::min(end - begin, sizeof(shown) - 1) : 0;
+              memcpy(shown, title + begin, length);
+              shown[length] = '\0';
+            }
+            renderer.drawText(UI_12_FONT_ID, statsX,
+                              inkDrawY(renderer, UI_12_FONT_ID, text, EpdFontFamily::BOLD, titleY), text, true,
+                              EpdFontFamily::BOLD);
+            titleY += titleSlotHeight;
+          }
+          if (authorLine[0]) {
+            const int authorY = titleY + kTitleAuthorGap;
+            renderer.drawText(UI_10_FONT_ID, statsX,
+                              inkDrawY(renderer, UI_10_FONT_ID, authorLine, EpdFontFamily::REGULAR, authorY),
+                              authorLine);
+          }
+        }
 
         const ReadingBookStats* stats = READING_STATS.findBook(book->path);
         const uint64_t totalMs = stats ? stats->totalReadingMs : 0;
@@ -532,18 +895,22 @@ void KkHomeActivity::render(RenderLock&&) {
         snprintf(progressText, sizeof(progressText), "%u%%",
                  static_cast<unsigned>(stats ? stats->lastProgressPercent : 0));
 
-        const int gridY = innerY + titleHeight + 8;
-        const int gridH = std::max(1, coverH - titleHeight - 8);
-        const int cellW = std::max(1, (statsW - kGap) / 2);
-        const int cellH = std::max(1, (gridH - kGap) / 2);
-        const char* statLabels[] = {tr(STR_KK_LOCAL_TIME), tr(STR_KK_UNREPORTED_TIME), tr(STR_KK_WEREAD_TIME),
-                                    tr(STR_KK_TOTAL_PROGRESS)};
-        const char* values[] = {totalText, unreportedText, wereadText, progressText};
-        for (int i = 0; i < 4; ++i) {
-          const int column = i % 2;
-          const int row = i / 2;
-          drawStat(renderer, Rect{statsX + column * (cellW + kGap), gridY + row * (cellH + kGap), cellW, cellH},
-                   statLabels[i], values[i]);
+        const int gridY = innerY + headingHeight;
+        const int columnH = std::max(1, panel.height - pad * 2);
+        const int gridH = columnH - headingHeight;
+        if (gridH > kGap) {
+          const GfxRenderer::ClipScope statsClip(renderer, statsX, gridY, statsW, gridH);
+          const int cellW = std::max(1, (statsW - kGap) / 2);
+          const int cellH = std::max(1, (gridH - kGap) / 2);
+          const char* statLabels[] = {tr(STR_KK_LOCAL_TIME), tr(STR_KK_UNREPORTED_TIME), tr(STR_KK_WEREAD_TIME),
+                                      tr(STR_KK_TOTAL_PROGRESS)};
+          const char* values[] = {totalText, unreportedText, wereadText, progressText};
+          for (int i = 0; i < 4; ++i) {
+            const int column = i % 2;
+            const int row = i / 2;
+            drawStat(renderer, Rect{statsX + column * (cellW + kGap), gridY + row * (cellH + kGap), cellW, cellH},
+                     statLabels[i], values[i]);
+          }
         }
       }
 
