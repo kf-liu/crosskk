@@ -113,6 +113,9 @@ struct BoxHit {
   uint16_t index = 0;
 };
 
+// 点开或向后翻时，原文先出来，评论在后台到齐后再换这一态。
+enum class Load : uint8_t { Ready = 0, Loading, Failed, Offline, Empty };
+
 struct Panel {
   bool open = false;
   bool full = false;
@@ -139,6 +142,9 @@ struct Panel {
   uint8_t hitCount = 0;
   BoxHit hits[12] = {};
   WeReadComment::StoredComment comment;
+  Load load = Load::Ready;
+  // 这次打开已经交给后台。worker 正忙时先记着，空闲后再排队，避免把请求丢掉。
+  bool fetchQueued = false;
   // 一条评论最长 2KB。静态缓冲给灰阶各遍复用，不放进阅读栈。
   char text[WeReadComment::kMaxCommentBytes] = {};
   // 当前页划线原文。阅读页画完就丢了，点开时拷进这里。
@@ -270,8 +276,17 @@ bool scrollComments(Panel& view, const bool forward) {
     view.scrollY = view.nextScroll;
     return true;
   }
-  if (view.comment.hasMore && WeReadHttpClient::networkReady()) return queueMore(view);
-  return false;
+  // 正在拉时翻页只保持加载态，不在阅读循环里等网络。
+  if (view.load == Load::Loading) return false;
+  const bool wantFetch = view.comment.hasMore || view.load == Load::Failed || view.load == Load::Empty;
+  if (!wantFetch) return false;
+  if (!WeReadHttpClient::networkReady()) {
+    view.load = Load::Offline;
+    return true;
+  }
+  view.load = Load::Loading;
+  view.fetchQueued = queueMore(view);
+  return true;
 }
 
 bool pageFullText(Panel& view, const bool forward) {
@@ -1083,6 +1098,31 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   return phaseChanged;
 }
 
+void showRange(Panel& view) {
+  copyQuote(view.start, view.end, view.quote, sizeof(view.quote));
+  view.quoteTotal = countCodepoints(view.quote);
+  view.fetchQueued = false;
+  const bool stored = readPanelText(view, 0);
+  if (stored && view.comment.count > 0) {
+    view.load = Load::Ready;
+  } else if (!WeReadHttpClient::networkReady()) {
+    if (!stored) {
+      view.comment = {};
+      view.text[0] = '\0';
+    }
+    view.load = stored ? Load::Empty : Load::Offline;
+  } else if (stored) {
+    view.load = Load::Empty;
+  } else {
+    view.comment = {};
+    view.text[0] = '\0';
+    view.load = Load::Loading;
+    view.fetchQueued = queueMore(view);
+  }
+  underlayReady = false;
+  markPanel(true);
+}
+
 }  // namespace
 
 bool syncPage(const char* bookId, const Epub& epub, const int spineIndex, const int pageNumber,
@@ -1114,13 +1154,40 @@ const char* chapterStatus() {
 bool takeDirty() {
   if (!dirty.exchange(false)) return false;
   pageComments().valid = false;
-  if (moreState.load() == kMoreFailed) moreState.store(kMoreIdle);
+  const bool moreFailed = moreState.load() == kMoreFailed;
+  if (moreFailed) moreState.store(kMoreIdle);
   Panel& view = panel();
   if (!view.open) return true;
+  if (view.load != Load::Loading && view.load != Load::Ready && view.load != Load::Failed) return true;
   const uint32_t index = view.full ? view.index : 0;
   const uint32_t previous = view.comment.count;
-  if (!readPanelText(view, index) && previous > 0) readPanelText(view, 0);
+  bool got = readPanelText(view, index);
+  if (!got && previous > 0) got = readPanelText(view, 0);
+  if (!got || view.comment.count == 0) {
+    // 还没轮到这次请求，或完成的是别的范围。保持加载，空闲后再排。
+    if (view.load != Load::Loading || moreState.load() == kMoreWanted || !view.fetchQueued) return true;
+    view.fetchQueued = false;
+    if (moreFailed) view.load = Load::Failed;
+    else if (!WeReadHttpClient::networkReady()) view.load = Load::Offline;
+    else view.load = Load::Empty;
+    return true;
+  }
+  if (view.load == Load::Loading && moreFailed) view.load = Load::Failed;
+  else if (view.load == Load::Loading) view.load = Load::Ready;
+  view.fetchQueued = false;
   return true;
+}
+
+bool pumpPanel() {
+  Panel& view = panel();
+  if (!view.open || view.load != Load::Loading || view.fetchQueued) return false;
+  if (moreState.load() != kMoreIdle) return false;
+  if (!WeReadHttpClient::networkReady()) {
+    view.load = Load::Offline;
+    return true;
+  }
+  view.fetchQueued = queueMore(view);
+  return false;
 }
 
 void drawForBook(GfxRenderer& renderer, const int fontId, const Page& page, const int xOffset, const int yOffset,
@@ -1147,15 +1214,8 @@ bool openAt(const int x, const int y) {
     view.chapterUid = comments.chapterUid;
     view.start = comments.ranges[segment.rangeIndex].nativeStart;
     view.end = comments.ranges[segment.rangeIndex].nativeEnd;
-    if (!readPanelText(view, 0)) {
-      view.open = false;
-      return false;
-    }
-    copyQuote(view.start, view.end, view.quote, sizeof(view.quote));
-    view.quoteTotal = countCodepoints(view.quote);
     // 下一帧先把阅读页画进帧缓冲，再盖弹窗。不能直接画在灰阶残帧上。
-    underlayReady = false;
-    markPanel(true);
+    showRange(view);
     return true;
   }
   return false;
@@ -1204,14 +1264,7 @@ bool openStored(const uint32_t nativeStart, const uint32_t nativeEnd) {
   view.chapterUid = comments.chapterUid;
   view.start = nativeStart;
   view.end = nativeEnd;
-  if (!readPanelText(view, 0)) {
-    view.open = false;
-    return false;
-  }
-  copyQuote(view.start, view.end, view.quote, sizeof(view.quote));
-  view.quoteTotal = countCodepoints(view.quote);
-  underlayReady = false;
-  markPanel(true);
+  showRange(view);
   return true;
 }
 
@@ -1440,6 +1493,27 @@ void drawPanel(GfxRenderer& renderer) {
     renderer.fillRect(innerX, quoteTop, 2, quoteBottom - quoteTop, true);
   }
 
+  if (view.comment.count == 0) {
+    const char* status = tr(STR_WEREAD_HIGHLIGHT_NO_COMMENTS);
+    switch (view.load) {
+      case Load::Loading:
+        status = tr(STR_LOADING_POPUP);
+        break;
+      case Load::Failed:
+        status = tr(STR_WEREAD_COMMENTS_FAILED);
+        break;
+      case Load::Offline:
+        status = tr(STR_WEREAD_PASSAGE_COMMENT_OFFLINE);
+        break;
+      case Load::Empty:
+      case Load::Ready:
+        break;
+    }
+    place(8, [](const int) {});
+    place(smallHeight, [&](const int y) { renderer.drawText(fontId, innerX, y, status); });
+    return;
+  }
+
   uint32_t marks = 0;
   uint32_t comments = 0;
   passageStats(view, marks, comments);
@@ -1509,7 +1583,7 @@ void drawPanel(GfxRenderer& renderer) {
     }
     place(4, [](const int) {});
   }
-  if (view.nextScroll < 0 && view.comment.count > 0 && !view.comment.hasMore) {
+  if (view.nextScroll < 0 && !view.comment.hasMore && view.load != Load::Loading && view.load != Load::Failed) {
     const char* endMark = tr(STR_WEREAD_PASSAGE_COMMENT_END);
     place(8, [](const int) {});
     place(smallHeight, [&](const int y) {
@@ -1517,9 +1591,12 @@ void drawPanel(GfxRenderer& renderer) {
       const int x = innerX + (innerW > markWidth ? (innerW - markWidth) / 2 : 0);
       renderer.drawText(fontId, x, y, endMark);
     });
-  } else if (view.nextScroll < 0 && view.comment.hasMore) {
-    const char* hint = WeReadHttpClient::networkReady() ? tr(STR_WEREAD_PASSAGE_COMMENT_MORE)
-                                                        : tr(STR_WEREAD_PASSAGE_COMMENT_OFFLINE);
+  } else if (view.nextScroll < 0) {
+    const char* hint = tr(STR_WEREAD_PASSAGE_COMMENT_MORE);
+    if (view.load == Load::Loading) hint = tr(STR_LOADING_POPUP);
+    else if (view.load == Load::Failed) hint = tr(STR_WEREAD_COMMENTS_FAILED);
+    else if (view.load == Load::Offline || !WeReadHttpClient::networkReady())
+      hint = tr(STR_WEREAD_PASSAGE_COMMENT_OFFLINE);
     place(smallHeight, [&](const int y) { renderer.drawText(fontId, innerX, y, hint); });
   }
 }

@@ -17,6 +17,9 @@ bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumb
 // 后台写入了新评论。阅读循环用来刷新画面，本身不发请求。
 bool takeDirty();
 
+// 弹层还在加载、后台又空了出来时补一次排队。不发网络，阅读循环每圈调用。
+bool pumpPanel();
+
 // 有他人评论的片段画点状下划线。坐标和划线相同，灰阶各遍复用这一页的结果。
 void drawForBook(GfxRenderer& renderer, int fontId, const Page& page, int xOffset, int yOffset, const char* bookId,
                  const Epub& epub, int spineIndex);

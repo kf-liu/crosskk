@@ -1188,7 +1188,9 @@ void EpubReaderActivity::loop() {
   pollHighlightJobs();
   pollLiveReading();
   refreshBusyFooter();
-  if (WeReadCommentOverlay::takeDirty()) requestUpdate();
+  const bool commentsChanged = WeReadCommentOverlay::takeDirty();
+  const bool panelChanged = WeReadCommentOverlay::pumpPanel();
+  if (commentsChanged || panelChanged) requestUpdate();
   if (wereadBookId_[0] && epub && section && section->currentPage >= 0) {
     const int page = section->currentPage;
     uint32_t pageStart = 0;
