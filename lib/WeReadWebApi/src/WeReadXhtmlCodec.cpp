@@ -933,6 +933,61 @@ bool copyVisibleTextInFile(const std::string& path, const uint32_t start, const 
   return true;
 }
 
+// 一页的词对齐只取决于章节文件和这一页的可见偏移。灰阶每个条带、两层平面、
+// 还有预热那一趟都会再画这一页。不缓存的话，Metalio 翻一页要把章节文件读十几遍。
+// 640 个词大约 4KB，静态放着，不进阅读任务的栈，也不按页分配。
+constexpr uint16_t kMaxCachedPageWords = 640;
+constexpr size_t kAlignCachePathBytes = 256;
+
+struct PageAlignCache {
+  char path[kAlignCachePathBytes] = {};
+  uint32_t pageStart = 0;
+  uint16_t count = 0;
+  bool valid = false;
+  uint32_t starts[kMaxCachedPageWords] = {};
+  uint16_t spans[kMaxCachedPageWords] = {};
+};
+
+PageAlignCache& pageAlignCache() {
+  static PageAlignCache cache;
+  return cache;
+}
+
+struct AlignRecord {
+  PageAlignCache* cache = nullptr;
+  void (*onWord)(uint32_t, uint16_t, void*) = nullptr;
+  bool overflow = false;
+};
+
+AlignRecord* activeRecord = nullptr;
+
+void cachingOnWord(const uint32_t start, const uint16_t span, void* context) {
+  AlignRecord* record = activeRecord;
+  if (!record || !record->onWord) return;
+  if (record->cache && record->cache->count < kMaxCachedPageWords) {
+    record->cache->starts[record->cache->count] = start;
+    record->cache->spans[record->cache->count] = span;
+    record->cache->count++;
+  } else {
+    record->overflow = true;
+  }
+  record->onWord(start, span, context);
+}
+
+bool replayPageAlign(const std::string& path, const uint32_t pageVisibleStart, const char* (*nextWord)(void*),
+                     void (*onWord)(uint32_t, uint16_t, void*), void* context) {
+  const PageAlignCache& cache = pageAlignCache();
+  if (!cache.valid || cache.pageStart != pageVisibleStart || strcmp(cache.path, path.c_str()) != 0) return false;
+  for (uint16_t i = 0; i < cache.count; ++i) {
+    // 和 startAlignedWord 一样：空词跳过，不占一条对齐结果。
+    const char* word = nextWord(context);
+    while (word && !word[0]) word = nextWord(context);
+    if (!word) break;
+    onWord(cache.starts[i], cache.spans[i], context);
+  }
+  return true;
+}
+
 }  // namespace
 
 bool writeLiteral(HalFile& output, const char* text) {
@@ -1098,7 +1153,29 @@ bool nativeOffsetsToVisible(const std::string& path, const uint32_t* nativeOffse
 bool alignRenderedWords(const std::string& path, const uint32_t pageVisibleStart,
                         const char* (*nextWord)(void* context),
                         void (*onWord)(uint32_t start, uint16_t span, void* context), void* context) {
-  return alignRenderedWordsInFile(path, pageVisibleStart, nextWord, onWord, context);
+  if (path.empty() || !nextWord || !onWord) return false;
+  if (replayPageAlign(path, pageVisibleStart, nextWord, onWord, context)) return true;
+
+  PageAlignCache& cache = pageAlignCache();
+  cache.valid = false;
+  cache.count = 0;
+  cache.pageStart = pageVisibleStart;
+  cache.path[0] = '\0';
+  const bool cacheable = path.size() + 1 <= sizeof(cache.path);
+  if (cacheable) memcpy(cache.path, path.c_str(), path.size() + 1);
+
+  AlignRecord record;
+  record.cache = cacheable ? &cache : nullptr;
+  record.onWord = onWord;
+  activeRecord = &record;
+  const bool ok = alignRenderedWordsInFile(path, pageVisibleStart, nextWord, cachingOnWord, context);
+  activeRecord = nullptr;
+  cache.valid = ok && cacheable && !record.overflow;
+  if (!cache.valid) {
+    cache.count = 0;
+    cache.path[0] = '\0';
+  }
+  return ok;
 }
 
 bool copyVisibleText(const std::string& path, const uint32_t start, const uint32_t end, char* dest,
