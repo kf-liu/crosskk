@@ -502,9 +502,10 @@ void EpubReaderActivity::openWeReadHighlightConfirm() {
   overlayPopup.showMessage(tr(STR_WEREAD_HIGHLIGHT), body, options, 2, 0, [this](const int index) {
     if (index == 0) {
       submitWeReadHighlight();
-    } else {
-      highlightSelectPhase_ = HighlightSelectPhase::AwaitEnd;
+      return;
     }
+    // 取消离开划线。点外面或返回仍只关确认框，选择留着。
+    cancelWeReadHighlightSelect();
   });
   highlightSheetOpen_ = overlayPopup.isActive();
   requestUpdate();
