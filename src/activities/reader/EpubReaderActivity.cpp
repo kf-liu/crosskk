@@ -1184,7 +1184,8 @@ void EpubReaderActivity::loop() {
 
 #ifdef ENABLE_CHINESE_VERSION
   if (maybeOfferCompleteChineseFont()) return;
-  WeReadBackgroundSync::setPaused(section && section->isBuilding());
+  // 分页经常要到整章结束。进度同步和心跳不跟着等，否则阅读过程中既不上报时长，也不上传进度。
+  WeReadBackgroundSync::setPaused(false);
   pollHighlightJobs();
   pollLiveReading();
   refreshBusyFooter();
@@ -1205,13 +1206,15 @@ void EpubReaderActivity::loop() {
   }
 #endif
 
-  if (wifiCornerShown_ >= 0 && overlay == Overlay::None && section && !section->isBuilding() && !RenderLock::peek() &&
-      NetworkStartup::stationConnected() != (wifiCornerShown_ != 0)) {
+  if (wifiShown_ >= 0 && overlay == Overlay::None && section && !section->isBuilding() && !RenderLock::peek() &&
+      NetworkStartup::stationConnected() != (wifiShown_ != 0)) {
     RenderLock lock(RenderLock::Mode::Try);
     if (lock.ownsLock()) {
-      GUI.drawReaderWifiCorner(renderer, true);
+      const int y = std::max(0, UITheme::getStatusBarTextOrigin(renderer, 0));
+      renderer.fillRect(0, y, renderer.getScreenWidth(), renderer.getScreenHeight() - y, false);
+      renderStatusBar();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-      wifiCornerShown_ = NetworkStartup::stationConnected() ? 1 : 0;
+      wifiShown_ = NetworkStartup::stationConnected() ? 1 : 0;
     }
   }
 
@@ -2234,7 +2237,7 @@ bool EpubReaderActivity::stepLiveReading() {
 }
 
 void EpubReaderActivity::pollLiveReading() {
-  liveReadingPaused.store(section && section->isBuilding());
+  liveReadingPaused.store(false);
 #if !defined(SIMULATOR)
   if (wereadBookId_[0] != '\0' && NetworkStartup::smartOnlineReading()) ensureLiveReadingTask();
   // 锁只包住登记。拿不到就等下一轮，翻页不等 HTTPS。
@@ -2264,8 +2267,8 @@ void EpubReaderActivity::pollLiveReading() {
   } else if (wereadHeartbeatDueMs_ == 0) {
     noteReadingTime(false);
     wereadHeartbeatDueMs_ = millis() + intervalMs;
-  } else if (static_cast<long>(millis() - wereadHeartbeatDueMs_) < 0 || (section && section->isBuilding())) {
-    // 还没到点，或这一章还在分页。这一拍已经结束，底部回到章节名。
+  } else if (static_cast<long>(millis() - wereadHeartbeatDueMs_) < 0) {
+    // 还没到点。这一拍已经结束，任务状态先收掉。
     noteReadingTime(false);
   } else {
     if (!wereadHeartbeat_) {
@@ -2297,6 +2300,8 @@ void EpubReaderActivity::pollLiveReading() {
         wereadHeartbeatDueMs_ = millis() + intervalMs;
       } else {
         wake = wereadHeartbeat_->active();
+        // 这一拍已经交出去。状态先亮，wrBeat 再真正发出去。
+        if (wake) noteReadingTime(true);
       }
     }
   }
@@ -2507,7 +2512,7 @@ bool EpubReaderActivity::pollWeReadBackground() {
   if (progressChoiceOpen_ || overlayPopup.isActive() || overlay != Overlay::None) return false;
   if (highlightSelectPhase_ != HighlightSelectPhase::Idle) return false;
   if (WeReadCommentOverlay::panelOpen()) return false;
-  if (section && section->isBuilding()) return false;
+  // 分页可能要很久。选择框不放下，进度就停在 Choice，心跳也起不来。
 
   WeReadBackgroundSync::Choice choice;
   if (!WeReadBackgroundSync::takeChoice(choice)) return false;
@@ -4208,8 +4213,7 @@ void EpubReaderActivity::renderStatusBar() const {
 
   GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, true, currentPageBookmarked,
                     section ? section->isBuilding() : false);
-  GUI.drawReaderWifiCorner(renderer);
-  wifiCornerShown_ = NetworkStartup::stationConnected() ? 1 : 0;
+  wifiShown_ = NetworkStartup::stationConnected() ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

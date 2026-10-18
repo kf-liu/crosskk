@@ -268,27 +268,23 @@ void drawWifiGlyph(const GfxRenderer& renderer, const int x, const int y) {
     }
   }
 }
-}  // namespace
 
-void BaseTheme::drawReaderWifiCorner(const GfxRenderer& renderer, const bool clearSlot) const {
-  int top = 0;
-  int right = 0;
-  int bottom = 0;
-  int left = 0;
-  renderer.getOrientedViewableTRBL(&top, &right, &bottom, &left);
-  (void)bottom;
-  (void)left;
-  constexpr int pad = 2;
-  // 底边停在正文边距上，默认边距装得下，不盖第一行。
-  const int contentTop = top + static_cast<int>(SETTINGS.screenMargin);
-  int y = contentTop - kWifiMarkSize;
-  if (y < top + pad) y = top + pad;
-  const int x = renderer.getScreenWidth() - right - pad - kWifiMarkSize;
-  if (x < 0 || y < 0) return;
-  const bool connected = NetworkStartup::stationConnected();
-  if (clearSlot || connected) renderer.fillRect(x, y, kWifiMarkSize, kWifiMarkSize, false);
-  if (connected) drawWifiGlyph(renderer, x, y);
+// 缩进电池图标那么大的方格。0 位是墨水，和 drawWifiGlyph 一样。
+void drawWifiGlyphBox(const GfxRenderer& renderer, const int x, const int y, const int side) {
+  if (side <= 0) return;
+  const freeink::Icon& icon = icon_wifi_24;
+  const int stride = (icon.w + 7) / 8;
+  for (int row = 0; row < side; ++row) {
+    const int srcRow = row * icon.h / side;
+    for (int column = 0; column < side; ++column) {
+      const int srcColumn = column * icon.w / side;
+      if ((icon.bits[srcRow * stride + srcColumn / 8] & (0x80U >> (srcColumn % 8))) == 0) {
+        renderer.drawPixel(x + column, y + row, true);
+      }
+    }
+  }
 }
+}  // namespace
 
 void BaseTheme::drawStationWifiLeftOfBattery(const GfxRenderer& renderer, const int batteryX, const int rowY,
                                              const bool showPercentage, const int numericFontId) const {
@@ -1248,6 +1244,15 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     }
 
     leftClusterWidth += batteryWidth;
+
+    // 只在已经连上时占位，大小和电池图标一样，紧挨在电量右边。
+    if (NetworkStartup::stationConnected()) {
+      const int gap = UiHighDpiProfile::enabled ? 6 : batteryPercentSpacing;
+      const int side = metrics.batteryHeight;
+      const int iconY = textY + (UiHighDpiProfile::enabled ? 8 : 6);
+      drawWifiGlyphBox(renderer, leftClusterX + leftClusterWidth + gap, iconY, side);
+      leftClusterWidth += gap + side;
+    }
   }
 
   // Draw the system clock on every board; an external RTC is optional.

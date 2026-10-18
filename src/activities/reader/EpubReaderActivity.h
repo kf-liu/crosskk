@@ -338,8 +338,8 @@ class EpubReaderActivity final : public ReaderActivity {
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
-  // 阅读页右上角 Wi-Fi 标。-1 还没画过这一页，0 没标，1 有标。
-  mutable int8_t wifiCornerShown_ = -1;
+  // 阅读页状态栏电量旁的 Wi-Fi 标。-1 还没画过这一页，0 没标，1 有标。
+  mutable int8_t wifiShown_ = -1;
   void applyOrientation(uint8_t orientation);
   void applyInitialOrientation() override;
   // The orientation the current layout was built for. The control center's

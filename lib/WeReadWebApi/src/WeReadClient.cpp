@@ -2383,7 +2383,11 @@ Error Operation::renewSession() {
   if (error != Error::Ok) return error;
   if (responseStatus_ != 200 || !context.rootClosed || context.errorCode != 0 || !context.succeed ||
       !session_.valid()) {
-    WeReadStore::clearSession();
+    // 续期失败只放弃这一次请求。磁盘上的登录态留着，和划线续期一样，不因为一次
+    // 协议或网络抖动把用户登出。
+    LOG_ERR("WR", "session renewal failed: status=%d code=%d", responseStatus_, context.errorCode);
+    WeReadStore::Session stored;
+    if (WeReadStore::loadSession(stored)) session_ = stored;
     return Error::SessionExpired;
   }
   return WeReadStore::saveSession(session_) ? Error::Ok : Error::SdCard;
@@ -3801,7 +3805,6 @@ Operation::Event Operation::step(const WeReadStore::WorkCallback callback, void*
       }
       if (error == Error::Network) return handleRequestError(error, Phase::Renew);
       if (error == Error::SdCard) return fail(error);
-      WeReadStore::clearSession();
       if (kind_ == Kind::ProgressSync) return fail(Error::SessionExpired);
       if (loginRecoveryAttempted_) return fail(Error::SessionExpired);
       loginRecoveryAttempted_ = true;
