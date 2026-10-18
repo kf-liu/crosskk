@@ -759,6 +759,13 @@ void notifyWorker() {
   if (worker) xTaskNotifyGive(worker);
 }
 
+bool readerLoggedIn() {
+  WeReadStore::Session session;
+  const bool loggedIn = WeReadStore::loadSession(session) && session.valid();
+  session.clear();
+  return loggedIn;
+}
+
 bool queueMore(const Panel& view) {
   if (moreState.load() != kMoreIdle) return false;
   lockState();
@@ -993,7 +1000,8 @@ bool pickWork(Assignment& work) {
       } else {
         job().fetch = false;
         round().refreshStored = false;
-        round().phase = hit.anyFailed ? Phase::Failed : Phase::Idle;
+        // 这一轮已经结束。失败只留下文件，底部回到章节名，不把「加载失败」停在状态栏。
+        round().phase = Phase::Idle;
         dirty.store(true);
         unlockState();
         if (!hit.anyFailed) LOG_INF("WR", "本章评论已拉完");
@@ -1094,17 +1102,21 @@ bool stepOnce() {
     }
     Round& state = round();
     if (!ok) {
-      if (WeReadHttpClient::networkReady()) {
+      const bool onlineNow = WeReadHttpClient::networkReady();
+      if (onlineNow) {
         WeReadStore::Session session;
         if (!WeReadStore::loadSession(session) || !session.valid()) state.sessionMissing = true;
         else state.underlinesFailed = true;
+        session.clear();
       }
-      // 这一轮已经试过。停在失败，不在本章里马上再拉；完成时间去掉，下次进入再试。
-      state.phase = Phase::Failed;
+      // 这一轮已经结束。不在本章马上再拉。状态栏回到章节名，进行中的标记当场清掉。
       state.refreshStored = false;
       job().fetch = false;
+      state.phase = (!onlineNow && !state.sessionMissing) ? Phase::Offline : Phase::Idle;
       unlockState();
       WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+      noteCommentFetch(false);
+      dirty.store(true);
       return false;
     }
     state.underlinesReady = true;
@@ -1208,7 +1220,10 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   const bool bounds = pageNativeBounds(path, pageStart, pageEnd, nativeStart, nativeEnd);
   const bool fresh = chapterFetchFresh(bookId, chapterUid);
   const bool haveCandidates = WeReadComment::candidatesReady(bookId, chapterUid);
-  const bool blocked = !online || sessionMissing;
+  // 在线时以卡上的会话为准。未登录不发请求，也不把失败写进状态栏。
+  bool noSession = sessionMissing;
+  if (online && (!fresh || honorStaleRefresh)) noSession = !readerLoggedIn();
+  const bool blocked = !online || noSession;
 
   char abandonedId[64] = {};
   uint32_t abandonedUid = 0;
@@ -1241,12 +1256,14 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
     state.phase = Phase::Idle;
     LOG_INF("WR", "本章评论 48 小时内已拉完，跳过");
   } else if (blocked) {
+    state.sessionMissing = noSession;
     state.underlinesReady = haveCandidates;
     state.refreshStored = false;
     current.fetch = false;
-    if (sessionMissing) state.phase = Phase::Failed;
+    if (noSession) state.phase = Phase::Idle;
     else state.phase = haveCandidates ? Phase::Idle : Phase::Offline;
   } else {
+    state.sessionMissing = false;
     state.underlinesReady = false;
     state.underlinesFailed = false;
     state.refreshStored = true;
@@ -1309,9 +1326,9 @@ void refetchChapter() {
   strncpy(bookId, state.bookId, sizeof(bookId) - 1);
   bookId[sizeof(bookId) - 1] = '\0';
   const uint32_t chapterUid = state.chapterUid;
-  const bool sessionMissing = state.sessionMissing;
   unlockState();
 
+  const bool loggedIn = readerLoggedIn();
   const bool online = WeReadHttpClient::networkReady();
   lockState();
   if (!state.haveChapter || state.chapterUid != chapterUid ||
@@ -1320,12 +1337,13 @@ void refetchChapter() {
     return;
   }
   Job& current = job();
+  state.sessionMissing = !loggedIn;
   state.underlinesReady = false;
   state.underlinesFailed = false;
   state.refreshStored = true;
   current.generation++;
-  current.fetch = online && !sessionMissing;
-  if (sessionMissing) state.phase = Phase::Failed;
+  current.fetch = online && loggedIn;
+  if (!loggedIn) state.phase = Phase::Idle;
   else if (!online) state.phase = Phase::Offline;
   else state.phase = Phase::Loading;
   const bool fetch = current.fetch;
