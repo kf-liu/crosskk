@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
-// 进行中的后台动作。下拉控制中心在快捷按钮下方的任务区列出全部。阅读页底部保持
-// 章节或书名。顶栏只放时钟、电量，以及已经连上的 Wi-Fi 标。
+// 进行中的后台动作。同步进度和同步时长列在下拉控制中心快捷按钮下方，结束就收回。
+// 整章评论拉取不登记。阅读页底部保持章节或书名。顶栏只放时钟、电量，以及已经连上的 Wi-Fi 标。
 namespace BackgroundWork {
 
 enum class Kind : uint8_t { FetchComments, SyncProgress, SyncReadingTime, Count };

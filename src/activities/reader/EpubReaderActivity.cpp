@@ -4185,8 +4185,7 @@ void EpubReaderActivity::renderStatusBar() const {
   std::string title;
   int textYOffset = 0;
   const auto sb = SETTINGS.statusBarSpec();
-  // 拉取评论、同步进度、同步时长可能要很久，结束前也会占着这一行。底部只留章节名，
-  // 这些任务改到下拉控制中心去看。
+  // 底部只留章节名。同步进度和同步时长列在下拉控制中心，整章评论不占任务区。
 
   if (automaticPageTurnActive) {
     title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(60 * 1000 / pageTurnDuration);

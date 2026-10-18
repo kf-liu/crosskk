@@ -1100,7 +1100,8 @@ bool stepOnce() {
     unlockState();
     return false;
   }
-  noteCommentFetch(true);
+  // 整章要拉很多段，不把「正在拉取评论」停在控制中心里。
+  noteCommentFetch(false);
   if (work.kind == WorkKind::Underlines) {
     const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid);
     lockState();

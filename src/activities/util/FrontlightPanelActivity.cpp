@@ -104,6 +104,7 @@ void FrontlightPanelActivity::onEnter() {
     touchModeRestore = SETTINGS.touchReaderControls;
   }
 
+  busyGen_ = BackgroundWork::generation();
   resetUi();
   app.on(ACTION_BRIGHTNESS, &FrontlightPanelActivity::onBrightnessEvent, this);
   app.on(ACTION_WARMTH, &FrontlightPanelActivity::onWarmthEvent, this);
@@ -276,6 +277,11 @@ bool FrontlightPanelActivity::handleHomeGesture() {
 }
 
 void FrontlightPanelActivity::loop() {
+  const uint32_t generation = BackgroundWork::generation();
+  if (generation != busyGen_) {
+    busyGen_ = generation;
+    requestUpdate();
+  }
   const auto touch = routeTouch(mappedInput, false, /*routeHeld=*/true);
   if (touch.routed) {
     if (app.invalidated()) requestUpdate();

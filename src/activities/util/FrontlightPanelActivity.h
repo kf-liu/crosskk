@@ -36,6 +36,7 @@ class FrontlightPanelActivity final : public Activity, private UiAppHost {
   // rather than the Tap default. Seeded from the setting in onEnter().
   uint8_t touchModeRestore = CrossPointSettings::TOUCH_READER_ON;
   int panelBottom = 0;
+  uint32_t busyGen_ = 0;
 
   // Quick-setting tiles, in grid order (2 columns): night mode, refresh,
   // orientation, touch, then offline reading / smart online reading.
