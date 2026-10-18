@@ -78,6 +78,7 @@
 
 #include "activities/apps/weread/WeReadBackgroundSync.h"
 #include "activities/apps/weread/WeReadProgressSyncActivity.h"
+#include "WeReadCommentRefreshActivity.h"
 #include "activities/settings/FontDownloadActivity.h"
 #endif
 #include "components/UITheme.h"
@@ -1846,7 +1847,15 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
     }
     case EpubReaderMenuActivity::MenuAction::REFRESH_COMMENTS: {
 #ifdef ENABLE_CHINESE_VERSION
-      if (wereadBookId_[0]) WeReadCommentOverlay::refetchChapter();
+      if (wereadBookId_[0]) {
+        auto refresh = makeUniqueNoThrow<WeReadCommentRefreshActivity>(renderer, mappedInput);
+        if (!refresh) {
+          LOG_ERR("WR", "内存不足：评论重拉页 %u 字节",
+                  static_cast<unsigned>(sizeof(WeReadCommentRefreshActivity)));
+          break;
+        }
+        startActivityForResult(std::move(refresh), [this](const ActivityResult&) { requestUpdate(); });
+      }
 #endif
       break;
     }
@@ -2225,6 +2234,11 @@ void EpubReaderActivity::serviceWhileCovered() {
 }
 
 void EpubReaderActivity::pollLiveReading() {
+  if (WeReadCommentOverlay::manualRefreshState() == WeReadCommentOverlay::ManualRefresh::Running) {
+    liveReadingPaused.store(true);
+    noteReadingTime(false);
+    return;
+  }
   liveReadingPaused.store(false);
 #if !defined(SIMULATOR)
   if (wereadBookId_[0] != '\0' && NetworkStartup::smartOnlineReading()) ensureLiveReadingTask();

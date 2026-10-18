@@ -525,7 +525,8 @@ static_assert(sizeof(Operation) <= 8 * 1024, "WeRead operation exceeds its fixed
 
 // 别人写过评论的片段。只在已经连上的 Wi-Fi 上请求，不打开网络。
 // 把这一章的全部候选写入 ranges.wri，不截断。
-bool fetchCommentUnderlines(const char* bookId, uint32_t chapterUid);
+// stage 时候选写到 ranges.wri.new，不替换已有索引。
+bool fetchCommentUnderlines(const char* bookId, uint32_t chapterUid, bool stage = false);
 bool fetchCommentReviewPage(const char* bookId, uint32_t chapterUid, const char* rangeText, uint32_t maxIdx,
                             uint64_t syncKey, WeReadComment::RangeFile& file, WeReadComment::Cursor& cursor);
 

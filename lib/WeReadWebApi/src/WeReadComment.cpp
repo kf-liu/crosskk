@@ -139,9 +139,10 @@ std::string rangePath(const char* bookId, const uint32_t chapterUid, const uint3
 }
 
 bool RangeFile::begin(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
-                      const bool copyExisting, const bool stage) {
+                      const bool copyExisting, const bool stage, const bool keepStaged) {
   abort();
-  stage_ = stage;
+  stage_ = stage || keepStaged;
+  keepStaged_ = keepStaged;
   carried_ = false;
   carriedMaxIdx_ = 0;
   carriedSyncKey_ = 0;
@@ -238,18 +239,20 @@ bool RangeFile::finish(const uint32_t maxIdx, const uint64_t syncKey, const bool
   file_.flush();
   file_.close();
   active_ = false;
-  // 还有下一页时只更新 .new，已有 .wrn 继续给界面用。整段结束后才替换。
-  const std::string target = stage_ && hasMore ? finalPath_ + ".new" : finalPath_;
+  // 还有下一页，或整章要等全部成功再换时，只更新 .new。已有 .wrn 继续给界面用。
+  const bool leaveNew = stage_ && (hasMore || keepStaged_);
+  const std::string target = leaveNew ? finalPath_ + ".new" : finalPath_;
   if (!WeReadStore::atomicReplace(partPath_, target)) {
     Storage.remove(partPath_.c_str());
     return false;
   }
   partPath_.clear();
-  if (stage_ && !hasMore) {
+  if (stage_ && !hasMore && !keepStaged_) {
     const std::string staging = finalPath_ + ".new";
     if (Storage.exists(staging.c_str())) Storage.remove(staging.c_str());
   }
   stage_ = false;
+  keepStaged_ = false;
   return true;
 }
 
@@ -315,8 +318,16 @@ DiskCandidate toDisk(const Candidate& item) {
   return record;
 }
 
-bool openCandidate(const char* bookId, const uint32_t chapterUid, HalFile& file, CandidateHeader& header) {
-  const std::string path = candidatePath(bookId, chapterUid);
+std::string candidateFilePath(const char* bookId, const uint32_t chapterUid, const bool staged) {
+  std::string path = candidatePath(bookId, chapterUid);
+  if (path.empty() || !staged) return path;
+  path += ".new";
+  return path;
+}
+
+bool openCandidate(const char* bookId, const uint32_t chapterUid, HalFile& file, CandidateHeader& header,
+                   const bool staged = false) {
+  const std::string path = candidateFilePath(bookId, chapterUid, staged);
   if (path.empty() || !Storage.openFileForRead("WR", path, file)) return false;
   if (file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kCandidateMagic ||
       header.version != kCandidateVersion || header.headerSize != kCandidateHeaderSize ||
@@ -384,7 +395,7 @@ bool CandidateFile::add(const uint32_t start, const uint32_t end, const uint32_t
   return true;
 }
 
-bool CandidateFile::finish() {
+bool CandidateFile::finish(const bool stage) {
   if (!active_) return false;
   CandidateHeader header;
   header.chapterUid = chapterUid_;
@@ -396,7 +407,8 @@ bool CandidateFile::finish() {
   file_.flush();
   file_.close();
   active_ = false;
-  if (!WeReadStore::atomicReplace(partPath_, finalPath_)) {
+  const std::string target = stage ? finalPath_ + ".new" : finalPath_;
+  if (!WeReadStore::atomicReplace(partPath_, target)) {
     Storage.remove(partPath_.c_str());
     return false;
   }
@@ -476,13 +488,13 @@ bool clearChapterFetched(const char* bookId, const uint32_t chapterUid) {
 }
 
 bool visitCandidates(const char* bookId, const uint32_t chapterUid,
-                     bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx) {
+                     bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx, const bool staged) {
   if (!visit || !isStandardBook(bookId)) return false;
-  const std::string path = candidatePath(bookId, chapterUid);
+  const std::string path = candidateFilePath(bookId, chapterUid, staged);
   if (path.empty() || !Storage.exists(path.c_str())) return true;
   HalFile file;
   CandidateHeader header;
-  if (!openCandidate(bookId, chapterUid, file, header)) return false;
+  if (!openCandidate(bookId, chapterUid, file, header, staged)) return false;
   for (uint32_t i = 0; i < header.count; ++i) {
     DiskCandidate record;
     if (!readDisk(file, i, record)) return false;
@@ -491,18 +503,20 @@ bool visitCandidates(const char* bookId, const uint32_t chapterUid,
   return true;
 }
 
-bool readCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, Candidate& item) {
+bool readCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, Candidate& item,
+                   const bool staged) {
   HalFile file;
   CandidateHeader header;
-  if (!openCandidate(bookId, chapterUid, file, header) || index >= header.count) return false;
+  if (!openCandidate(bookId, chapterUid, file, header, staged) || index >= header.count) return false;
   DiskCandidate record;
   if (!readDisk(file, index, record)) return false;
   item = toPublic(record);
   return true;
 }
 
-bool updateCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, const Candidate& item) {
-  const std::string path = candidatePath(bookId, chapterUid);
+bool updateCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, const Candidate& item,
+                     const bool staged) {
+  const std::string path = candidateFilePath(bookId, chapterUid, staged);
   if (path.empty()) return false;
   HalFile file = Storage.open(path.c_str(), O_RDWR);
   if (!file) return false;
@@ -513,6 +527,224 @@ bool updateCandidate(const char* bookId, const uint32_t chapterUid, const uint32
     return false;
   }
   return writeDisk(file, index, toDisk(item));
+}
+
+bool hasSuffix(const char* name, const char* suffix) {
+  if (!name || !suffix) return false;
+  const size_t nameLen = strlen(name);
+  const size_t suffixLen = strlen(suffix);
+  return nameLen >= suffixLen && memcmp(name + (nameLen - suffixLen), suffix, suffixLen) == 0;
+}
+
+bool stagedIndexHas(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
+                    bool& readable) {
+  struct Hit {
+    uint32_t start = 0;
+    uint32_t end = 0;
+    bool found = false;
+  } hit{start, end, false};
+  auto match = [](void* raw, uint32_t, const Candidate& item) {
+    auto* wanted = static_cast<Hit*>(raw);
+    if (item.start != wanted->start || item.end != wanted->end) return true;
+    wanted->found = true;
+    return false;
+  };
+  readable = visitCandidates(bookId, chapterUid, match, &hit, true);
+  return hit.found;
+}
+
+bool queriesCanCommit(void* raw, uint32_t, const Candidate& item) {
+  if (item.query == CandidateQuery::Stored || item.query == CandidateQuery::Empty) return true;
+  *static_cast<bool*>(raw) = false;
+  return true;
+}
+
+// 换文件时先把旧的改名为 .bak。整章没换完就改回去，避免只换上一部分。
+std::string backupPath(const std::string& live) { return live + ".bak"; }
+
+std::string pathWithoutBak(const std::string& backup) {
+  constexpr size_t kBakLen = 4;
+  if (backup.size() < kBakLen) return backup;
+  return backup.substr(0, backup.size() - kBakLen);
+}
+
+bool nextBackup(const std::string& directory, std::string& backup) {
+  HalFile folder = Storage.open(directory.c_str());
+  if (!folder || !folder.isDirectory()) return false;
+  while (true) {
+    HalFile entry = folder.openNextFile();
+    if (!entry) return false;
+    char name[64];
+    const size_t nameLen = entry.getName(name, sizeof(name));
+    if (nameLen == 0 || nameLen >= sizeof(name)) continue;
+    name[nameLen] = '\0';
+    const char* file = baseName(name);
+    if (!hasSuffix(file, ".wrn.bak") && strcmp(file, "ranges.wri.bak") != 0) continue;
+    backup = directory + "/" + file;
+    return true;
+  }
+}
+
+// 上次换到一半留下的备份：新文件还在就丢掉备份，只剩备份就把旧评论放回去。
+bool settleLeftoverBackups(const std::string& directory) {
+  for (;;) {
+    std::string backup;
+    if (!nextBackup(directory, backup)) return true;
+    const std::string live = pathWithoutBak(backup);
+    if (Storage.exists(live.c_str())) {
+      if (!Storage.remove(backup.c_str())) return false;
+    } else if (!Storage.rename(backup.c_str(), live.c_str())) {
+      return false;
+    }
+  }
+}
+
+bool parkLive(const std::string& live) {
+  const std::string backup = backupPath(live);
+  if (Storage.exists(backup.c_str())) return false;
+  if (!Storage.exists(live.c_str())) return true;
+  return Storage.rename(live.c_str(), backup.c_str());
+}
+
+// 失败时新文件让位，.bak 回到原来的名字。
+bool undoBackups(const std::string& directory) {
+  for (;;) {
+    std::string backup;
+    if (!nextBackup(directory, backup)) return true;
+    const std::string live = pathWithoutBak(backup);
+    if (Storage.exists(live.c_str()) && !Storage.remove(live.c_str())) return false;
+    if (!Storage.rename(backup.c_str(), live.c_str())) return false;
+  }
+}
+
+bool dropBackups(const std::string& directory) {
+  for (;;) {
+    std::string backup;
+    if (!nextBackup(directory, backup)) return true;
+    if (!Storage.remove(backup.c_str())) return false;
+  }
+}
+
+struct StageApply {
+  const char* bookId = nullptr;
+  uint32_t chapterUid = 0;
+  bool ok = true;
+};
+
+bool applyOneStaged(void* raw, uint32_t, const Candidate& item) {
+  auto* apply = static_cast<StageApply*>(raw);
+  if (!apply->ok) return false;
+  const std::string live = rangePath(apply->bookId, apply->chapterUid, item.start, item.end);
+  if (live.empty()) {
+    apply->ok = false;
+    return false;
+  }
+  const std::string staged = live + ".new";
+  if (item.query == CandidateQuery::Empty) {
+    if (!parkLive(live)) apply->ok = false;
+    if (Storage.exists(staged.c_str()) && !Storage.remove(staged.c_str())) apply->ok = false;
+    return apply->ok;
+  }
+  if (item.query != CandidateQuery::Stored) {
+    apply->ok = false;
+    return false;
+  }
+  // 超过一轮能重拉的段没有 .new，保留原来的评论文件。
+  if (!Storage.exists(staged.c_str())) return true;
+  if (!parkLive(live) || !Storage.rename(staged.c_str(), live.c_str())) {
+    apply->ok = false;
+    return false;
+  }
+  return true;
+}
+
+bool parkRetiredRanges(const char* bookId, const uint32_t chapterUid, const std::string& directory) {
+  for (;;) {
+    HalFile folder = Storage.open(directory.c_str());
+    if (!folder || !folder.isDirectory()) return true;
+    std::string victim;
+    while (true) {
+      HalFile entry = folder.openNextFile();
+      if (!entry) break;
+      char name[64];
+      const size_t nameLen = entry.getName(name, sizeof(name));
+      if (nameLen == 0 || nameLen >= sizeof(name)) continue;
+      name[nameLen] = '\0';
+      uint32_t start = 0;
+      uint32_t end = 0;
+      if (!parseRangeFileName(name, start, end)) continue;
+      bool readable = false;
+      if (stagedIndexHas(bookId, chapterUid, start, end, readable)) continue;
+      if (!readable) return false;
+      victim = directory + "/" + baseName(name);
+      break;
+    }
+    if (victim.empty()) return true;
+    if (!parkLive(victim)) return false;
+  }
+}
+
+bool swapIndexKeepingBackup(const std::string& stagedIndex, const std::string& liveIndex) {
+  const std::string backup = backupPath(liveIndex);
+  if (Storage.exists(backup.c_str()) && !Storage.remove(backup.c_str())) return false;
+  const bool hadLive = Storage.exists(liveIndex.c_str());
+  if (hadLive && !Storage.rename(liveIndex.c_str(), backup.c_str())) return false;
+  if (Storage.rename(stagedIndex.c_str(), liveIndex.c_str())) return true;
+  if (hadLive) Storage.rename(backup.c_str(), liveIndex.c_str());
+  return false;
+}
+
+bool stillWantedNow(bool (*stillWanted)(void*), void* stillCtx) { return !stillWanted || stillWanted(stillCtx); }
+
+void discardStagedChapter(const char* bookId, const uint32_t chapterUid) {
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, false)) return;
+  const std::string index = candidateFilePath(bookId, chapterUid, true);
+  if (!index.empty() && Storage.exists(index.c_str())) Storage.remove(index.c_str());
+  if (!Storage.exists(directory.c_str())) return;
+  for (;;) {
+    HalFile folder = Storage.open(directory.c_str());
+    if (!folder || !folder.isDirectory()) return;
+    std::string victim;
+    while (true) {
+      HalFile entry = folder.openNextFile();
+      if (!entry) break;
+      char name[64];
+      const size_t nameLen = entry.getName(name, sizeof(name));
+      if (nameLen == 0 || nameLen >= sizeof(name)) continue;
+      name[nameLen] = '\0';
+      if (!hasSuffix(baseName(name), ".wrn.new")) continue;
+      victim = directory + "/" + baseName(name);
+      break;
+    }
+    if (victim.empty()) return;
+    if (!Storage.remove(victim.c_str())) return;
+  }
+}
+
+bool commitStagedChapter(const char* bookId, const uint32_t chapterUid, bool (*stillWanted)(void*), void* stillCtx) {
+  const std::string stagedIndex = candidateFilePath(bookId, chapterUid, true);
+  const std::string liveIndex = candidateFilePath(bookId, chapterUid, false);
+  if (stagedIndex.empty() || liveIndex.empty() || !Storage.exists(stagedIndex.c_str())) return false;
+  bool queriesOk = true;
+  if (!visitCandidates(bookId, chapterUid, queriesCanCommit, &queriesOk, true) || !queriesOk) return false;
+  if (!stillWantedNow(stillWanted, stillCtx)) return false;
+
+  std::string directory;
+  if (!chapterDirectory(bookId, chapterUid, directory, false)) return false;
+  if (!settleLeftoverBackups(directory)) return false;
+
+  StageApply apply{bookId, chapterUid, true};
+  if (!visitCandidates(bookId, chapterUid, applyOneStaged, &apply, true) || !apply.ok ||
+      !parkRetiredRanges(bookId, chapterUid, directory) || !stillWantedNow(stillWanted, stillCtx) ||
+      !swapIndexKeepingBackup(stagedIndex, liveIndex) || !stillWantedNow(stillWanted, stillCtx)) {
+    if (!undoBackups(directory)) LOG_ERR("WR", "本章评论退回失败");
+    return false;
+  }
+  // 索引已经是新的。备份清不掉也算换上了，下次再清，不能把已经换上的说成失败。
+  if (!dropBackups(directory)) LOG_ERR("WR", "本章评论备份没有删掉");
+  discardStagedChapter(bookId, chapterUid);
+  return true;
 }
 
 bool visitStoredRanges(const char* bookId, const uint32_t chapterUid,
@@ -1162,10 +1394,10 @@ bool ReviewPageParser::finish(Cursor& cursor) {
 CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
                            const uint32_t startMaxIdx, const uint64_t startSyncKey, const bool copyExisting,
                            const ReviewPageFetch fetch, void* ctx, const int maxPages, uint32_t* totalCount,
-                           uint32_t* markCount, const bool stage) {
+                           uint32_t* markCount, const bool stage, const bool keepStaged) {
   if (!fetch || end <= start || maxPages <= 0) return CollectResult::Failed;
   RangeFile file;
-  if (!file.begin(bookId, chapterUid, start, end, copyExisting, stage)) return CollectResult::Failed;
+  if (!file.begin(bookId, chapterUid, start, end, copyExisting, stage, keepStaged)) return CollectResult::Failed;
 
   Cursor cursor;
   cursor.maxIdx = file.carriedCursor() ? file.carriedMaxIdx() : startMaxIdx;

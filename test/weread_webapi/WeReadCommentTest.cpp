@@ -284,6 +284,107 @@ TEST_F(WeReadCommentTest, StoresEveryCandidateWithoutACap) {
   EXPECT_EQ(seen, 70u);
 }
 
+TEST_F(WeReadCommentTest, StagedRefreshReplacesOnlyAfterCommit) {
+  const std::string oldPage = reviewPage("10-40", false, 1, 5, 1, 1, "name");
+  ScriptedPages oldScript;
+  oldScript.pages[0] = oldPage.c_str();
+  ASSERT_EQ(WeReadComment::collectRange("3300003224", 12, 10, 40, 0, 0, false, scriptedFetch, &oldScript),
+            WeReadComment::CollectResult::Stored);
+
+  const std::string fresh = reviewPage("10-40", false, 2, 8, 9, 1, "name");
+  ScriptedPages next;
+  next.pages[0] = fresh.c_str();
+  EXPECT_EQ(WeReadComment::collectRange("3300003224", 12, 10, 40, 0, 0, false, scriptedFetch, &next,
+                                        WeReadComment::kMaxReviewPages, nullptr, nullptr, true, true),
+            WeReadComment::CollectResult::Stored);
+
+  char text[64];
+  WeReadComment::StoredComment comment;
+  ASSERT_TRUE(WeReadComment::readComment("3300003224", 12, 10, 40, 0, text, sizeof(text), comment));
+  EXPECT_STREQ(text, "评论1");
+  EXPECT_TRUE(std::filesystem::exists(root_ / ".crosspoint/weread/comments/3300003224/12/10_40.wrn.new"));
+
+  WeReadComment::CandidateFile index;
+  ASSERT_TRUE(index.begin("3300003224", 12));
+  ASSERT_TRUE(index.add(10, 40, 1));
+  ASSERT_TRUE(index.finish(true));
+  ASSERT_TRUE(WeReadComment::commitStagedChapter("3300003224", 12));
+  ASSERT_TRUE(WeReadComment::readComment("3300003224", 12, 10, 40, 0, text, sizeof(text), comment));
+  EXPECT_STREQ(text, "评论9");
+  EXPECT_FALSE(std::filesystem::exists(root_ / ".crosspoint/weread/comments/3300003224/12/10_40.wrn.new"));
+  EXPECT_TRUE(WeReadComment::candidatesReady("3300003224", 12));
+}
+
+TEST_F(WeReadCommentTest, DiscardingAStagedRefreshKeepsThePreviousComments) {
+  const std::string oldPage = reviewPage("10-40", false, 1, 5, 1, 1, "name");
+  ScriptedPages oldScript;
+  oldScript.pages[0] = oldPage.c_str();
+  ASSERT_EQ(WeReadComment::collectRange("3300003224", 12, 10, 40, 0, 0, false, scriptedFetch, &oldScript),
+            WeReadComment::CollectResult::Stored);
+
+  const std::string fresh = reviewPage("10-40", false, 2, 8, 9, 1, "name");
+  ScriptedPages next;
+  next.pages[0] = fresh.c_str();
+  ASSERT_EQ(WeReadComment::collectRange("3300003224", 12, 10, 40, 0, 0, false, scriptedFetch, &next,
+                                        WeReadComment::kMaxReviewPages, nullptr, nullptr, true, true),
+            WeReadComment::CollectResult::Stored);
+  WeReadComment::CandidateFile index;
+  ASSERT_TRUE(index.begin("3300003224", 12));
+  ASSERT_TRUE(index.add(10, 40, 1));
+  ASSERT_TRUE(index.finish(true));
+
+  WeReadComment::discardStagedChapter("3300003224", 12);
+  char text[64];
+  WeReadComment::StoredComment comment;
+  ASSERT_TRUE(WeReadComment::readComment("3300003224", 12, 10, 40, 0, text, sizeof(text), comment));
+  EXPECT_STREQ(text, "评论1");
+  EXPECT_FALSE(std::filesystem::exists(root_ / ".crosspoint/weread/comments/3300003224/12/10_40.wrn.new"));
+  EXPECT_FALSE(std::filesystem::exists(root_ / ".crosspoint/weread/comments/3300003224/12/ranges.wri.new"));
+}
+
+TEST_F(WeReadCommentTest, FailedStagedChapterDoesNotReplaceComments) {
+  const std::string oldPage = reviewPage("10-40", false, 1, 5, 1, 1, "name");
+  ScriptedPages oldScript;
+  oldScript.pages[0] = oldPage.c_str();
+  ASSERT_EQ(WeReadComment::collectRange("3300003224", 12, 10, 40, 0, 0, false, scriptedFetch, &oldScript),
+            WeReadComment::CollectResult::Stored);
+
+  WeReadComment::CandidateFile index;
+  ASSERT_TRUE(index.begin("3300003224", 12));
+  ASSERT_TRUE(index.add(10, 40, 1));
+  ASSERT_TRUE(index.finish(true));
+  WeReadComment::Candidate item;
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 12, 0, item, true));
+  item.query = WeReadComment::CandidateQuery::Failed;
+  ASSERT_TRUE(WeReadComment::updateCandidate("3300003224", 12, 0, item, true));
+
+  EXPECT_FALSE(WeReadComment::commitStagedChapter("3300003224", 12));
+  char text[64];
+  WeReadComment::StoredComment comment;
+  ASSERT_TRUE(WeReadComment::readComment("3300003224", 12, 10, 40, 0, text, sizeof(text), comment));
+  EXPECT_STREQ(text, "评论1");
+}
+
+TEST_F(WeReadCommentTest, SuccessfulEmptyRangeClearsThePreviousComments) {
+  const std::string oldPage = reviewPage("10-40", false, 1, 5, 1, 1, "name");
+  ScriptedPages oldScript;
+  oldScript.pages[0] = oldPage.c_str();
+  ASSERT_EQ(WeReadComment::collectRange("3300003224", 12, 10, 40, 0, 0, false, scriptedFetch, &oldScript),
+            WeReadComment::CollectResult::Stored);
+
+  WeReadComment::CandidateFile index;
+  ASSERT_TRUE(index.begin("3300003224", 12));
+  ASSERT_TRUE(index.add(10, 40, 1));
+  ASSERT_TRUE(index.finish(true));
+  WeReadComment::Candidate item;
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 12, 0, item, true));
+  item.query = WeReadComment::CandidateQuery::Empty;
+  ASSERT_TRUE(WeReadComment::updateCandidate("3300003224", 12, 0, item, true));
+
+  ASSERT_TRUE(WeReadComment::commitStagedChapter("3300003224", 12));
+  EXPECT_FALSE(std::filesystem::exists(root_ / ".crosspoint/weread/comments/3300003224/12/10_40.wrn"));
+}
+
 TEST_F(WeReadCommentTest, RecordsWhenAChapterFetchFinishes) {
   EXPECT_EQ(WeReadComment::chapterFetchedAt("3300003224", 9), 0u);
   EXPECT_FALSE(WeReadComment::markChapterFetched("3300003224", 9, 0));

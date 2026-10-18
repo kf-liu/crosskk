@@ -56,6 +56,9 @@ struct Round {
   bool sessionMissing = false;
   // 过期后重拉时，已经存过的片段也要再请求一遍。
   bool refreshStored = false;
+  // 菜单里的重拉先写到旁边，整章成功才替换。
+  bool holdCommit = false;
+  ManualRefresh manual = ManualRefresh::Idle;
   Phase phase = Phase::Idle;
   int settledSpine = -1;
   int settledPage = -1;
@@ -749,6 +752,8 @@ MoreRequest& moreRequest() {
 }
 
 std::atomic<bool> dirty{false};
+// 正在把整章评论换上。这段时间取消只做标记，不能同时删 .new。
+std::atomic<bool> committing{false};
 std::atomic<bool> panelShown{false};
 std::atomic<uint8_t> moreState{kMoreIdle};
 TaskHandle_t worker = nullptr;
@@ -784,11 +789,19 @@ bool queueMore(const Panel& view) {
   return true;
 }
 
-bool rangeHasMore(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end) {
-  char scratch[2] = {};
-  WeReadComment::StoredComment comment;
-  if (!WeReadComment::readComment(bookId, chapterUid, start, end, 0, scratch, sizeof(scratch), comment)) return false;
-  return comment.hasMore;
+bool rangeHasMore(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
+                  const bool staged) {
+  std::string path = WeReadComment::rangePath(bookId, chapterUid, start, end);
+  if (path.empty()) return false;
+  if (staged) path += ".new";
+  HalFile file;
+  WeReadComment::Header header;
+  if (!Storage.openFileForRead("WR", path, file) ||
+      file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != WeReadComment::kMagic ||
+      header.version != WeReadComment::kVersion || header.headerSize != WeReadComment::kHeaderSize) {
+    return false;
+  }
+  return (header.flags & WeReadComment::kFlagHasMore) != 0;
 }
 
 // 整章拉完后 48 小时内不再请求。覆盖两天内的反复打开；过期后再进章会在后台更新。
@@ -812,6 +825,9 @@ struct Assignment {
   bool copyExisting = false;
   // 已有评论先留着。新内容写到旁边，整段成功才替换。
   bool stage = false;
+  // 整章重拉时，这一段拉完也先留在 .new。
+  bool keepStaged = false;
+  bool holdCommit = false;
 };
 
 struct PendingHit {
@@ -882,14 +898,14 @@ bool chapterFetchFresh(const char* bookId, const uint32_t chapterUid) {
 
 bool rememberCandidate(const char* bookId, const uint32_t chapterUid, const uint32_t index, const uint32_t start,
                        const uint32_t end, const WeReadComment::CandidateQuery query, const uint32_t totalCount,
-                       const uint32_t markCount) {
+                       const uint32_t markCount, const bool staged) {
   WeReadComment::Candidate item;
-  if (!WeReadComment::readCandidate(bookId, chapterUid, index, item)) return false;
+  if (!WeReadComment::readCandidate(bookId, chapterUid, index, item, staged)) return false;
   if (item.start != start || item.end != end) return false;
   item.query = query;
   if (totalCount > item.commentTotal) item.commentTotal = totalCount;
   if (markCount > item.markCount) item.markCount = markCount;
-  return WeReadComment::updateCandidate(bookId, chapterUid, index, item);
+  return WeReadComment::updateCandidate(bookId, chapterUid, index, item, staged);
 }
 
 uint8_t failedBits[kSettledRangeCap / 8] = {};
@@ -965,6 +981,7 @@ bool pickWork(Assignment& work) {
     work.nativeEnd = current.nativeEnd;
     work.bounds = current.bounds;
     Round& state = round();
+    work.holdCommit = state.holdCommit;
     if (!state.underlinesReady && !state.underlinesFailed) {
       work.kind = WorkKind::Underlines;
     } else if (state.underlinesReady) {
@@ -977,7 +994,8 @@ bool pickWork(Assignment& work) {
     ChapterScan hit;
     hit.refreshStored = refreshStored;
     hit.generation = work.generation;
-    const bool visited = WeReadComment::visitCandidates(work.bookId, work.chapterUid, scanChapter, &hit);
+    const bool visited =
+        WeReadComment::visitCandidates(work.bookId, work.chapterUid, scanChapter, &hit, work.holdCommit);
     if (visited && hit.found) {
       work.kind = WorkKind::Range;
       work.rangeIndex = hit.index;
@@ -985,26 +1003,77 @@ bool pickWork(Assignment& work) {
       work.end = hit.item.end;
       const std::string live = WeReadComment::rangePath(work.bookId, work.chapterUid, work.start, work.end);
       const bool staging = !live.empty() && Storage.exists((live + ".new").c_str());
-      work.stage = staging || (refreshStored && hit.item.query == WeReadComment::CandidateQuery::Stored);
+      work.keepStaged = work.holdCommit;
+      work.stage = work.holdCommit || staging ||
+                   (refreshStored && hit.item.query == WeReadComment::CandidateQuery::Stored);
       work.copyExisting = hit.item.query == WeReadComment::CandidateQuery::Partial || staging;
     } else if (visited && !hit.found) {
-      const uint32_t now = TimeUtils::getCurrentValidTimestamp();
-      const bool marked = !hit.anyFailed && now != 0 &&
-                          WeReadComment::markChapterFetched(work.bookId, work.chapterUid, now);
-      // 没拉完不算这次成功。去掉完成时间，评论文件留下，下次进章再试。
-      if (hit.anyFailed) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
       lockState();
-      if (work.generation != job().generation) {
+      const bool live = work.generation == job().generation && (!work.holdCommit || round().holdCommit);
+      unlockState();
+      if (!live) {
+        if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
+      } else if (work.holdCommit) {
+        lockState();
+        const bool liveNow = work.generation == job().generation && round().holdCommit;
+        if (liveNow) committing.store(true);
         unlockState();
-        if (marked) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+        bool commitOk = false;
+        if (!liveNow) {
+          WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
+        } else {
+          uint32_t generation = work.generation;
+          auto stillWanted = [](void* raw) {
+            const uint32_t wanted = *static_cast<const uint32_t*>(raw);
+            lockState();
+            const bool ok = wanted == job().generation && round().holdCommit;
+            unlockState();
+            return ok;
+          };
+          commitOk = !hit.anyFailed &&
+                     WeReadComment::commitStagedChapter(work.bookId, work.chapterUid, stillWanted, &generation);
+          committing.store(false);
+          if (!commitOk) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
+        }
+        const uint32_t now = TimeUtils::getCurrentValidTimestamp();
+        if (commitOk && now != 0) WeReadComment::markChapterFetched(work.bookId, work.chapterUid, now);
+        lockState();
+        if (work.generation != job().generation) {
+          if (commitOk) pageComments().valid = false;
+          unlockState();
+          if (!commitOk) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
+        } else {
+          job().fetch = false;
+          round().refreshStored = false;
+          round().holdCommit = false;
+          round().phase = Phase::Idle;
+          round().manual = commitOk ? ManualRefresh::Succeeded : ManualRefresh::Failed;
+          // 回到阅读页时由那一屏重画。成功则丢掉这一页的旧点线，按新文件再载入。
+          if (commitOk) pageComments().valid = false;
+          dirty.store(false);
+          unlockState();
+          if (commitOk) LOG_INF("WR", "本章评论已拉完");
+          else LOG_INF("WR", "本章评论没有替换");
+        }
       } else {
-        job().fetch = false;
-        round().refreshStored = false;
-        // 这一轮已经结束。失败只留下文件，底部回到章节名，不把「加载失败」停在状态栏。
-        round().phase = Phase::Idle;
-        dirty.store(true);
-        unlockState();
-        if (!hit.anyFailed) LOG_INF("WR", "本章评论已拉完");
+        const uint32_t now = TimeUtils::getCurrentValidTimestamp();
+        const bool marked = !hit.anyFailed && now != 0 &&
+                            WeReadComment::markChapterFetched(work.bookId, work.chapterUid, now);
+        // 没拉完不算这次成功。去掉完成时间，评论文件留下，下次进章再试。
+        if (hit.anyFailed) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+        lockState();
+        if (work.generation != job().generation) {
+          unlockState();
+          if (marked) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+        } else {
+          job().fetch = false;
+          round().refreshStored = false;
+          // 这一轮已经结束。失败只留下文件，底部回到章节名，不把「加载失败」停在状态栏。
+          round().phase = Phase::Idle;
+          dirty.store(true);
+          unlockState();
+          if (!hit.anyFailed) LOG_INF("WR", "本章评论已拉完");
+        }
       }
     }
   }
@@ -1029,10 +1098,11 @@ inline void noteCommentFetch(bool) {}
 void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult result, const uint32_t totalCount,
                       const uint32_t markCount) {
   const bool hasMore = result == WeReadComment::CollectResult::Stored &&
-                       rangeHasMore(work.bookId, work.chapterUid, work.start, work.end);
+                       rangeHasMore(work.bookId, work.chapterUid, work.start, work.end, work.keepStaged);
   lockState();
   if (work.generation != job().generation) {
     unlockState();
+    if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
     noteCommentFetch(false);
     return;
   }
@@ -1043,7 +1113,7 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   else if (hasMore) query = WeReadComment::CandidateQuery::Partial;
   if (work.kind != WorkKind::More) {
     rememberCandidate(work.bookId, work.chapterUid, static_cast<uint32_t>(work.rangeIndex), work.start, work.end, query,
-                      totalCount, markCount);
+                      totalCount, markCount, work.holdCommit);
   } else if (totalCount > 0 || markCount > 0) {
     PendingHit hit;
     hit.pageStart = work.start;
@@ -1059,12 +1129,14 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
       return false;
     };
     if (WeReadComment::visitCandidates(work.bookId, work.chapterUid, match, &hit) && hit.found) {
-      rememberCandidate(work.bookId, work.chapterUid, hit.index, work.start, work.end, query, totalCount, markCount);
+      rememberCandidate(work.bookId, work.chapterUid, hit.index, work.start, work.end, query, totalCount, markCount,
+                        work.holdCommit);
     }
   }
   lockState();
   if (work.generation != job().generation) {
     unlockState();
+    if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
     noteCommentFetch(false);
     return;
   }
@@ -1073,7 +1145,8 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   } else if (query == WeReadComment::CandidateQuery::Stored || query == WeReadComment::CandidateQuery::Empty) {
     markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
   }
-  dirty.store(true);
+  // 手动重拉还没整章换上。阅读页继续用旧缓存，成功后再丢掉。
+  if (!work.holdCommit) dirty.store(true);
   unlockState();
 }
 
@@ -1103,15 +1176,17 @@ bool stepOnce() {
   // 整章要拉很多段，不把「正在拉取评论」停在控制中心里。
   noteCommentFetch(false);
   if (work.kind == WorkKind::Underlines) {
-    const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid);
+    const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid, work.holdCommit);
     lockState();
     if (work.generation != job().generation) {
       unlockState();
+      if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
       noteCommentFetch(false);
       return true;
     }
     Round& state = round();
     if (!ok) {
+      const bool hold = state.holdCommit;
       const bool onlineNow = WeReadHttpClient::networkReady();
       if (onlineNow) {
         WeReadStore::Session session;
@@ -1121,12 +1196,19 @@ bool stepOnce() {
       }
       // 这一轮已经结束。不在本章马上再拉。状态栏回到章节名，进行中的标记当场清掉。
       state.refreshStored = false;
+      state.holdCommit = false;
       job().fetch = false;
-      state.phase = (!onlineNow && !state.sessionMissing) ? Phase::Offline : Phase::Idle;
+      if (hold) {
+        state.manual = ManualRefresh::Failed;
+        state.phase = Phase::Idle;
+      } else {
+        state.phase = (!onlineNow && !state.sessionMissing) ? Phase::Offline : Phase::Idle;
+      }
       unlockState();
-      WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+      if (hold) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
+      else WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
       noteCommentFetch(false);
-      dirty.store(true);
+      dirty.store(!hold);
       return false;
     }
     state.underlinesReady = true;
@@ -1142,7 +1224,7 @@ bool stepOnce() {
     if (work.kind == WorkKind::More) moreState.store(kMoreFailed);
     else {
       rememberCandidate(work.bookId, work.chapterUid, static_cast<uint32_t>(work.rangeIndex), work.start, work.end,
-                        WeReadComment::CandidateQuery::Failed, 0, 0);
+                        WeReadComment::CandidateQuery::Failed, 0, 0, work.holdCommit);
     }
     dirty.store(true);
     return true;
@@ -1155,9 +1237,11 @@ bool stepOnce() {
   uint32_t markCount = 0;
   auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
                                             work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
-                                            &markCount, work.stage);
-  // 重新拉取没成功时不要把已有评论标成空。
-  if (work.stage && result != WeReadComment::CollectResult::Stored) result = WeReadComment::CollectResult::Failed;
+                                            &markCount, work.stage, work.keepStaged);
+  // 后台重拉没成功时不要把已有评论标成空。整章重拉由提交时再决定换不换。
+  if (work.stage && !work.keepStaged && result != WeReadComment::CollectResult::Stored) {
+    result = WeReadComment::CollectResult::Failed;
+  }
   applyRangeResult(work, result, totalCount, markCount);
   return true;
 #else
@@ -1171,8 +1255,14 @@ void workerMain(void*) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
-    // 一段一段往后拉，留给翻页和退出。
-    vTaskDelay(pdMS_TO_TICKS(300));
+    // 后台一段一段拉，留给翻页。手动重拉时人在空白页上等，只留一点空隙。
+    uint32_t pauseMs = 300;
+    if (stateLock) {
+      lockState();
+      if (round().holdCommit) pauseMs = 20;
+      unlockState();
+    }
+    vTaskDelay(pdMS_TO_TICKS(pauseMs));
   }
 }
 
@@ -1324,13 +1414,14 @@ bool syncPage(const char* bookId, const Epub& epub, const int spineIndex, const 
   return publishPage(bookId, epub, spineIndex, pageNumber, pageStart, pageEnd);
 }
 
-void refetchChapter() {
-  if (!stateLock) return;
+ManualRefresh beginManualRefresh() {
+  ensureWorker();
+  if (!stateLock) return ManualRefresh::Failed;
   lockState();
   Round& state = round();
   if (!state.haveChapter || state.bookId[0] == '\0') {
     unlockState();
-    return;
+    return ManualRefresh::Idle;
   }
   char bookId[64];
   strncpy(bookId, state.bookId, sizeof(bookId) - 1);
@@ -1340,29 +1431,70 @@ void refetchChapter() {
 
   const bool loggedIn = readerLoggedIn();
   const bool online = WeReadHttpClient::networkReady();
+  if (!loggedIn || !online) {
+    const ManualRefresh outcome = loggedIn ? ManualRefresh::Offline : ManualRefresh::LoginRequired;
+    lockState();
+    if (!state.haveChapter || state.chapterUid != chapterUid ||
+        strncmp(state.bookId, bookId, sizeof(state.bookId)) != 0) {
+      unlockState();
+      return ManualRefresh::Idle;
+    }
+    state.manual = outcome;
+    state.holdCommit = false;
+    state.sessionMissing = !loggedIn;
+    unlockState();
+    return outcome;
+  }
+
+  WeReadComment::discardStagedChapter(bookId, chapterUid);
   lockState();
   if (!state.haveChapter || state.chapterUid != chapterUid ||
       strncmp(state.bookId, bookId, sizeof(state.bookId)) != 0) {
     unlockState();
-    return;
+    return ManualRefresh::Idle;
   }
   Job& current = job();
-  state.sessionMissing = !loggedIn;
+  state.sessionMissing = false;
   state.underlinesReady = false;
   state.underlinesFailed = false;
   state.refreshStored = true;
+  state.holdCommit = true;
+  state.manual = ManualRefresh::Running;
   current.generation++;
-  current.fetch = online && loggedIn;
-  if (!loggedIn) state.phase = Phase::Idle;
-  else if (!online) state.phase = Phase::Offline;
-  else state.phase = Phase::Loading;
-  const bool fetch = current.fetch;
+  current.fetch = true;
+  state.phase = Phase::Loading;
   unlockState();
-  dirty.store(true);
-  if (fetch) {
-    reopenFailedRanges(bookId, chapterUid);
-    notifyWorker();
-  }
+  notifyWorker();
+  return ManualRefresh::Running;
+}
+
+ManualRefresh manualRefreshState() {
+  if (!stateLock) return ManualRefresh::Idle;
+  lockState();
+  const ManualRefresh state = round().manual;
+  unlockState();
+  return state;
+}
+
+void cancelManualRefresh() {
+  if (!stateLock) return;
+  lockState();
+  char bookId[64] = {};
+  strncpy(bookId, round().bookId, sizeof(bookId) - 1);
+  const uint32_t chapterUid = round().chapterUid;
+  const bool hold = round().holdCommit || round().manual == ManualRefresh::Running;
+  round().holdCommit = false;
+  round().refreshStored = false;
+  round().manual = ManualRefresh::Idle;
+  round().phase = Phase::Idle;
+  job().fetch = false;
+  job().generation++;
+  const bool commitBusy = committing.load();
+  unlockState();
+  // 换文件进行中时由那一侧退回并删 .new。这里再删会把正在换上的文件拆掉。
+  if (hold && !commitBusy && bookId[0] != '\0') WeReadComment::discardStagedChapter(bookId, chapterUid);
+  noteCommentFetch(false);
+  dirty.store(false);
 }
 
 const char* chapterStatus() {
@@ -1863,11 +1995,13 @@ void reset() {
   char abandonedId[64] = {};
   uint32_t abandonedUid = 0;
   bool abandonRefresh = false;
+  bool hold = false;
   lockState();
-  if (round().refreshStored && job().bookId[0] != '\0') {
+  if ((round().refreshStored || round().holdCommit) && job().bookId[0] != '\0') {
     strncpy(abandonedId, job().bookId, sizeof(abandonedId) - 1);
     abandonedUid = job().chapterUid;
-    abandonRefresh = true;
+    hold = round().holdCommit;
+    abandonRefresh = round().refreshStored && !hold;
   }
   const uint32_t generation = job().generation + 1;
   round() = {};
@@ -1875,10 +2009,12 @@ void reset() {
   round().settledPage = -1;
   job() = {};
   job().generation = generation;
+  const bool commitBusy = committing.load();
   unlockState();
   noteCommentFetch(false);
-  // 退出时这一轮还没拉完。去掉完成时间，评论文件留下，下次进入再试。
-  if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
+  // 手动重拉退出时丢掉旁边的新文件，已有评论不动。正在换上时由那一侧退回。
+  if (hold && !commitBusy) WeReadComment::discardStagedChapter(abandonedId, abandonedUid);
+  else if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
   moreState.store(kMoreIdle);
   markPanel(false);
   underlayReady = true;

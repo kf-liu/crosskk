@@ -94,7 +94,8 @@ class CandidateFile {
  public:
   bool begin(const char* bookId, uint32_t chapterUid);
   bool add(uint32_t start, uint32_t end, uint32_t markCount);
-  bool finish();
+  // stage 时写到 ranges.wri.new，不替换正在给界面用的索引。
+  bool finish(bool stage = false);
   void abort();
   ~CandidateFile();
   uint32_t count() const { return count_; }
@@ -113,11 +114,17 @@ bool candidatesReady(const char* bookId, uint32_t chapterUid);
 uint32_t chapterFetchedAt(const char* bookId, uint32_t chapterUid);
 bool markChapterFetched(const char* bookId, uint32_t chapterUid, uint32_t epochSeconds);
 bool clearChapterFetched(const char* bookId, uint32_t chapterUid);
+// 手动重拉先把新索引和新评论留在 .new。整章成功才换上，失败或 stillWanted 返回 false 则退回，不改已有评论。
+bool commitStagedChapter(const char* bookId, uint32_t chapterUid, bool (*stillWanted)(void*) = nullptr,
+                         void* stillCtx = nullptr);
+void discardStagedChapter(const char* bookId, uint32_t chapterUid);
 // visit 返回 false 时停下。文件不存在视为空表，返回 true。
+// staged 时读写 ranges.wri.new。
 bool visitCandidates(const char* bookId, uint32_t chapterUid,
-                     bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx);
-bool readCandidate(const char* bookId, uint32_t chapterUid, uint32_t index, Candidate& item);
-bool updateCandidate(const char* bookId, uint32_t chapterUid, uint32_t index, const Candidate& item);
+                     bool (*visit)(void* ctx, uint32_t index, const Candidate& item), void* ctx, bool staged = false);
+bool readCandidate(const char* bookId, uint32_t chapterUid, uint32_t index, Candidate& item, bool staged = false);
+bool updateCandidate(const char* bookId, uint32_t chapterUid, uint32_t index, const Candidate& item,
+                     bool staged = false);
 // 已经写过评论的片段，不设条数上限。
 bool visitStoredRanges(const char* bookId, uint32_t chapterUid, bool (*visit)(void* ctx, uint32_t start, uint32_t end),
                        void* ctx);
@@ -125,9 +132,9 @@ bool visitStoredRanges(const char* bookId, uint32_t chapterUid, bool (*visit)(vo
 // 流式写入一个 range 的评论。失败时 abort，不替换已有文件。
 class RangeFile {
  public:
-  // stage 时新内容先落在 .wrn.new，整段没有下一页才替换已有 .wrn。
+  // stage 时新内容先落在 .wrn.new。keepStaged 时即使这一段拉完也先留在 .new。
   bool begin(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end, bool copyExisting,
-             bool stage = false);
+             bool stage = false, bool keepStaged = false);
   void discardStaging();
   bool carriedCursor() const { return carried_; }
   uint32_t carriedMaxIdx() const { return carriedMaxIdx_; }
@@ -151,6 +158,7 @@ class RangeFile {
   bool capped_ = false;
   bool active_ = false;
   bool stage_ = false;
+  bool keepStaged_ = false;
   bool carried_ = false;
   uint32_t carriedMaxIdx_ = 0;
   uint64_t carriedSyncKey_ = 0;
@@ -201,7 +209,7 @@ using ReviewPageFetch = bool (*)(void* ctx, uint32_t maxIdx, uint64_t syncKey, R
 CollectResult collectRange(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end, uint32_t startMaxIdx,
                            uint64_t startSyncKey, bool copyExisting, ReviewPageFetch fetch, void* ctx,
                            int maxPages = kMaxReviewPages, uint32_t* totalCount = nullptr,
-                           uint32_t* markCount = nullptr, bool stage = false);
+                           uint32_t* markCount = nullptr, bool stage = false, bool keepStaged = false);
 
 std::string rangePath(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end);
 bool loadChapter(const char* bookId, uint32_t chapterUid, Range* ranges, size_t capacity, size_t& count,

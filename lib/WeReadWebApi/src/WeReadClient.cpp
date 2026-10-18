@@ -4692,7 +4692,7 @@ bool writeCandidate(void* ctx, const uint32_t start, const uint32_t end, const u
   return static_cast<WeReadComment::CandidateFile*>(ctx)->add(start, end, markCount);
 }
 
-bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid) {
+bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, const bool stage) {
   if (!commentIdSafe(bookId)) return false;
   if (!WeReadHttpClient::networkReady()) return false;
   WeReadStore::Session session;
@@ -4756,7 +4756,7 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid) {
     index.abort();
     return false;
   }
-  if (!index.finish()) return false;
+  if (!index.finish(stage)) return false;
   if (!WeReadStore::saveSession(session)) LOG_ERR("WR", "评论候选已解析，但会话没有写回");
   return true;
 }

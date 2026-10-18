@@ -14,8 +14,11 @@ namespace WeReadCommentOverlay {
 bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumber, uint32_t pageStart,
               uint32_t pageEnd);
 
-// 忽略新鲜期，从当前章重新拉评论。没有章节时不做任何事。
-void refetchChapter();
+// 手动重拉当前章。没有章节时是 Idle。成功前不替换已有评论。
+enum class ManualRefresh : uint8_t { Idle, Running, Succeeded, Failed, LoginRequired, Offline };
+ManualRefresh beginManualRefresh();
+ManualRefresh manualRefreshState();
+void cancelManualRefresh();
 
 // 后台写入了新评论。阅读循环用来刷新画面，本身不发请求。
 bool takeDirty();
