@@ -17,6 +17,7 @@
 #include "MappedInputManager.h"
 #include "NetworkStartup.h"
 #include "WifiCredentialStore.h"
+#include "network/SavedStationConnect.h"
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -268,20 +269,7 @@ void WifiSelectionActivity::startWifiScan(const bool autoScan) {
   networkRowItems.clear();
   requestUpdate();
 
-  // Set WiFi mode to station
-  if (!NetworkStartup::setMode(renderer, WIFI_STA)) {
-    LOG_ERR("WIFI", "Station initialization failed");
-    showNetworkError();
-    return;
-  }
-  WiFi.disconnect();
-  delay(100);
-
-  // Start async scan
-  if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) {
-    LOG_ERR("WIFI", "Could not start scan");
-    showNetworkError();
-  }
+  if (!SavedStationConnect::startScan(renderer)) showNetworkError();
 }
 
 void WifiSelectionActivity::processWifiScanResults() {
@@ -486,15 +474,30 @@ bool WifiSelectionActivity::tryAutoConnectCredential(const WifiCredential& cred)
 }
 
 bool WifiSelectionActivity::tryNextSavedNetworkFromScan() {
+  constexpr size_t kMax = SavedStationConnect::kMaxSavedNetworks;
+  SavedStationConnect::RankedSsid rows[kMax];
+  size_t rowCount = 0;
   for (const auto& network : networks) {
-    if (!network.hasSavedPassword || hasAttemptedAutoSsid(network.ssid)) {
-      continue;
-    }
+    if (!network.hasSavedPassword || network.ssid.empty()) continue;
+    // Saved rows are already sorted strongest-first, and the store holds at most kMax.
+    if (rowCount >= kMax) break;
+    rows[rowCount++] = {network.ssid.c_str(), network.rssi, true};
+  }
 
-    const auto cred = WIFI_STORE.findCredential(network.ssid);
-    if (cred && tryAutoConnectCredential(*cred)) {
-      return true;
-    }
+  const char* skip[kMax];
+  size_t skipCount = 0;
+  for (const auto& ssid : autoAttemptedSsids) {
+    if (skipCount >= kMax) break;
+    skip[skipCount++] = ssid.c_str();
+  }
+
+  while (skipCount < kMax) {
+    const SavedStationConnect::RankedSsid* picked =
+        SavedStationConnect::pickStrongestSaved(rows, rowCount, skip, skipCount);
+    if (!picked) return false;
+    const auto cred = WIFI_STORE.findCredential(picked->ssid);
+    if (cred && tryAutoConnectCredential(*cred)) return true;
+    skip[skipCount++] = picked->ssid;
   }
   return false;
 }
@@ -541,35 +544,9 @@ void WifiSelectionActivity::attemptConnection() {
   connectionError.clear();
   requestUpdate();
 
-  WiFi.persistent(false);  // Credentials are managed by WifiCredentialStore; suppress SDK NVS auto-connect
-  if (!NetworkStartup::setMode(renderer, WIFI_STA)) {
-    LOG_ERR("WIFI", "Station initialization failed");
+  const bool passPassword = selectedRequiresPassword && !enteredPassword.empty();
+  if (!SavedStationConnect::begin(renderer, selectedSSID.c_str(), enteredPassword.c_str(), passPassword)) {
     showNetworkError();
-    return;
-  }
-  WiFi.disconnect(true, true);  // Abort any in-progress SDK auto-connect and clear NVS-saved SSID
-  delay(100);
-
-  // Scan all channels so networks with multiple APs use the strongest matching
-  // BSSID instead of the first match found by the framework's default fast scan.
-  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
-  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-
-  // Set hostname so routers show "CrossPoint-Reader-AABBCCDDEEFF" instead of "esp32-XXXXXXXXXXXX"
-  uint8_t mac[6] = {};
-  if (readStationMac(mac)) {
-    char hostname[sizeof("CrossPoint-Reader-") + 12];
-    snprintf(hostname, sizeof(hostname), "CrossPoint-Reader-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3],
-             mac[4], mac[5]);
-    WiFi.setHostname(hostname);
-  } else {
-    LOG_ERR("WIFI", "Failed to read station MAC for hostname");
-  }
-
-  if (selectedRequiresPassword && !enteredPassword.empty()) {
-    WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str());
-  } else {
-    WiFi.begin(selectedSSID.c_str());
   }
 }
 
@@ -578,94 +555,89 @@ void WifiSelectionActivity::checkConnectionStatus() {
     return;
   }
 
-  const wl_status_t status = WiFi.status();
+  const unsigned long timeoutMs = autoConnecting ? SavedStationConnect::kAutoJoinTimeoutMs : CONNECTION_TIMEOUT_MS;
+  switch (SavedStationConnect::pollJoin(connectionStartTime, timeoutMs)) {
+    case SavedStationConnect::JoinWait::Pending:
+      return;
+    case SavedStationConnect::JoinWait::Connected:
+      break;
+    case SavedStationConnect::JoinWait::Failed:
+      connectionError = tr(STR_ERROR_GENERAL_FAILURE);
+      if (WiFi.status() == WL_NO_SSID_AVAIL) connectionError = tr(STR_ERROR_NETWORK_NOT_FOUND);
+      if (autoConnecting) {
+        handleAutoConnectFailure();
+        return;
+      }
+      state = WifiSelectionState::CONNECTION_FAILED;
+      requestUpdate();
+      return;
+    case SavedStationConnect::JoinWait::TimedOut:
+      WiFi.disconnect();
+      connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
+      if (autoConnecting) {
+        handleAutoConnectFailure();
+        return;
+      }
+      state = WifiSelectionState::CONNECTION_FAILED;
+      requestUpdate();
+      return;
+  }
 
-  if (status == WL_CONNECTED) {
-    // Successfully connected
-    IPAddress ip = WiFi.localIP();
-    char ipStr[16];
-    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
-    connectedIP = ipStr;
-    autoConnecting = false;
+  // Successfully connected
+  IPAddress ip = WiFi.localIP();
+  char ipStr[16];
+  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+  connectedIP = ipStr;
+  autoConnecting = false;
 
 #if defined(ENABLE_SERIAL_LOG) && LOG_LEVEL >= 2
-    uint8_t connectedBssid[6] = {};
-    WiFi.BSSID(connectedBssid);
-    LOG_DBG("WIFI", "Connected BSSID: %02x:%02x:%02x:%02x:%02x:%02x, channel: %d, RSSI: %d dBm",
-            static_cast<unsigned>(connectedBssid[0]), static_cast<unsigned>(connectedBssid[1]),
-            static_cast<unsigned>(connectedBssid[2]), static_cast<unsigned>(connectedBssid[3]),
-            static_cast<unsigned>(connectedBssid[4]), static_cast<unsigned>(connectedBssid[5]), WiFi.channel(),
-            WiFi.RSSI());
+  uint8_t connectedBssid[6] = {};
+  WiFi.BSSID(connectedBssid);
+  LOG_DBG("WIFI", "Connected BSSID: %02x:%02x:%02x:%02x:%02x:%02x, channel: %d, RSSI: %d dBm",
+          static_cast<unsigned>(connectedBssid[0]), static_cast<unsigned>(connectedBssid[1]),
+          static_cast<unsigned>(connectedBssid[2]), static_cast<unsigned>(connectedBssid[3]),
+          static_cast<unsigned>(connectedBssid[4]), static_cast<unsigned>(connectedBssid[5]), WiFi.channel(),
+          WiFi.RSSI());
 #endif
 
-    // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
-    // drifts ~2 ppm so one sync is enough; users can force a re-sync from
-    // Settings > System > Clock > Sync clock now.
-    if (halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
-      if (halClock.syncFromNTP()) {
-        SETTINGS.clockHasBeenSynced = 1;
-        SETTINGS.saveToFile();
-      }
+  // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
+  // drifts ~2 ppm so one sync is enough; users can force a re-sync from
+  // Settings > System > Clock > Sync clock now.
+  if (halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
+    if (halClock.syncFromNTP()) {
+      SETTINGS.clockHasBeenSynced = 1;
+      SETTINGS.saveToFile();
     }
-
-    // Every station join is a chance to snap the loan-clock floor to real
-    // time (non-blocking; see TrustedTime).
-    trustedtime::startSync();
-
-    // Save this as the last connected network - SD card operations need lock as
-    // we use SPI for both
-    {
-      RenderLock lock(*this);
-      WIFI_STORE.setLastConnectedSsid(selectedSSID);
-    }
-
-    // Every station join is a window where plugin senders are deliverable, so
-    // drain the plugin outboxes here (web server up and sleep entry are the
-    // other such moments). Cheap no-op when nothing is queued.
-    pluginevents::drain(&renderer);
-
-    // If we entered a new password, ask if user wants to save it
-    // Otherwise, immediately complete so parent can start web server
-    if (!usedSavedPassword && !enteredPassword.empty()) {
-      state = WifiSelectionState::SAVE_PROMPT;
-      savePromptSelection = 0;  // Default to "Yes"
-      requestUpdate();
-    } else {
-      // Using saved password or open network - complete immediately
-      LOG_DBG("WIFI",
-              "Connected with saved/open credentials, "
-              "completing immediately");
-      onComplete(true);
-    }
-    return;
   }
 
-  if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL) {
-    connectionError = tr(STR_ERROR_GENERAL_FAILURE);
-    if (status == WL_NO_SSID_AVAIL) {
-      connectionError = tr(STR_ERROR_NETWORK_NOT_FOUND);
-    }
-    if (autoConnecting) {
-      handleAutoConnectFailure();
-      return;
-    }
-    state = WifiSelectionState::CONNECTION_FAILED;
-    requestUpdate();
-    return;
+  // Every station join is a chance to snap the loan-clock floor to real
+  // time (non-blocking; see TrustedTime).
+  trustedtime::startSync();
+
+  // Save this as the last connected network - SD card operations need lock as
+  // we use SPI for both
+  {
+    RenderLock lock(*this);
+    WIFI_STORE.setLastConnectedSsid(selectedSSID);
   }
 
-  // Check for timeout
-  const unsigned long timeoutMs = autoConnecting ? AUTO_CONNECTION_TIMEOUT_MS : CONNECTION_TIMEOUT_MS;
-  if (millis() - connectionStartTime > timeoutMs) {
-    WiFi.disconnect();
-    connectionError = tr(STR_ERROR_CONNECTION_TIMEOUT);
-    if (autoConnecting) {
-      handleAutoConnectFailure();
-      return;
-    }
-    state = WifiSelectionState::CONNECTION_FAILED;
+  // Every station join is a window where plugin senders are deliverable, so
+  // drain the plugin outboxes here (web server up and sleep entry are the
+  // other such moments). Cheap no-op when nothing is queued.
+  pluginevents::drain(&renderer);
+
+  // If we entered a new password, ask if user wants to save it
+  // Otherwise, immediately complete so parent can start web server
+  if (!usedSavedPassword && !enteredPassword.empty()) {
+    state = WifiSelectionState::SAVE_PROMPT;
+    savePromptSelection = 0;  // Default to "Yes"
     requestUpdate();
-    return;
+  } else {
+    // Using saved password or open network - complete immediately
+    LOG_DBG("WIFI",
+            "Connected with saved/open credentials, "
+            "completing immediately");
+    onComplete(true);
   }
 }
 

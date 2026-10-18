@@ -99,9 +99,8 @@ class WifiSelectionActivity final : public Activity, private UiAppHost {
   int savePromptSelection = 0;
   int forgetPromptSelection = 0;
 
-  // Connection timeout
+  // Manual connection timeout. Unattended auto-connect uses SavedStationConnect::kAutoJoinTimeoutMs.
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
-  static constexpr unsigned long AUTO_CONNECTION_TIMEOUT_MS = 7000;
   unsigned long connectionStartTime = 0;
 
   // The UiAppHost app hosts the network list and the save/forget prompts

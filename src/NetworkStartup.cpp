@@ -19,6 +19,7 @@
 #include "BleInput.h"
 #include "SdCardFontSystem.h"
 #include "activities/RenderLock.h"
+#include "network/SavedStationConnect.h"
 
 namespace {
 
@@ -103,6 +104,250 @@ bool setMode(GfxRenderer& renderer, const wifi_mode_t mode) {
 
 namespace {
 bool readingHold = false;
+
+enum class ReadingRadioPhase : uint8_t { Idle, Joining, Scanning };
+
+constexpr unsigned long kReadingJoinRetryMs = 60000;
+constexpr unsigned long kReadingScanTimeoutMs = 15000;
+
+ReadingRadioPhase readingPhase = ReadingRadioPhase::Idle;
+unsigned long readingPhaseStartedMs = 0;
+bool readingScanDone = false;
+// Fixed cap matches the credential store. Kept in BSS so a scan does not fragment the reader heap.
+char readingJoinSsid[33] = {};
+char readingAttempted[SavedStationConnect::kMaxSavedNetworks][33] = {};
+uint8_t readingAttemptedCount = 0;
+char readingPending[SavedStationConnect::kMaxSavedNetworks][33] = {};
+uint8_t readingPendingCount = 0;
+uint8_t readingPendingNext = 0;
+
+void copyFixed(char* dest, const size_t size, const char* src) {
+  if (!dest || size == 0) return;
+  if (!src) {
+    dest[0] = '\0';
+    return;
+  }
+  std::strncpy(dest, src, size - 1);
+  dest[size - 1] = '\0';
+}
+
+void clearReadingCandidates() {
+  readingAttemptedCount = 0;
+  readingPendingCount = 0;
+  readingPendingNext = 0;
+  readingJoinSsid[0] = '\0';
+}
+
+bool alreadyAttempted(const char* ssid) {
+  for (uint8_t i = 0; i < readingAttemptedCount; ++i) {
+    if (std::strcmp(readingAttempted[i], ssid) == 0) return true;
+  }
+  return false;
+}
+
+void rememberAttempt(const char* ssid) {
+  if (!ssid || ssid[0] == '\0' || alreadyAttempted(ssid)) return;
+  if (readingAttemptedCount >= SavedStationConnect::kMaxSavedNetworks) return;
+  copyFixed(readingAttempted[readingAttemptedCount], sizeof(readingAttempted[0]), ssid);
+  ++readingAttemptedCount;
+}
+
+void quietReadingRadio() {
+  if (readingPhase == ReadingRadioPhase::Scanning) WiFi.scanDelete();
+  readingPhase = ReadingRadioPhase::Idle;
+  readingPendingCount = 0;
+  readingPendingNext = 0;
+  readingJoinSsid[0] = '\0';
+  if (WiFi.getMode() == WIFI_MODE_NULL) return;
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_OFF);
+}
+
+void finishReadingAttempt(const char* reason) {
+  if (reason) LOG_INF("NET", "%s", reason);
+  quietReadingRadio();
+}
+
+void noteReadingConnected();
+
+bool joinReadingSsid(GfxRenderer& renderer, const char* ssid, const char* password) {
+  const bool passPassword = password && password[0] != '\0';
+  if (!SavedStationConnect::begin(renderer, ssid, password, passPassword)) {
+    readingPhase = ReadingRadioPhase::Idle;
+    return false;
+  }
+  rememberAttempt(ssid);
+  copyFixed(readingJoinSsid, sizeof(readingJoinSsid), ssid);
+  readingPhase = ReadingRadioPhase::Joining;
+  readingPhaseStartedMs = millis();
+  LOG_INF("NET", "reading radio: joining %s", readingJoinSsid);
+  return true;
+}
+
+bool joinNextPending(GfxRenderer& renderer) {
+  while (readingPendingNext < readingPendingCount) {
+    const char* ssid = readingPending[readingPendingNext];
+    ++readingPendingNext;
+    char pass[64] = {};
+    const auto cred = WIFI_STORE.findCredential(ssid);
+    if (!cred) continue;
+    copyFixed(pass, sizeof(pass), cred->password.c_str());
+    if (joinReadingSsid(renderer, ssid, pass)) return true;
+    return false;
+  }
+  return false;
+}
+
+bool beginReadingScan(GfxRenderer& renderer) {
+  readingScanDone = true;
+  if (!SavedStationConnect::startScan(renderer)) {
+    finishReadingAttempt(nullptr);
+    return false;
+  }
+  readingPhase = ReadingRadioPhase::Scanning;
+  readingPhaseStartedMs = millis();
+  return true;
+}
+
+void fillPendingFromScan(const int16_t count) {
+  constexpr size_t kMax = SavedStationConnect::kMaxSavedNetworks;
+  // Eight saved SSIDs, copied once. The scan String from WiFi.SSID() does not outlive this function.
+  char ssids[kMax][33] = {};
+  SavedStationConnect::RankedSsid rows[kMax] = {};
+  size_t rowCount = 0;
+
+  for (int16_t i = 0; i < count; ++i) {
+    char ssid[33];
+    copyFixed(ssid, sizeof(ssid), WiFi.SSID(static_cast<uint8_t>(i)).c_str());
+    if (ssid[0] == '\0' || alreadyAttempted(ssid) || !WIFI_STORE.hasSavedCredential(ssid)) continue;
+
+    size_t existing = rowCount;
+    for (size_t row = 0; row < rowCount; ++row) {
+      if (std::strcmp(ssids[row], ssid) == 0) {
+        existing = row;
+        break;
+      }
+    }
+    const int32_t rssi = WiFi.RSSI(static_cast<uint8_t>(i));
+    if (existing < rowCount) {
+      if (rssi > rows[existing].rssi) rows[existing].rssi = rssi;
+      continue;
+    }
+    if (rowCount >= kMax) {
+      size_t weakest = 0;
+      for (size_t row = 1; row < rowCount; ++row) {
+        if (rows[row].rssi < rows[weakest].rssi) weakest = row;
+      }
+      if (rssi <= rows[weakest].rssi) continue;
+      copyFixed(ssids[weakest], sizeof(ssids[weakest]), ssid);
+      rows[weakest].ssid = ssids[weakest];
+      rows[weakest].rssi = rssi;
+      rows[weakest].saved = true;
+      continue;
+    }
+    copyFixed(ssids[rowCount], sizeof(ssids[rowCount]), ssid);
+    rows[rowCount] = {ssids[rowCount], rssi, true};
+    ++rowCount;
+  }
+
+  const char* skip[kMax] = {};
+  size_t skipCount = 0;
+  readingPendingCount = 0;
+  readingPendingNext = 0;
+  while (readingPendingCount < kMax && skipCount < kMax) {
+    const SavedStationConnect::RankedSsid* picked =
+        SavedStationConnect::pickStrongestSaved(rows, rowCount, skip, skipCount);
+    if (!picked) break;
+    copyFixed(readingPending[readingPendingCount], sizeof(readingPending[0]), picked->ssid);
+    skip[skipCount++] = readingPending[readingPendingCount];
+    ++readingPendingCount;
+  }
+}
+
+void advanceAfterJoinFailure(GfxRenderer& renderer) {
+  if (!readingScanDone) {
+    beginReadingScan(renderer);
+    return;
+  }
+  if (joinNextPending(renderer)) return;
+  finishReadingAttempt("reading radio: no reachable saved network");
+}
+
+void pumpReadingJoin(GfxRenderer& renderer) {
+  switch (SavedStationConnect::pollJoin(readingPhaseStartedMs, SavedStationConnect::kAutoJoinTimeoutMs)) {
+    case SavedStationConnect::JoinWait::Pending:
+      return;
+    case SavedStationConnect::JoinWait::Connected:
+      noteReadingConnected();
+      return;
+    case SavedStationConnect::JoinWait::Failed:
+    case SavedStationConnect::JoinWait::TimedOut:
+      advanceAfterJoinFailure(renderer);
+      return;
+  }
+}
+
+void pumpReadingScan(GfxRenderer& renderer) {
+  const int16_t result = WiFi.scanComplete();
+  if (result == WIFI_SCAN_RUNNING) {
+    if (static_cast<unsigned long>(millis() - readingPhaseStartedMs) > kReadingScanTimeoutMs) {
+      finishReadingAttempt("reading radio: scan timed out");
+    }
+    return;
+  }
+  if (result < 0) {
+    finishReadingAttempt("reading radio: scan failed");
+    return;
+  }
+
+  fillPendingFromScan(result);
+  WiFi.scanDelete();
+  readingPhase = ReadingRadioPhase::Idle;
+  if (joinNextPending(renderer)) return;
+  finishReadingAttempt("reading radio: no saved network in range");
+}
+
+bool startReadingJoin(GfxRenderer& renderer) {
+  if (readingPhase != ReadingRadioPhase::Idle) return true;
+  stayConnectAttemptAtMs = millis();
+  readingScanDone = false;
+  clearReadingCandidates();
+
+  if (WIFI_STORE.getCredentialCount() == 0) {
+    RenderLock lock;
+    WIFI_STORE.loadFromFile();
+  }
+  const std::string last = WIFI_STORE.getLastConnectedSsid();
+  if (last.empty() && WIFI_STORE.getCredentialCount() == 0) {
+    LOG_INF("NET", "stay connected: no saved network");
+    return false;
+  }
+  if (!last.empty()) {
+    char ssid[33];
+    char pass[64] = {};
+    copyFixed(ssid, sizeof(ssid), last.c_str());
+    const auto cred = WIFI_STORE.findCredential(ssid);
+    if (cred) copyFixed(pass, sizeof(pass), cred->password.c_str());
+    return joinReadingSsid(renderer, ssid, pass);
+  }
+  return beginReadingScan(renderer);
+}
+
+void noteReadingConnected() {
+  if (readingPhase != ReadingRadioPhase::Joining || readingJoinSsid[0] == '\0') {
+    if (readingPhase == ReadingRadioPhase::Scanning) WiFi.scanDelete();
+    readingPhase = ReadingRadioPhase::Idle;
+    readingJoinSsid[0] = '\0';
+    return;
+  }
+  {
+    RenderLock lock;
+    WIFI_STORE.setLastConnectedSsid(readingJoinSsid);
+  }
+  LOG_INF("NET", "reading radio: connected %s", readingJoinSsid);
+  readingPhase = ReadingRadioPhase::Idle;
+  readingJoinSsid[0] = '\0';
+}
 }
 
 bool smartOnlineReading() { return SETTINGS.wifiStayConnected != 0; }
@@ -119,44 +364,17 @@ void holdReadingRadio(const bool hold) { readingHold = hold; }
 void releaseReadingRadio() {
   readingHold = false;
   stayConnectAttemptAtMs = 0;
-  if (WiFi.getMode() == WIFI_MODE_NULL) return;
-  WiFi.disconnect(false);
-  WiFi.mode(WIFI_OFF);
+  readingScanDone = false;
+  clearReadingCandidates();
+  const bool radioOn = WiFi.getMode() != WIFI_MODE_NULL || readingPhase == ReadingRadioPhase::Scanning;
+  quietReadingRadio();
+  if (!radioOn) return;
   LOG_INF("NET", "reading radio off");
 }
 
 bool beginSavedNetwork(GfxRenderer& renderer) {
   if (WiFi.status() == WL_CONNECTED) return true;
-  if (WIFI_STORE.getCredentialCount() == 0) WIFI_STORE.loadFromFile();
-  const std::string last = WIFI_STORE.getLastConnectedSsid();
-  if (last.empty()) {
-    LOG_INF("NET", "stay connected: no saved network");
-    return false;
-  }
-  const auto cred = WIFI_STORE.findCredential(last);
-  // Copy off the store's strings before the driver starts. Password stays off the log.
-  // An open network is remembered by SSID only: the selection screen does not
-  // write a credential row when there is no password.
-  char ssid[33];
-  char pass[64] = {};
-  const char* ssidSrc = cred ? cred->ssid.c_str() : last.c_str();
-  const char* passSrc = cred ? cred->password.c_str() : "";
-  std::strncpy(ssid, ssidSrc, sizeof(ssid) - 1);
-  ssid[sizeof(ssid) - 1] = '\0';
-  std::strncpy(pass, passSrc, sizeof(pass) - 1);
-  pass[sizeof(pass) - 1] = '\0';
-
-  WiFi.persistent(false);
-  if (!setMode(renderer, WIFI_STA)) return false;
-  // begin() returns the current status. WL_IDLE_STATUS is 0 and means the
-  // join was accepted, not that it failed, so the return value is not a bool.
-  if (pass[0] == '\0') {
-    WiFi.begin(ssid);
-  } else {
-    WiFi.begin(ssid, pass);
-  }
-  LOG_INF("NET", "reading radio: joining %s", ssid);
-  return true;
+  return startReadingJoin(renderer);
 }
 
 void setStayConnected(GfxRenderer& renderer, const bool on) {
@@ -173,13 +391,29 @@ void setStayConnected(GfxRenderer& renderer, const bool on) {
 
 void serviceStayConnected(GfxRenderer& renderer) {
   if (!readingHold || !smartOnlineReading()) return;
-  if (WiFi.status() == WL_CONNECTED) return;
-  // One join at a time. A failed or dropped link retries a minute later,
-  // instead of calling begin() on the reading heartbeat.
-  const unsigned long now = millis();
-  if (stayConnectAttemptAtMs != 0 && static_cast<unsigned long>(now - stayConnectAttemptAtMs) < 60000UL) return;
-  stayConnectAttemptAtMs = now;
-  beginSavedNetwork(renderer);
+  if (WiFi.status() == WL_CONNECTED) {
+    noteReadingConnected();
+    return;
+  }
+  switch (readingPhase) {
+    case ReadingRadioPhase::Idle: {
+      // One attempt at a time. A miss or a dropped link retries a minute later,
+      // instead of calling begin() on the reading heartbeat.
+      const unsigned long now = millis();
+      if (stayConnectAttemptAtMs != 0 &&
+          static_cast<unsigned long>(now - stayConnectAttemptAtMs) < kReadingJoinRetryMs) {
+        return;
+      }
+      startReadingJoin(renderer);
+      return;
+    }
+    case ReadingRadioPhase::Joining:
+      pumpReadingJoin(renderer);
+      return;
+    case ReadingRadioPhase::Scanning:
+      pumpReadingScan(renderer);
+      return;
+  }
 }
 
 void releaseOwnedRadio() {

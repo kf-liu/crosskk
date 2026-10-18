@@ -16,16 +16,13 @@ class WifiStartupFailureTest(unittest.TestCase):
             'void WifiSelectionActivity::onScanEvent('))
         run_cpp(r'''
 #include <cassert>
-#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
 #define LOG_ERR(...) ((void)0)
 constexpr int WIFI_STA = 1, WIFI_SCAN_FAILED = -2;
-constexpr int WIFI_ALL_CHANNEL_SCAN = 0, WIFI_CONNECT_AP_BY_SIGNAL = 0;
 unsigned long millis() { return 0; }
 void delay(int) {}
-bool readStationMac(uint8_t (&)[6]) { return false; }
 namespace fui { struct ActionEvent {}; }
 enum class WifiSelectionState { SCANNING, NETWORK_ERROR, NETWORK_LIST, AUTO_CONNECTING, CONNECTING, CONNECTION_FAILED };
 namespace NetworkStartup {
@@ -43,6 +40,21 @@ struct {
  void setHostname(const char*) {}
  void begin(const char*, const char* = nullptr) { ++connections; }
 } WiFi;
+namespace SavedStationConnect {
+bool begin(int&, const char*, const char*, bool) {
+  if (!NetworkStartup::setMode(0, WIFI_STA)) return false;
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.begin("saved");
+  return true;
+}
+bool startScan(int&) {
+  if (!NetworkStartup::setMode(0, WIFI_STA)) return false;
+  WiFi.disconnect();
+  delay(100);
+  return WiFi.scanNetworks(true) != WIFI_SCAN_FAILED;
+}
+}
 class WifiSelectionActivity {
  public:
  int renderer = 0, realNetworkCount = 0;

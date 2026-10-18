@@ -29,14 +29,15 @@ bool stayConnected();
 void holdReadingRadio(bool hold);
 void releaseReadingRadio();
 
-// Join the last saved network without waiting. Already-connected is success.
-// No saved network returns false and leaves the radio as it was.
+// 和 Wi-Fi 选择界面同一条自动连接：先试上次的网络，失败再扫描，只连当前可见且已保存的。
+// 没有就结束，不弹出选择界面。已经连上算成功。不等待连接结果。
 bool beginSavedNetwork(GfxRenderer& renderer);
 
 // 记下模式。关掉时立即断无线电。打开时不在主页主动连接，等进入阅读。
 void setStayConnected(GfxRenderer& renderer, bool on);
 
-// 只有阅读会话握着连接时才补连，大约每分钟一次。
+// 阅读会话握着连接时，把进行中的扫描或连接收完。失败大约每分钟再试一次。
+// 这一轮没有可见的已保存网络就停。
 void serviceStayConnected(GfxRenderer& renderer);
 
 // Task-exit helper. Disconnects unless a reading session is holding the radio.

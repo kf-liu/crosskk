@@ -54,7 +54,8 @@ class WifiCredentialStore : public PersistableStore<WifiCredentialStore> {
   // Password-free snapshot for display/API consumers.
   std::vector<WifiCredentialSummary> getCredentialSummaries() const;
 
-  // Check if a network is saved
+  // Check if a network is saved. The C-string overload avoids a temporary during scans.
+  bool hasSavedCredential(const char* ssid) const;
   bool hasSavedCredential(const std::string& ssid) const;
 
   // Last connected network
