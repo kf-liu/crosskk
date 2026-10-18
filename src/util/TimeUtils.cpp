@@ -95,25 +95,32 @@ bool TimeUtils::localDateTimeToUtcEpoch(const int year, const unsigned month, co
     return false;
   }
 
-  std::tm local{};
-  local.tm_year = year - 1900;
-  local.tm_mon = static_cast<int>(month) - 1;
-  local.tm_mday = static_cast<int>(day);
-  local.tm_hour = static_cast<int>(hour);
-  local.tm_min = static_cast<int>(minute);
-  local.tm_isdst = -1;  // Let the configured timezone resolve ambiguous fall-back times.
-  const time_t utcSeconds = mktime(&local);
-  if (utcSeconds < VALID_CLOCK_THRESHOLD || static_cast<uint64_t>(utcSeconds) > UINT32_MAX) return false;
-
-  std::tm roundTrip{};
-  if (!getLocalDateTime(static_cast<uint32_t>(utcSeconds), roundTrip) || roundTrip.tm_year + 1900 != year ||
-      roundTrip.tm_mon + 1 != static_cast<int>(month) || roundTrip.tm_mday != static_cast<int>(day) ||
-      roundTrip.tm_hour != static_cast<int>(hour) || roundTrip.tm_min != static_cast<int>(minute)) {
-    return false;
+  // Walk a UTC guess until localtime_r shows this civil time. That is the same
+  // timezone the system clock uses. mktime() on device newlib can ignore TZ, which
+  // shifted reading-status timestamps by the offset while the settings clock stayed put.
+  const auto civilSeconds = [](const int y, const unsigned mo, const unsigned d, const int h, const int mi) {
+    return static_cast<int64_t>(getDayOrdinalForDate(y, mo, d)) * 86400 + static_cast<int64_t>(h) * 3600 +
+           static_cast<int64_t>(mi) * 60;
+  };
+  const int64_t want = civilSeconds(year, month, day, static_cast<int>(hour), static_cast<int>(minute));
+  int64_t guess = want;
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    if (guess < static_cast<int64_t>(VALID_CLOCK_THRESHOLD) || guess > UINT32_MAX) return false;
+    const time_t probe = static_cast<time_t>(guess);
+    if (static_cast<int64_t>(probe) != guess) return false;
+    std::tm local{};
+    if (!localtime_r(&probe, &local)) return false;
+    const int64_t shown = civilSeconds(local.tm_year + 1900, static_cast<unsigned>(local.tm_mon + 1),
+                                       static_cast<unsigned>(local.tm_mday), local.tm_hour, local.tm_min);
+    if (shown == want) {
+      epochSeconds = static_cast<uint32_t>(guess);
+      return true;
+    }
+    const int64_t next = guess + (want - shown);
+    if (next == guess) return false;
+    guess = next;
   }
-
-  epochSeconds = static_cast<uint32_t>(utcSeconds);
-  return true;
+  return false;
 }
 
 bool TimeUtils::formatTime(const uint32_t epochSeconds, const uint8_t encodedOffset, const bool use12Hour, char* buffer,

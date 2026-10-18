@@ -24,7 +24,8 @@ bool getLocalDateTime(uint32_t epochSeconds, std::tm& out);
 // Explicit fixed-offset conversion, independent of the system timezone.
 bool getLocalDateTime(uint32_t epochSeconds, uint8_t utcOffsetQuarterHoursBiased, std::tm& out);
 
-// Convert local civil time to UTC; reject invalid dates and DST gaps.
+// Convert local civil time to UTC using the system timezone (the same rules as
+// localtime_r). Reject invalid dates and DST gaps.
 bool localDateTimeToUtcEpoch(int year, unsigned month, unsigned day, unsigned hour, unsigned minute,
                              uint32_t& epochSeconds);
 unsigned getDaysInMonth(int year, unsigned month);

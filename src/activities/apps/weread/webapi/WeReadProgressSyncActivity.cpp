@@ -40,7 +40,8 @@ namespace {
 static_assert(sizeof(WeReadClient::Operation) <= 8 * 1024, "WeRead progress workspace exceeds its fixed heap budget");
 
 #if !CROSSPOINT_EMULATED
-// FAT 日期时间打包成 date<<16|time。年从 1980 起，秒被折半存，这里只取到分钟。
+// FAT 目录时间是系统时区下的钟面（写入时用 localtime，和设置里的系统时间同一套规则）。
+// 年从 1980 起，秒被折半存，这里只取到分钟。再按同一时区折回 UTC，显示时不会多偏一个时区。
 uint32_t fatPackedToUnix(const uint32_t packed) {
   if (packed == 0) return 0;
   const uint16_t date = static_cast<uint16_t>(packed >> 16);

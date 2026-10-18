@@ -10,6 +10,7 @@
 #endif
 
 #include <cassert>
+#include <ctime>
 
 #if FREEINK_DEVICE_READPICO
 #include <BoardReadPico.h>
@@ -21,6 +22,23 @@ namespace {
 #if FREEINK_CAP_USB_MSC
 freeink::UsbMassStorage usbMassStorage;
 #endif
+
+// SdFat only stamps a file when this callback is set; otherwise progress.bin
+// keeps 1 Jan of the compile year. The fields are local civil time in the
+// system timezone, the same localtime_r the settings clock uses.
+void stampFileLocalTime(uint16_t* date, uint16_t* time) {
+  const time_t now = ::time(nullptr);
+  struct tm local{};
+  if (!date || !time || now <= 0 || !localtime_r(&now, &local)) {
+    if (date) *date = 0;
+    if (time) *time = 0;
+    return;
+  }
+  *date = FS_DATE(static_cast<uint16_t>(local.tm_year + 1900), static_cast<uint8_t>(local.tm_mon + 1),
+                  static_cast<uint8_t>(local.tm_mday));
+  *time = FS_TIME(static_cast<uint8_t>(local.tm_hour), static_cast<uint8_t>(local.tm_min),
+                  static_cast<uint8_t>(local.tm_sec));
+}
 }  // namespace
 
 HalStorage HalStorage::instance;
@@ -33,6 +51,7 @@ HalStorage::HalStorage() {
 // begin() and ready() are only called from setup, no need to acquire mutex for them
 
 bool HalStorage::begin() {
+  FsDateTime::setCallback(stampFileLocalTime);
   const bool mounted = SDCard.begin();
 #if FREEINK_DEVICE_READPICO
   if (!mounted) {
