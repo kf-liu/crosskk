@@ -1,0 +1,70 @@
+name: Metalio E-Ink 4 release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: metalio-eink4-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  select_runner:
+    uses: ./.github/workflows/select-build-runner.yml
+    secrets:
+      runner_status_token: ${{ secrets.H2O_RUNNER_TOKEN }}
+
+  release:
+    needs: select_runner
+    runs-on: ${{ fromJSON(needs.select_runner.outputs['runs-on']) }}
+    permissions:
+      contents: write
+    steps:
+      - name: Isolate PlatformIO toolchains
+        run: echo "PLATFORMIO_CORE_DIR=$RUNNER_TEMP/.platformio-$GITHUB_RUN_ID-$GITHUB_JOB-metalio_eink4" >> "$GITHUB_ENV"
+      - name: Use runner temporary directory
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: latest
+          enable-cache: false
+      - name: Install PlatformIO Core
+        run: uv pip install --system -U pioarduino==6.2.0
+      - name: Prepare platform tools
+        run: python scripts/patch_pioarduino_cache.py --prepare-platform
+      - name: Set seven-character build revision
+        run: echo "CROSSPOINT_RC_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Build Metalio nightly firmware
+        run: pio run -e metalio_eink4_nightly
+      - name: Package and verify Metalio target
+        run: |
+          set -euo pipefail
+          python3 scripts/package_nightly_target.py metalio_eink4 \
+            --channel nightly \
+            --output dist/metalio_eink4
+          (cd dist/metalio_eink4 && sha256sum --check *-SHA256SUMS)
+      - name: Publish Metalio release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="metalio-eink4-${GITHUB_SHA::7}-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          cat > release-body.md << EOF
+          Manual Metalio E-Ink 4 package from \`${GITHUB_SHA}\`.
+
+          Built with \`pio run -e metalio_eink4_nightly\` and packaged with \`scripts/package_nightly_target.py metalio_eink4 --channel nightly\`.
+          This prerelease does not update the rolling Nightly index.
+          EOF
+          mapfile -t assets < <(find dist/metalio_eink4 -type f -print)
+          gh release create "$tag" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Metalio E-Ink 4 ${GITHUB_SHA::7}" \
+            --notes-file release-body.md --prerelease
