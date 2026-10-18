@@ -22,7 +22,7 @@
 #include <VectorFontSupport.h>
 #include <WiFi.h>
 #include <XteinkDetect.h>
-#if FREEINK_DEVICE_METALIO_EINK4
+#if FREEINK_DEVICE_METALIO_EINK4 && !defined(SIMULATOR)
 #include <MetalioEink4Board.h>
 #endif
 #if FREEINK_CAP_TOUCH
@@ -686,7 +686,7 @@ void continueChineseFontInstall(const uint8_t expectedPointSize) {
 #endif
 
 void setup() {
-#if FREEINK_DEVICE_METALIO_EINK4
+#if FREEINK_DEVICE_METALIO_EINK4 && !defined(SIMULATOR)
   // Latch main power before serial or the touch-reset delays. holdPowerRails()
   // only drives ESP GPIO latches, which this board does not have.
   freeink::metalio::latchRails();

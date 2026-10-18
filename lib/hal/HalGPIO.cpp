@@ -2,6 +2,11 @@
 #if FREEINK_DEVICE_METALIO_EINK4
 #include <MetalioEink4Board.h>
 #endif
+#if FREEINK_DEVICE_METALIO_EINK4 && !defined(SIMULATOR)
+#include <esp_rom_gpio.h>
+#include <esp_rom_sys.h>
+#include <soc/gpio_struct.h>
+#endif
 #if FREEINK_DEVICE_READPICO
 #include <BoardReadPico.h>
 #endif
@@ -530,3 +535,86 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
   }
   return WakeupReason::Other;
 }
+
+#if FREEINK_DEVICE_METALIO_EINK4 && !defined(SIMULATOR)
+namespace {
+constexpr int kMetalioSda = 41;
+constexpr int kMetalioScl = 42;
+
+uint32_t metalioBankBit(const int pin) { return 1u << (pin - 32); }
+
+void metalioRelease(const int pin) { GPIO.enable1_w1tc.val = metalioBankBit(pin); }
+
+void metalioDriveLow(const int pin) {
+  GPIO.out1_w1tc.val = metalioBankBit(pin);
+  GPIO.enable1_w1ts.val = metalioBankBit(pin);
+}
+
+void metalioSetLine(const int pin, const bool released) {
+  if (released) metalioRelease(pin);
+  else metalioDriveLow(pin);
+}
+
+void metalioPause() { esp_rom_delay_us(5); }
+
+void metalioI2cStart() {
+  metalioSetLine(kMetalioSda, true);
+  metalioSetLine(kMetalioScl, true);
+  metalioPause();
+  metalioSetLine(kMetalioSda, false);
+  metalioPause();
+  metalioSetLine(kMetalioScl, false);
+  metalioPause();
+}
+
+void metalioI2cStop() {
+  metalioSetLine(kMetalioSda, false);
+  metalioPause();
+  metalioSetLine(kMetalioScl, true);
+  metalioPause();
+  metalioSetLine(kMetalioSda, true);
+  metalioPause();
+}
+
+bool metalioWriteByte(const uint8_t value) {
+  for (int bit = 7; bit >= 0; --bit) {
+    metalioSetLine(kMetalioSda, ((value >> bit) & 1) != 0);
+    metalioPause();
+    metalioSetLine(kMetalioScl, true);
+    metalioPause();
+    metalioSetLine(kMetalioScl, false);
+  }
+  metalioSetLine(kMetalioSda, true);
+  metalioPause();
+  metalioSetLine(kMetalioScl, true);
+  metalioPause();
+  const bool ack = (GPIO.in1.val & metalioBankBit(kMetalioSda)) == 0;
+  metalioSetLine(kMetalioScl, false);
+  metalioPause();
+  return ack;
+}
+
+bool metalioWrite16(const uint8_t reg, const uint16_t value) {
+  metalioI2cStart();
+  const bool ok = metalioWriteByte(static_cast<uint8_t>(freeink::metalio::EXPANDER << 1)) && metalioWriteByte(reg) &&
+                  metalioWriteByte(static_cast<uint8_t>(value)) && metalioWriteByte(static_cast<uint8_t>(value >> 8));
+  metalioI2cStop();
+  return ok;
+}
+
+// 引导程序校验镜像前已经锁过一次。这里再写一遍，旧引导程序仍能在应用起来后保住电源。
+void metalioHoldPowerEarly() {
+  for (const int pin : {kMetalioSda, kMetalioScl}) {
+    esp_rom_gpio_pad_select_gpio(pin);
+    esp_rom_gpio_pad_pullup_only(pin);
+    metalioRelease(pin);
+  }
+  const uint16_t hold = freeink::metalio::BOOT_OUTPUT;
+  if (!metalioWrite16(2, hold) || !metalioWrite16(6, static_cast<uint16_t>(~hold))) {
+    esp_rom_printf("[metalio] early power hold failed\r\n");
+  }
+}
+
+__attribute__((constructor(101))) void metalioHoldPowerBeforeArduinoInit() { metalioHoldPowerEarly(); }
+}  // namespace
+#endif

@@ -121,11 +121,17 @@ on the physical device; this does not extend the earlier display-retention or
 power-cycle acceptance.
 
 The initial held Power gesture and its release are consumed on every boot.
-`setup()` latches main power, the power-key hold, and USB routing on the expander
-before serial startup or the touch-reset delays. A press has to outlast the chip
-bootloader plus that I2C write; releasing earlier drops the rail because the
-application is not running yet. Subsequent Power gestures and automatic sleep use existing
-settings. Shutdown saves reading state, renders the sleep screen and parks the controller before
+The expander powers up with every pin as an input, so writing the output latch
+alone does not hold the rail. The second-stage bootloader calls a power-hold
+routine after its own hardware init and before it checksums the application
+image. That routine bit-bangs the expander: the output latch first, then the
+main-power, power-key hold, and USB-route pins as outputs. A press has to cover
+the ROM loading that bootloader, not the application checksum. The application
+repeats the same pair of writes from a constructor and again from `setup()`,
+before serial startup or the touch-reset delays. Replacing only the application
+leaves the previous bootloader in place, so a short press still needs a
+full-table flash that includes `bootloader.bin`. Subsequent Power gestures and
+automatic sleep use existing settings. Shutdown saves reading state, renders the sleep screen and parks the controller before
 continuously sending 100 ms high/100 ms low power-key pulses until hardware
 removes power, matching the reference board. MAIN/SCREEN rails stay enabled and
 PA stays off. There is no three-pulse limit or ESP deep-sleep fallback, including
