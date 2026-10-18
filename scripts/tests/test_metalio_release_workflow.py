@@ -9,6 +9,7 @@ class MetalioReleaseWorkflowTest(unittest.TestCase):
     def test_manual_release_follows_the_local_package_flow(self):
         workflow = (ROOT / '.github/workflows/metalio-eink4-release.yml').read_text()
         self.assertIn('workflow_dispatch:', workflow)
+        self.assertNotIn('\n  push:', workflow)
         self.assertNotIn('\n  pull_request:', workflow)
         self.assertNotIn('\n  schedule:', workflow)
         self.assertIn('pio run -e metalio_eink4_nightly', workflow)
