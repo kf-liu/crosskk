@@ -784,8 +784,8 @@ bool rangeHasMore(const char* bookId, const uint32_t chapterUid, const uint32_t 
   return comment.hasMore;
 }
 
-// 整章拉完后 6 小时内不再请求。够覆盖一次阅读和当天返回，隔夜再进章会更新。
-constexpr uint32_t kCommentFreshSeconds = 6 * 60 * 60;
+// 整章拉完后 48 小时内不再请求。覆盖两天内的反复打开；过期后再进章会在后台更新。
+constexpr uint32_t kCommentFreshSeconds = 48 * 60 * 60;
 
 enum class WorkKind : uint8_t { None, Underlines, Range, More };
 
@@ -803,6 +803,8 @@ struct Assignment {
   uint32_t maxIdx = 0;
   uint64_t syncKey = 0;
   bool copyExisting = false;
+  // 已有评论先留着。新内容写到旁边，整段成功才替换。
+  bool stage = false;
 };
 
 struct PendingHit {
@@ -817,14 +819,40 @@ struct ChapterScan {
   bool refreshStored = false;
   bool found = false;
   bool anyFailed = false;
+  uint32_t generation = 0;
   uint32_t index = 0;
   WeReadComment::Candidate item;
 };
+
+// 一章里这一轮已经拉完的段。静态位图，不随段数在堆上增长。
+// 超过 1024 段的已存评论这一轮不再重拉，避免完成后再被选中、反复请求。
+constexpr uint32_t kSettledRangeCap = 1024;
+uint8_t settledBits[kSettledRangeCap / 8] = {};
+uint32_t settledGeneration = 0;
+
+bool rangeSettled(const uint32_t generation, const uint32_t index) {
+  if (generation != settledGeneration || index >= kSettledRangeCap) return false;
+  return (settledBits[index / 8] & static_cast<uint8_t>(1u << (index % 8))) != 0;
+}
+
+void markRangeSettled(const uint32_t generation, const uint32_t index) {
+  if (generation != settledGeneration) {
+    memset(settledBits, 0, sizeof(settledBits));
+    settledGeneration = generation;
+  }
+  if (index >= kSettledRangeCap) return;
+  settledBits[index / 8] |= static_cast<uint8_t>(1u << (index % 8));
+}
 
 bool scanChapter(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
   auto* hit = static_cast<ChapterScan*>(raw);
   if (item.query == WeReadComment::CandidateQuery::Failed) {
     hit->anyFailed = true;
+    return true;
+  }
+  // 这一轮拉完的已存段不再选。否则刷新标志还在时，成功写回的段会立刻被再拉一次。
+  if (hit->refreshStored && item.query == WeReadComment::CandidateQuery::Stored &&
+      (index >= kSettledRangeCap || rangeSettled(hit->generation, index))) {
     return true;
   }
   const bool open = item.query == WeReadComment::CandidateQuery::Unknown ||
@@ -855,6 +883,50 @@ bool rememberCandidate(const char* bookId, const uint32_t chapterUid, const uint
   if (totalCount > item.commentTotal) item.commentTotal = totalCount;
   if (markCount > item.markCount) item.markCount = markCount;
   return WeReadComment::updateCandidate(bookId, chapterUid, index, item);
+}
+
+uint8_t failedBits[kSettledRangeCap / 8] = {};
+
+bool noteFailedCandidate(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
+  if (item.query != WeReadComment::CandidateQuery::Failed) return true;
+  if (index >= kSettledRangeCap) {
+    *static_cast<bool*>(raw) = true;
+    return true;
+  }
+  failedBits[index / 8] |= static_cast<uint8_t>(1u << (index % 8));
+  return true;
+}
+
+void reopenOneFailed(const char* bookId, const uint32_t chapterUid, const uint32_t index,
+                     const WeReadComment::Candidate& item) {
+  WeReadComment::Candidate next = item;
+  const std::string path = WeReadComment::rangePath(bookId, chapterUid, item.start, item.end);
+  // 有旧文件就按已存重拉，这样新内容写到旁边，失败不会盖掉已有评论。
+  next.query = (!path.empty() && Storage.exists(path.c_str())) ? WeReadComment::CandidateQuery::Stored
+                                                                : WeReadComment::CandidateQuery::Unknown;
+  WeReadComment::updateCandidate(bookId, chapterUid, index, next);
+}
+
+void reopenFailedRanges(const char* bookId, const uint32_t chapterUid) {
+  // 遍历时文件还开着，不能在回调里改索引。先记下失败段，关文件后再写。
+  memset(failedBits, 0, sizeof(failedBits));
+  bool overflow = false;
+  WeReadComment::visitCandidates(bookId, chapterUid, noteFailedCandidate, &overflow);
+  for (uint32_t index = 0; index < kSettledRangeCap; ++index) {
+    if ((failedBits[index / 8] & static_cast<uint8_t>(1u << (index % 8))) == 0) continue;
+    WeReadComment::Candidate item;
+    if (!WeReadComment::readCandidate(bookId, chapterUid, index, item) ||
+        item.query != WeReadComment::CandidateQuery::Failed) {
+      continue;
+    }
+    reopenOneFailed(bookId, chapterUid, index, item);
+  }
+  if (!overflow) return;
+  for (uint32_t index = kSettledRangeCap;; ++index) {
+    WeReadComment::Candidate item;
+    if (!WeReadComment::readCandidate(bookId, chapterUid, index, item)) return;
+    if (item.query == WeReadComment::CandidateQuery::Failed) reopenOneFailed(bookId, chapterUid, index, item);
+  }
 }
 
 bool pickWork(Assignment& work) {
@@ -897,17 +969,23 @@ bool pickWork(Assignment& work) {
   if (scanChapterWork) {
     ChapterScan hit;
     hit.refreshStored = refreshStored;
+    hit.generation = work.generation;
     const bool visited = WeReadComment::visitCandidates(work.bookId, work.chapterUid, scanChapter, &hit);
     if (visited && hit.found) {
       work.kind = WorkKind::Range;
       work.rangeIndex = hit.index;
       work.start = hit.item.start;
       work.end = hit.item.end;
-      work.copyExisting = hit.item.query == WeReadComment::CandidateQuery::Partial;
+      const std::string live = WeReadComment::rangePath(work.bookId, work.chapterUid, work.start, work.end);
+      const bool staging = !live.empty() && Storage.exists((live + ".new").c_str());
+      work.stage = staging || (refreshStored && hit.item.query == WeReadComment::CandidateQuery::Stored);
+      work.copyExisting = hit.item.query == WeReadComment::CandidateQuery::Partial || staging;
     } else if (visited && !hit.found) {
       const uint32_t now = TimeUtils::getCurrentValidTimestamp();
       const bool marked = !hit.anyFailed && now != 0 &&
                           WeReadComment::markChapterFetched(work.bookId, work.chapterUid, now);
+      // 没拉完不算这次成功。去掉完成时间，评论文件留下，下次进章再试。
+      if (hit.anyFailed) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
       lockState();
       if (work.generation != job().generation) {
         unlockState();
@@ -922,7 +1000,7 @@ bool pickWork(Assignment& work) {
       }
     }
   }
-  if (work.kind == WorkKind::Range && work.copyExisting) {
+  if (work.kind == WorkKind::Range && work.copyExisting && !work.stage) {
     char scratch[2] = {};
     WeReadComment::StoredComment comment;
     if (WeReadComment::readComment(work.bookId, work.chapterUid, work.start, work.end, 0, scratch, sizeof(scratch),
@@ -976,6 +1054,8 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   }
   if (work.kind == WorkKind::More) {
     moreState.store(result == WeReadComment::CollectResult::Failed ? kMoreFailed : kMoreIdle);
+  } else if (query == WeReadComment::CandidateQuery::Stored || query == WeReadComment::CandidateQuery::Empty) {
+    markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
   }
   dirty.store(true);
   unlockState();
@@ -1014,17 +1094,18 @@ bool stepOnce() {
     }
     Round& state = round();
     if (!ok) {
-      if (!WeReadHttpClient::networkReady()) {
-        state.phase = Phase::Offline;
-        unlockState();
-        return false;
+      if (WeReadHttpClient::networkReady()) {
+        WeReadStore::Session session;
+        if (!WeReadStore::loadSession(session) || !session.valid()) state.sessionMissing = true;
+        else state.underlinesFailed = true;
       }
-      WeReadStore::Session session;
-      if (!WeReadStore::loadSession(session) || !session.valid()) state.sessionMissing = true;
-      else state.underlinesFailed = true;
+      // 这一轮已经试过。停在失败，不在本章里马上再拉；完成时间去掉，下次进入再试。
       state.phase = Phase::Failed;
+      state.refreshStored = false;
+      job().fetch = false;
       unlockState();
-      return true;
+      WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
+      return false;
     }
     state.underlinesReady = true;
     state.phase = Phase::Loading;
@@ -1050,9 +1131,11 @@ bool stepOnce() {
   ctx.rangeText = rangeText;
   uint32_t totalCount = 0;
   uint32_t markCount = 0;
-  const auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
-                                                   work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
-                                                   &markCount);
+  auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
+                                            work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
+                                            &markCount, work.stage);
+  // 重新拉取没成功时不要把已有评论标成空。
+  if (work.stage && result != WeReadComment::CollectResult::Stored) result = WeReadComment::CollectResult::Failed;
   applyRangeResult(work, result, totalCount, markCount);
   return true;
 #else
@@ -1102,6 +1185,8 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
                            strncmp(current.bookId, bookId, sizeof(current.bookId)) == 0;
   // 离线进来之后网络恢复，补一次本章拉取。翻页本身不再发请求。
   const bool resumeOffline = sameChapter && state.phase == Phase::Offline && online && !sessionMissing;
+  // 手动重拉时如果当时离线，网络恢复后仍要拉，不能因为 48 小时记录还在就跳过。
+  const bool honorStaleRefresh = resumeOffline && state.refreshStored;
   unlockState();
   if (sameChapter && !resumeOffline) return false;
 
@@ -1125,10 +1210,18 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   const bool haveCandidates = WeReadComment::candidatesReady(bookId, chapterUid);
   const bool blocked = !online || sessionMissing;
 
+  char abandonedId[64] = {};
+  uint32_t abandonedUid = 0;
+  bool abandonRefresh = false;
   lockState();
   const Phase previous = state.phase;
   if (!state.haveChapter || state.chapterUid != chapterUid ||
       strncmp(state.bookId, bookId, sizeof(state.bookId)) != 0) {
+    if (state.refreshStored && state.haveChapter && state.bookId[0] != '\0') {
+      strncpy(abandonedId, state.bookId, sizeof(abandonedId) - 1);
+      abandonedUid = state.chapterUid;
+      abandonRefresh = true;
+    }
     beginChapter(state, bookId, chapterUid);
     current.generation++;
   }
@@ -1141,12 +1234,12 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   current.spine = spineIndex;
   current.page = pageNumber;
   current.active = true;
-  if (fresh) {
+  if (fresh && !honorStaleRefresh) {
     state.underlinesReady = true;
     state.refreshStored = false;
     current.fetch = false;
     state.phase = Phase::Idle;
-    LOG_INF("WR", "本章评论 6 小时内已拉完，跳过");
+    LOG_INF("WR", "本章评论 48 小时内已拉完，跳过");
   } else if (blocked) {
     state.underlinesReady = haveCandidates;
     state.refreshStored = false;
@@ -1163,7 +1256,11 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   const bool phaseChanged = state.phase != previous;
   const bool fetch = current.fetch;
   unlockState();
-  if (fetch) notifyWorker();
+  if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
+  if (fetch) {
+    reopenFailedRanges(bookId, chapterUid);
+    notifyWorker();
+  }
   return phaseChanged;
 }
 
@@ -1215,7 +1312,6 @@ void refetchChapter() {
   const bool sessionMissing = state.sessionMissing;
   unlockState();
 
-  WeReadComment::clearChapterFetched(bookId, chapterUid);
   const bool online = WeReadHttpClient::networkReady();
   lockState();
   if (!state.haveChapter || state.chapterUid != chapterUid ||
@@ -1235,7 +1331,10 @@ void refetchChapter() {
   const bool fetch = current.fetch;
   unlockState();
   dirty.store(true);
-  if (fetch) notifyWorker();
+  if (fetch) {
+    reopenFailedRanges(bookId, chapterUid);
+    notifyWorker();
+  }
 }
 
 const char* chapterStatus() {
@@ -1734,7 +1833,15 @@ void drawPanel(GfxRenderer& renderer) {
 }
 
 void reset() {
+  char abandonedId[64] = {};
+  uint32_t abandonedUid = 0;
+  bool abandonRefresh = false;
   lockState();
+  if (round().refreshStored && job().bookId[0] != '\0') {
+    strncpy(abandonedId, job().bookId, sizeof(abandonedId) - 1);
+    abandonedUid = job().chapterUid;
+    abandonRefresh = true;
+  }
   const uint32_t generation = job().generation + 1;
   round() = {};
   round().settledSpine = -1;
@@ -1742,6 +1849,8 @@ void reset() {
   job() = {};
   job().generation = generation;
   unlockState();
+  // 退出时这一轮还没拉完。去掉完成时间，评论文件留下，下次进入再试。
+  if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
   moreState.store(kMoreIdle);
   markPanel(false);
   underlayReady = true;

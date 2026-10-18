@@ -125,7 +125,13 @@ bool visitStoredRanges(const char* bookId, uint32_t chapterUid, bool (*visit)(vo
 // 流式写入一个 range 的评论。失败时 abort，不替换已有文件。
 class RangeFile {
  public:
-  bool begin(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end, bool copyExisting);
+  // stage 时新内容先落在 .wrn.new，整段没有下一页才替换已有 .wrn。
+  bool begin(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end, bool copyExisting,
+             bool stage = false);
+  void discardStaging();
+  bool carriedCursor() const { return carried_; }
+  uint32_t carriedMaxIdx() const { return carriedMaxIdx_; }
+  uint64_t carriedSyncKey() const { return carriedSyncKey_; }
   bool add(const char* author, const char* text, size_t textLen, bool truncated);
   bool finish(uint32_t maxIdx, uint64_t syncKey, bool hasMore);
   void abort();
@@ -144,6 +150,10 @@ class RangeFile {
   uint32_t count_ = 0;
   bool capped_ = false;
   bool active_ = false;
+  bool stage_ = false;
+  bool carried_ = false;
+  uint32_t carriedMaxIdx_ = 0;
+  uint64_t carriedSyncKey_ = 0;
 };
 
 // 解析器放堆上，避免把 2KB 词法缓冲放进阅读任务栈。
@@ -191,7 +201,7 @@ using ReviewPageFetch = bool (*)(void* ctx, uint32_t maxIdx, uint64_t syncKey, R
 CollectResult collectRange(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end, uint32_t startMaxIdx,
                            uint64_t startSyncKey, bool copyExisting, ReviewPageFetch fetch, void* ctx,
                            int maxPages = kMaxReviewPages, uint32_t* totalCount = nullptr,
-                           uint32_t* markCount = nullptr);
+                           uint32_t* markCount = nullptr, bool stage = false);
 
 std::string rangePath(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end);
 bool loadChapter(const char* bookId, uint32_t chapterUid, Range* ranges, size_t capacity, size_t& count,

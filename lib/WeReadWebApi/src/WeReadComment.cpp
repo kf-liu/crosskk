@@ -139,8 +139,12 @@ std::string rangePath(const char* bookId, const uint32_t chapterUid, const uint3
 }
 
 bool RangeFile::begin(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
-                      const bool copyExisting) {
+                      const bool copyExisting, const bool stage) {
   abort();
+  stage_ = stage;
+  carried_ = false;
+  carriedMaxIdx_ = 0;
+  carriedSyncKey_ = 0;
   if (end <= start) return false;
   std::string directory;
   if (!chapterDirectory(bookId, chapterUid, directory, true)) return false;
@@ -168,15 +172,20 @@ bool RangeFile::begin(const char* bookId, const uint32_t chapterUid, const uint3
   capped_ = false;
   active_ = true;
 
-  if (!copyExisting || !Storage.exists(finalPath_.c_str())) return true;
+  // 重新拉取时接着 .new 写，不把已有 .wrn 抄进来，避免失败时把旧评论改掉。
+  const std::string source = stage_ ? finalPath_ + ".new" : finalPath_;
+  if (!copyExisting || !Storage.exists(source.c_str())) return true;
   HalFile existing;
   Header previous;
-  if (!Storage.openFileForRead("WR", finalPath_, existing) ||
+  if (!Storage.openFileForRead("WR", source, existing) ||
       existing.read(&previous, sizeof(previous)) != static_cast<int>(sizeof(previous)) || previous.magic != kMagic ||
       previous.version != kVersion || previous.headerSize != kHeaderSize || previous.chapterUid != chapterUid ||
       previous.rangeStart != start || previous.rangeEnd != end || previous.commentCount > kMaxStoredComments) {
     return true;
   }
+  carried_ = true;
+  carriedMaxIdx_ = previous.maxIdx;
+  carriedSyncKey_ = previous.syncKey;
   for (uint32_t i = 0; i < previous.commentCount; ++i) {
     CommentHead head;
     if (existing.read(&head, sizeof(head)) != static_cast<int>(sizeof(head)) || head.authorLen > kMaxAuthorBytes ||
@@ -229,11 +238,25 @@ bool RangeFile::finish(const uint32_t maxIdx, const uint64_t syncKey, const bool
   file_.flush();
   file_.close();
   active_ = false;
-  if (!WeReadStore::atomicReplace(partPath_, finalPath_)) {
+  // 还有下一页时只更新 .new，已有 .wrn 继续给界面用。整段结束后才替换。
+  const std::string target = stage_ && hasMore ? finalPath_ + ".new" : finalPath_;
+  if (!WeReadStore::atomicReplace(partPath_, target)) {
     Storage.remove(partPath_.c_str());
     return false;
   }
+  partPath_.clear();
+  if (stage_ && !hasMore) {
+    const std::string staging = finalPath_ + ".new";
+    if (Storage.exists(staging.c_str())) Storage.remove(staging.c_str());
+  }
+  stage_ = false;
   return true;
+}
+
+void RangeFile::discardStaging() {
+  if (finalPath_.empty()) return;
+  const std::string staging = finalPath_ + ".new";
+  if (Storage.exists(staging.c_str())) Storage.remove(staging.c_str());
 }
 
 RangeFile::~RangeFile() { abort(); }
@@ -1139,14 +1162,14 @@ bool ReviewPageParser::finish(Cursor& cursor) {
 CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const uint32_t start, const uint32_t end,
                            const uint32_t startMaxIdx, const uint64_t startSyncKey, const bool copyExisting,
                            const ReviewPageFetch fetch, void* ctx, const int maxPages, uint32_t* totalCount,
-                           uint32_t* markCount) {
+                           uint32_t* markCount, const bool stage) {
   if (!fetch || end <= start || maxPages <= 0) return CollectResult::Failed;
   RangeFile file;
-  if (!file.begin(bookId, chapterUid, start, end, copyExisting)) return CollectResult::Failed;
+  if (!file.begin(bookId, chapterUid, start, end, copyExisting, stage)) return CollectResult::Failed;
 
   Cursor cursor;
-  cursor.maxIdx = startMaxIdx;
-  cursor.syncKey = startSyncKey;
+  cursor.maxIdx = file.carriedCursor() ? file.carriedMaxIdx() : startMaxIdx;
+  cursor.syncKey = file.carriedCursor() ? file.carriedSyncKey() : startSyncKey;
   bool hasMore = false;
   for (int page = 0; page < maxPages && file.count() < kMaxStoredComments; ++page) {
     const uint32_t before = file.count();
@@ -1155,12 +1178,14 @@ CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const 
     Cursor pageCursor;
     if (!fetch(ctx, requestMax, requestSync, file, pageCursor) || pageCursor.errorCode != 0) {
       file.abort();
+      file.discardStaging();
       return CollectResult::Failed;
     }
     if (pageCursor.hasMore && pageCursor.maxIdx == requestMax && pageCursor.syncKey == requestSync &&
         file.count() == before) {
       LOG_ERR("WR", "评论翻页游标没有前进：maxIdx=%u", requestMax);
       file.abort();
+      file.discardStaging();
       return CollectResult::Failed;
     }
     cursor = pageCursor;
@@ -1172,10 +1197,12 @@ CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const 
   if (file.capped()) hasMore = true;
   if (file.count() == 0) {
     file.abort();
+    if (stage) file.discardStaging();
     return CollectResult::Empty;
   }
   if (!file.finish(cursor.maxIdx, cursor.syncKey, hasMore || file.capped())) {
     file.abort();
+    file.discardStaging();
     return CollectResult::Failed;
   }
   return CollectResult::Stored;
