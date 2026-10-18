@@ -105,8 +105,17 @@ void ActivityManager::renderTaskLoop() {
     // ponytail: one idle attempt per render, including cancellations and I/O
     // failures; re-arm after quiet input only if measured cache hit rate needs it.
     waitTicks = portMAX_DELAY;
+    // onEnter loads the reader font before the first layout. A stale notify
+    // must not paint in the middle of that. requestUpdateAndWait still paints:
+    // its caller is blocked inside onEnter and cannot be answered later.
+    bool entryBlocksRender = activityEntering.load(std::memory_order_acquire);
+    if (entryBlocksRender) {
+      taskENTER_CRITICAL(&activityManagerSpinlock);
+      if (waitingTaskHandle != nullptr) entryBlocksRender = false;
+      taskEXIT_CRITICAL(&activityManagerSpinlock);
+    }
     RenderLock lock;
-    if (currentActivity && pendingAction.load() == PendingAction::None) {
+    if (currentActivity && pendingAction.load() == PendingAction::None && !entryBlocksRender) {
       HalPowerManager::Lock powerLock;
       if (foreground) {
         // Some renderers release the lock, so read activity-owned metadata
@@ -275,6 +284,7 @@ void ActivityManager::loop() {
         HeaderBackTapTarget::clear();
         LOG_DBG("ACT", "Pushed to activity stack, new size = %zu", stackActivities.size());
       }
+      activityEntering.store(true, std::memory_order_release);
       pendingAction.store(PendingAction::None);
       currentActivity = std::move(pendingActivity);
       resetHomeStandbyInput();
@@ -290,7 +300,7 @@ void ActivityManager::loop() {
 #endif
 
       lock.unlock();  // onEnter may acquire its own lock
-      currentActivity->onEnter();
+      enterCurrent();
 
       // onEnter may request another pending action, we will handle it in the next loop iteration
       continue;
@@ -488,10 +498,20 @@ void ActivityManager::replaceActivity(std::unique_ptr<Activity>&& newActivity) {
     pendingAction = PendingAction::Replace;
   } else {
     // No current activity, safe to launch immediately
+    activityEntering.store(true, std::memory_order_release);
     currentActivity = std::move(newActivity);
     resetHomeStandbyInput();
-    currentActivity->onEnter();
+    enterCurrent();
   }
+}
+
+void ActivityManager::enterCurrent() {
+  activityEntering.store(true, std::memory_order_release);
+  currentActivity->onEnter();
+  activityEntering.store(false, std::memory_order_release);
+  // A render notified during onEnter is skipped. Ask for one after the font
+  // and the rest of entry have finished.
+  requestedUpdate.store(true);
 }
 
 void ActivityManager::goToFileTransfer() { replaceActivityWith<CrossPointWebServerActivity>(); }

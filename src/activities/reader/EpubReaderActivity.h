@@ -236,6 +236,11 @@ class EpubReaderActivity final : public ReaderActivity {
   bool stylesDisabledForSession_ = false;
   int renderedSpineIndex_ = -1;
   int failedBuildSpine_ = -1;
+  // 当前章节是用哪个字体排的。和设置不一致时整章重排，避免先用内置字号画上一页。
+  int sectionFontId_ = -1;
+  unsigned long readerFontRetryAt_ = 0;
+  uint8_t readerFontRetries_ = 0;
+  void ensureReaderFont();
   ReaderRenderSpec effectiveRenderSpec(uint16_t width, uint16_t height) const;
   bool handleBuildFailure(const char* stage, Section::BuildError error);
   bool buildHeapPaused = false;

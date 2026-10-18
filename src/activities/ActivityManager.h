@@ -63,6 +63,11 @@ class ActivityManager {
   // Shared between the main task (core 0) and the render task (core 1), so it
   // must be atomic rather than a plain/volatile enum (FreeRTOS SMP data race).
   std::atomic<PendingAction> pendingAction{PendingAction::None};
+  // True while onEnter is running. The render task must not paint the new
+  // activity yet: reader entry loads the selected font before the first page
+  // is laid out, and a paint in the middle of that uses the previous face.
+  std::atomic<bool> activityEntering{false};
+  void enterCurrent();
 
   // Task to render and display the activity
   TaskHandle_t renderTaskHandle = nullptr;

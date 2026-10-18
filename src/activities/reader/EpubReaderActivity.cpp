@@ -2830,6 +2830,21 @@ bool EpubReaderActivity::skipLoopDelay() {
   return !buildHeapPaused && backgroundBuildWanted();
 }
 
+void EpubReaderActivity::ensureReaderFont() {
+  if (SETTINGS.sdFontFamilyName[0] == '\0') return;
+  if (sdFontSystem.resolveFontId(SETTINGS.sdFontFamilyName, SETTINGS.fontPointSize) != 0) {
+    readerFontRetries_ = 0;
+    return;
+  }
+  // 进阅读页时卡可能还没准备好。限次数重试，避免坏字体在渲染任务里一直打开文件。
+  if (readerFontRetries_ >= 4) return;
+  const unsigned long now = millis();
+  if (readerFontRetryAt_ != 0 && now < readerFontRetryAt_) return;
+  readerFontRetryAt_ = now + 1500;
+  ++readerFontRetries_;
+  sdFontSystem.ensureLoaded(renderer);
+}
+
 void EpubReaderActivity::renderBook() {
   currentPageLinks.clear();
   if (!epub) return;
@@ -2919,9 +2934,21 @@ void EpubReaderActivity::renderBook() {
   buildViewportWidth = viewportWidth;
   buildViewportHeight = viewportHeight;
 
+  ensureReaderFont();
   const ReaderRenderSpec renderSpec = effectiveRenderSpec(viewportWidth, viewportHeight);
 
+  if (section && sectionFontId_ != renderSpec.fontId) {
+    LOG_INF("ERS", "Reader font %d -> %d, rebuilding chapter", sectionFontId_, renderSpec.fontId);
+    rememberCurrentContentOffset();
+    cachedSpineIndex = currentSpineIndex;
+    if (section->pageCount > 0) cachedChapterTotalPageCount = section->pageCount;
+    nextPageNumber = section->currentPage;
+    sectionFontId_ = -1;
+    section.reset();
+  }
+
   if (!section) {
+    sectionFontId_ = renderSpec.fontId;
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
     LOG_DBG("ERS", "Loading file: %s, index: %d", filepath.c_str(), currentSpineIndex);
     section = makeUniqueNoThrow<Section>(epub, currentSpineIndex, renderer);
@@ -4814,6 +4841,9 @@ void EpubReaderActivity::applyReaderTextSettings() {
     cachedChapterTotalPageCount = section->pageCount;
     nextPageNumber = section->currentPage;
   }
+  sectionFontId_ = -1;
+  readerFontRetries_ = 0;
+  readerFontRetryAt_ = 0;
   section.reset();  // force re-pagination with the new settings
 }
 
