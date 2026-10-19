@@ -37,7 +37,7 @@ for other boards are rejected by the existing flash/OTA board-tag check.
 | Touch | CST816S `0x15`, active-low IRQ1, reset through the expander |
 | Buttons | BOOT0=Confirm, POWER3=Power; P0.7=Down/next, P1.0=Up/previous, active-low |
 | Virtual keys | Raw Home=(80,900) unchanged; Prev=(400,900) → Left, Next=(240,900) → Right |
-| Battery | BQ27220 `0x55`: percentage and gauge-native charging status |
+| Battery | BQ27220 `0x55` voltage only: 3300 mV = 0%, 4330 mV = 100%. The SOC register is not calibrated and is not displayed |
 | Charger | Optional CX25601N `0x6B`: fixed charge parameters at boot; status is never interpreted as BQ25896 |
 | RTC | PCF8563 `0x51`, existing system-UTC restore/writeback behavior |
 | USB | Native USB19/20, Serial/JTAG and existing USB Drive/MSC workflow; TCA9555 P0.0 held high for flash/debug routing |
@@ -154,6 +154,23 @@ leaves it disabled to avoid charging with partially updated parameters.
 This policy assumes a battery rated for 4.35 V charging. It does not change
 DPDM detection, private registers, the existing status path, or add a
 dynamic-regulation/recharge task. It has not yet been physically accepted.
+
+The displayed percentage follows the factory firmware's
+`docs/battery-soc-and-charge.md` (CloudZao/Metalio-E-INK4): ignore the uncalibrated BQ27220 SOC register
+and map pack voltage linearly from 3300 mV (0%) to 4330 mV (100%). A 60-second
+smoother feeds a one-way step of at most 1% per 30 seconds — up only while
+battery current is above +5 mA, down otherwise — so charger IR rise and load
+sag cannot jump the number. 100% requires the voltage to stay at or above
+4330 mV for 30 seconds, and it holds until the voltage falls below 4280 mV.
+E-ink does not sample at 1 Hz, so a late read applies every elapsed 30-second
+step and then discards that time. The first sample anchors to the voltage;
+later samples are rate-limited. Charge voltage stays 4350 mV.
+
+```sh
+c++ -std=c++17 -I freeink-sdk/libs/hardware/BatteryMonitor/src \
+  freeink-sdk/libs/hardware/BatteryMonitor/test/host/test_metalio_voltage_soc.cpp -o /tmp/test_metalio_voltage_soc \
+  && /tmp/test_metalio_voltage_soc
+```
 
 ## Acceptance
 
