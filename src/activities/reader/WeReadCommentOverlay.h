@@ -11,7 +11,8 @@ class Page;
 namespace WeReadCommentOverlay {
 
 // 把当前章登记给后台任务：索引过期时在后台拉一次「哪里有评论」。
-// 评论内容不在进章时拉，点开弹层才按页请求。翻页不发网络。返回 true 表示点线需要重画。
+// 评论正文不提前拉。点开弹层拉一页就显示，继续往下翻再拉下一页。
+// 翻页不发网络。返回 true 表示点线需要重画。
 bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumber, uint32_t pageStart,
               uint32_t pageEnd);
 
