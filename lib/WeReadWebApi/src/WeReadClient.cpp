@@ -53,6 +53,9 @@ constexpr const char* kUserAgent =
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 "
     "Safari/537.36 Edg/135.0.0.0";
 constexpr int kRequestTimeoutMs = 20000;
+// 心跳/进度上报的载荷只有几百字节。坏链路上 20s 的每行读截止线会把整拍 TLS 连同
+// 缓冲多挂 20 秒，堆风险窗口跟着翻倍；10 秒对正常响应仍绰绰有余。
+constexpr int kLiveRequestTimeoutMs = 10000;
 constexpr unsigned long kLoginTimeoutMs = 240000;
 constexpr unsigned long kLoginPollMs = 2000;
 constexpr unsigned long kClockSyncTimeoutMs = 12000;
@@ -318,7 +321,8 @@ bool absorbSetCookie(WeReadStore::Session* session, const char* headerName, cons
 Error requestOnce(const char* method, const char* path, const uint8_t* body, const size_t bodySize,
                   WeReadStore::Session* session, const char* referer, ResponseSink& sink, int& status, char* cookie,
                   const size_t cookieSize, char* url, const size_t urlSize, uint8_t* readBuffer,
-                  const size_t readBufferSize, WeReadHttpClient::Session* reusableSession = nullptr) {
+                  const size_t readBufferSize, WeReadHttpClient::Session* reusableSession = nullptr,
+                  const int timeoutMs = kRequestTimeoutMs) {
   if (!method || !path || !cookie || cookieSize == 0 || !url || urlSize == 0 || !readBuffer || readBufferSize == 0) {
     return Error::Protocol;
   }
@@ -338,7 +342,7 @@ Error requestOnce(const char* method, const char* path, const uint8_t* body, con
   options.bodySize = bodySize;
   options.headers = headers;
   options.headerCount = headerCount;
-  options.timeoutMs = kRequestTimeoutMs;
+  options.timeoutMs = timeoutMs;
   options.readBuffer = readBuffer;
   options.readBufferSize = readBufferSize;
 
@@ -3118,7 +3122,8 @@ Error Operation::sendProgressOnce(const bool report) {
   ResponseSink sink{&context, resetSimple, feedSimple, noOpFinish, Error::Protocol};
   const Error error =
       requestOnce("POST", "/web/book/read", ioBuffer_, bodySize, &session_, referer_.c_str(), sink, responseStatus_,
-                  cookie_, sizeof(cookie_), url_, sizeof(url_), ioBuffer_, sizeof(ioBuffer_), &bookSession_);
+                  cookie_, sizeof(cookie_), url_, sizeof(url_), ioBuffer_, sizeof(ioBuffer_), &bookSession_,
+                  kLiveRequestTimeoutMs);
   if (error != Error::Ok) return error;
   if (responseStatus_ == 401 || responseStatus_ == 403 || context.errorCode == -2012) {
     return Error::SessionExpired;

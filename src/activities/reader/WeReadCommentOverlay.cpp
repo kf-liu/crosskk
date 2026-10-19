@@ -1124,6 +1124,18 @@ bool stepOnce() {
     unlockState();
     return false;
   }
+  static bool deferredLogged = false;
+  if (!WeReadHttpClient::heapAllowsNewTls()) {
+    // 底线之下不开新 TLS（PHY PLL 定时器分配贴地板会 assert 重启）。工作留在队列里，
+    // 200ms 后重试；只在进入低堆时记一次日志，避免刷屏。
+    if (!deferredLogged) {
+      LOG_INF("WR", "comment fetch deferred: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+              static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      deferredLogged = true;
+    }
+    return false;
+  }
+  deferredLogged = false;
   workerBusy.store(true);
   if (work.kind == WorkKind::Underlines) {
     const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid, work.holdCommit);

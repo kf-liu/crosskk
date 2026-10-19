@@ -2244,12 +2244,15 @@ bool EpubReaderActivity::stepLiveReading() {
     pendingLiveReportedMs_.fetch_add(WeReadClient::Operation::kLiveReadingIntervalSeconds * 1000u);
   }
   if (event == WeReadClient::Operation::Event::Complete) {
-    LOG_INF("WR", "live reading report sent: seconds=%u",
-            static_cast<unsigned>(WeReadClient::Operation::kLiveReadingIntervalSeconds));
+    LOG_INF("WR", "live reading report sent: seconds=%u free=%u largest=%u",
+            static_cast<unsigned>(WeReadClient::Operation::kLiveReadingIntervalSeconds),
+            static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
     wereadHeartbeatDueMs_ = millis() + intervalMs;
     wereadHeartbeat_->releaseConnection();
   } else if (event == WeReadClient::Operation::Event::Failed) {
-    LOG_ERR("WR", "live reading report failed: error=%u", static_cast<unsigned>(wereadHeartbeat_->error()));
+    LOG_ERR("WR", "live reading report failed: error=%u free=%u largest=%u",
+            static_cast<unsigned>(wereadHeartbeat_->error()), static_cast<unsigned>(ESP.getFreeHeap()),
+            static_cast<unsigned>(ESP.getMaxAllocHeap()));
     wereadHeartbeatDueMs_ = millis() + intervalMs;
     wereadHeartbeat_->releaseConnection();
   }
@@ -2306,6 +2309,13 @@ void EpubReaderActivity::pollLiveReading() {
   } else if (static_cast<long>(millis() - wereadHeartbeatDueMs_) < 0) {
     // 还没到点。这一拍已经结束，任务状态先收掉。
     noteReadingTime(false);
+  } else if (!WeReadHttpClient::heapAllowsNewTls()) {
+    // 堆贴着地板时再开一拍 TLS，WiFi 电源管理重建 PLL 定时器的分配会 assert 重启。
+    // 这 30 秒顺延到堆回升，宁少报时长不重启。
+    LOG_INF("WR", "live reading deferred: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+            static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    noteReadingTime(false);
+    wereadHeartbeatDueMs_ = millis() + intervalMs;
   } else {
     if (!wereadHeartbeat_) {
       wereadHeartbeat_ = makeUniqueNoThrow<WeReadClient::Operation>();

@@ -247,7 +247,8 @@ WeReadHttpClient::Result runRequest(const char* url, const WeReadHttpClient::Req
   client.setInsecure();
   client.setTimeout(static_cast<unsigned long>(options.timeoutMs));
   if (!reused && !client.connect(host, HTTPS_PORT)) {
-    LOG_ERR("HTTP", "wolfSSL request connect failed");
+    LOG_ERR("HTTP", "wolfSSL request connect failed: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+            static_cast<unsigned>(ESP.getMaxAllocHeap()));
     cleanupClient(client);
     return WeReadHttpClient::Result::NetworkError;
   }
@@ -288,7 +289,8 @@ WeReadHttpClient::Result runRequest(const char* url, const WeReadHttpClient::Req
 
   size_t lineLength = 0;
   if (!readLine(client, options.readBuffer, options.readBufferSize, options.timeoutMs, lineLength)) {
-    LOG_ERR("HTTP", "wolfSSL status read failed");
+    LOG_ERR("HTTP", "wolfSSL status read failed: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+            static_cast<unsigned>(ESP.getMaxAllocHeap()));
     cleanupClient(client);
     return WeReadHttpClient::Result::NetworkError;
   }
@@ -596,6 +598,18 @@ bool networkReady() {
 #else
   const wifi_mode_t mode = WiFi.getMode();
   return (mode & WIFI_MODE_STA) && WiFi.status() == WL_CONNECTED;
+#endif
+}
+
+bool heapAllowsNewTls() {
+#ifdef CROSSPOINT_EMULATED
+  return true;
+#else
+  // 底线 = 一次新握手的峰值（wolfSSL 上下文与缓冲，MFL 已压到 2KB）加上
+  // WiFi 驱动与 PHY 的余量。低于它还硬开 TLS，就是 454a01f 之前两次重启的路径。
+  constexpr size_t kMinFreeHeap = 28 * 1024;
+  constexpr size_t kMinLargestBlock = 12 * 1024;
+  return ESP.getFreeHeap() >= kMinFreeHeap && ESP.getMaxAllocHeap() >= kMinLargestBlock;
 #endif
 }
 
