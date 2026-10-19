@@ -1218,10 +1218,9 @@ bool stepOnce() {
   ctx.rangeText = rangeText;
   uint32_t totalCount = 0;
   uint32_t markCount = 0;
-  // 弹层在等这一段。一页写完就交给界面，不要攒满多页才出字。整章重拉仍一批三页。
-  const int maxPages = work.kind == WorkKind::More ? 1 : 3;
+  // 一次只拉一页。弹层写完就显示；整章重拉也是一页一页往后走，不攒三页。
   auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
-                                            work.syncKey, work.copyExisting, fetchPage, &ctx, maxPages, &totalCount,
+                                            work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
                                             &markCount, work.stage, work.keepStaged);
   // 后台重拉没成功时不要把已有评论标成空。整章重拉由提交时再决定换不换。
   if (work.stage && !work.keepStaged && result != WeReadComment::CollectResult::Stored) {
