@@ -1099,6 +1099,15 @@ void reviewString(void* raw, const char* value, size_t len) {
   if (state.expect == Expect::Range) {
     WeReadProtocol::decodeJsonString(value, len, state.rangeText, sizeof(state.rangeText));
     state.skipGroup = state.rangeText[0] && strcmp(state.rangeText, state.expectedRange) != 0;
+  } else if (state.expect == Expect::HasMore && !state.skipGroup) {
+    // 组字段既有字符串编码的先例（bookMarkCount 按字符串收），hasMore 等游标两种编码都收。
+    state.groupHasMore = !(len == 1 && value && value[0] == '0');
+  } else if (state.expect == Expect::MaxIdx && !state.skipGroup) {
+    state.groupMaxIdx = parseUint32(value, len);
+  } else if (state.expect == Expect::TotalCount && !state.skipGroup) {
+    state.groupTotalCount = parseUint32(value, len);
+  } else if (state.expect == Expect::SyncKey && !state.skipGroup) {
+    state.groupSyncKey = parseUint64(value, len);
   } else if (state.expect == Expect::MarkCount && !state.skipGroup) {
     const uint32_t parsed = parseUint32(value, len);
     if (parsed > state.groupMarkCount) state.groupMarkCount = parsed;

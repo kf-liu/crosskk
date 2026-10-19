@@ -18,7 +18,7 @@ constexpr uint16_t kCandidateHeaderSize = 16;
 constexpr uint32_t kMaxStoredComments = 200;
 constexpr uint16_t kMaxCommentBytes = 2048;
 constexpr uint8_t kMaxAuthorBytes = 47;
-constexpr uint32_t kReviewPageSize = 20;
+constexpr uint32_t kReviewPageSize = 5;
 constexpr int kMaxReviewPages = 16;
 
 constexpr uint32_t kFlagHasMore = 1U << 0;
@@ -202,7 +202,8 @@ class ReviewPageParser {
 using ReviewPageFetch = bool (*)(void* ctx, uint32_t maxIdx, uint64_t syncKey, RangeFile& file, Cursor& cursor);
 
 // 按 maxIdx / synckey 翻页，直到没有下一页或达到存储上限。空结果不写文件。
-// maxPages 限制这一次调用最多请求几页。阅读界面每次只拉一页，避免一次把主循环堵住。
+// maxPages 限制这一次调用最多请求几页。页面内容流式写入 SD，不随页数涨内存。
+// 请求跑在独立任务里，调用方按自己的节奏分批拉。
 CollectResult collectRange(const char* bookId, uint32_t chapterUid, uint32_t start, uint32_t end, uint32_t startMaxIdx,
                            uint64_t startSyncKey, bool copyExisting, ReviewPageFetch fetch, void* ctx,
                            int maxPages = kMaxReviewPages, uint32_t* totalCount = nullptr,

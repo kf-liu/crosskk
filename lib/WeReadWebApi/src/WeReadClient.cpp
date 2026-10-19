@@ -4768,6 +4768,10 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, const
   return true;
 }
 
+// 弹层连续翻页共用一条 TLS：一次握手的成本在 ESP32 上要 2-4 秒，每页都重连是评论加载
+// 慢的主因。窗口结束由 closeCommentPageSession 释放，不跨工作项常驻。
+WeReadHttpClient::Session commentPageSession;
+
 bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const char* rangeText,
                             const uint32_t maxIdx, const uint64_t syncKey, WeReadComment::RangeFile& file,
                             WeReadComment::Cursor& cursor) {
@@ -4806,6 +4810,8 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   if (!readerReferer(bookId, referer, sizeof(referer))) return false;
 
   Error error = Error::Protocol;
+  const uint32_t startMs = millis();
+  const uint32_t connectionsBefore = commentPageSession.newConnections();
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (!parser->begin(&file, rangeText)) return false;
     cursor = {};
@@ -4819,7 +4825,7 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
     ResponseSink sink{&http, commentReset, commentFeed, commentFinish, Error::Protocol};
     error = requestOnce("POST", "/web/book/readreviews", reinterpret_cast<const uint8_t*>(body),
                         static_cast<size_t>(bodyLength), &session, referer, sink, http.status, cookie, kCookieSize, url,
-                        kUrlSize, readBuffer, kReadSize, nullptr);
+                        kUrlSize, readBuffer, kReadSize, &commentPageSession);
     if (error == Error::Ok) break;
     if (attempt == 0 && cursor.errorCode == -2012 &&
         renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
@@ -4828,12 +4834,22 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
     }
     LOG_ERR("WR", "评论翻页请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),
             cursor.errorCode);
+    commentPageSession.reset();
     return false;
   }
-  if (error != Error::Ok) return false;
+  if (error != Error::Ok) {
+    commentPageSession.reset();
+    return false;
+  }
+  LOG_INF("WR", "评论页：%u ms %s added=%u hasMore=%d maxIdx=%u synckey=%llu total=%u",
+          static_cast<unsigned>(millis() - startMs),
+          commentPageSession.newConnections() != connectionsBefore ? "新连接" : "复用", cursor.added,
+          cursor.hasMore ? 1 : 0, cursor.maxIdx, static_cast<unsigned long long>(cursor.syncKey), cursor.totalCount);
   if (!WeReadStore::saveSession(session)) LOG_ERR("WR", "评论页已解析，但会话没有写回");
   return true;
 }
+
+void closeCommentPageSession() { commentPageSession.reset(); }
 
 }  // namespace WeReadClient
 

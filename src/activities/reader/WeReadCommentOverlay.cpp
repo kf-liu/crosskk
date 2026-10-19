@@ -1061,6 +1061,8 @@ bool pickWork(Assignment& work) {
 
 void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult result, const uint32_t totalCount,
                       const uint32_t markCount) {
+  // 工作项到这里已收尾，请求不在途。评论翻页共用的 TLS 到此断开，不跨段常驻。
+  WeReadClient::closeCommentPageSession();
   const bool hasMore = result == WeReadComment::CollectResult::Stored &&
                        rangeHasMore(work.bookId, work.chapterUid, work.start, work.end, work.keepStaged);
   lockState();
@@ -1217,7 +1219,7 @@ bool stepOnce() {
   uint32_t totalCount = 0;
   uint32_t markCount = 0;
   auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
-                                            work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
+                                            work.syncKey, work.copyExisting, fetchPage, &ctx, 3, &totalCount,
                                             &markCount, work.stage, work.keepStaged);
   // 后台重拉没成功时不要把已有评论标成空。整章重拉由提交时再决定换不换。
   if (work.stage && !work.keepStaged && result != WeReadComment::CollectResult::Stored) {
