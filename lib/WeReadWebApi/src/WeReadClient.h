@@ -131,6 +131,9 @@ class Operation {
   // True after a timed report was accepted or its delivery could not be confirmed.
   bool readingTimeConsumed() const { return readingTimeConsumed_; }
   bool active() const;
+  // 释放空闲期挂着的 TLS 连接，下次请求重新握手。阅读期空闲堆贴着地板，
+  // 常驻会话再叠加一个在途请求会把 WiFi PHY 的定时器分配压成 assert 重启。
+  void releaseConnection();
   bool needsCoverConversionScratch() const { return coverConversionNeedsScratch(phase_, progressStage_); }
 
  private:

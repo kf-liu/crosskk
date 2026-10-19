@@ -2247,9 +2247,11 @@ bool EpubReaderActivity::stepLiveReading() {
     LOG_INF("WR", "live reading report sent: seconds=%u",
             static_cast<unsigned>(WeReadClient::Operation::kLiveReadingIntervalSeconds));
     wereadHeartbeatDueMs_ = millis() + intervalMs;
+    wereadHeartbeat_->releaseConnection();
   } else if (event == WeReadClient::Operation::Event::Failed) {
     LOG_ERR("WR", "live reading report failed: error=%u", static_cast<unsigned>(wereadHeartbeat_->error()));
     wereadHeartbeatDueMs_ = millis() + intervalMs;
+    wereadHeartbeat_->releaseConnection();
   }
   const bool still = wereadHeartbeat_ && wereadHeartbeat_->active();
   // 这一拍成功或失败后先收掉。下一拍真正发出去时再亮。
@@ -2264,7 +2266,9 @@ void EpubReaderActivity::serviceWhileCovered() {
 
 void EpubReaderActivity::pollLiveReading() {
   commitLiveReportedMs();
-  if (WeReadCommentOverlay::manualRefreshState() == WeReadCommentOverlay::ManualRefresh::Running) {
+  // 弹层在等评论内容时心跳让位：两条 TLS 握手会在 C3 上抢 CPU，评论请求被拖慢。
+  if (WeReadCommentOverlay::manualRefreshState() == WeReadCommentOverlay::ManualRefresh::Running ||
+      WeReadCommentOverlay::panelFetchActive()) {
     liveReadingPaused.store(true);
     noteReadingTime(false);
     return;

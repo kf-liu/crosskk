@@ -21,6 +21,9 @@ ManualRefresh beginManualRefresh();
 ManualRefresh manualRefreshState();
 void cancelManualRefresh();
 
+// 弹层的评论内容请求已排队或在途。心跳等其它后台网络让位，别和它抢。
+bool panelFetchActive();
+
 // 后台写入了新评论。阅读循环用来刷新画面，本身不发请求。
 bool takeDirty();
 

@@ -2159,6 +2159,8 @@ void Operation::cancel() {
   if (active()) cancelRequested_ = true;
 }
 
+void Operation::releaseConnection() { bookSession_.reset(); }
+
 Operation::Event Operation::cancelNow() {
   bookSession_.reset();
   abortBrowseCache();

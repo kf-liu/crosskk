@@ -740,6 +740,8 @@ MoreRequest& moreRequest() {
 std::atomic<bool> dirty{false};
 // 正在把整章评论换上。这段时间取消只做标记，不能同时删 .new。
 std::atomic<bool> committing{false};
+// 后台任务正在发请求或收尾（索引、评论内容、按段提交）。取消/退出据此不删它正写的暂存文件。
+std::atomic<bool> workerBusy{false};
 std::atomic<bool> panelShown{false};
 std::atomic<uint8_t> moreState{kMoreIdle};
 TaskHandle_t worker = nullptr;
@@ -1122,6 +1124,7 @@ bool stepOnce() {
     unlockState();
     return false;
   }
+  workerBusy.store(true);
   if (work.kind == WorkKind::Underlines) {
     const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid, work.holdCommit);
     lockState();
@@ -1218,11 +1221,13 @@ bool stepOnce() {
 void workerMain(void*) {
   for (;;) {
     if (!stepOnce()) {
+      workerBusy.store(false);
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
-    // 手动重拉一段一段爬，段与段之间留空隙给翻页。自动进章只有一次索引请求，拉完就空闲。
-    uint32_t pauseMs = 300;
+    workerBusy.store(false);
+    // 手动重拉一段一段爬，段与段之间留空隙给翻页。弹层正等着评论内容时不拖这 300ms。
+    uint32_t pauseMs = moreState.load() == kMoreWanted ? 20 : 300;
     if (stateLock) {
       lockState();
       if (round().holdCommit) pauseMs = 20;
@@ -1444,12 +1449,16 @@ void cancelManualRefresh() {
   round().phase = Phase::Idle;
   job().fetch = false;
   job().generation++;
-  const bool commitBusy = committing.load();
+  // 提交进行中由那一侧退回并删 .new；任务还在拉取时删暂存会拆掉它正写的文件。两种情况都先不删，
+  // 暂存遗留由下次 beginManualRefresh 开头的 discardStagedChapter 清掉。
+  const bool busy = committing.load() || workerBusy.load();
   unlockState();
-  // 换文件进行中时由那一侧退回并删 .new。这里再删会把正在换上的文件拆掉。
-  if (hold && !commitBusy && bookId[0] != '\0') WeReadComment::discardStagedChapter(bookId, chapterUid);
+  if (hold && !busy && bookId[0] != '\0') WeReadComment::discardStagedChapter(bookId, chapterUid);
   dirty.store(false);
 }
+
+// 弹层的评论内容请求已排队或在途（moreState 在请求结束才离开 Wanted）。
+bool panelFetchActive() { return moreState.load() == kMoreWanted; }
 
 const char* chapterStatus() {
   Phase phase = Phase::Idle;
@@ -1959,10 +1968,10 @@ void reset() {
   round() = {};
   job() = {};
   job().generation = generation;
-  const bool commitBusy = committing.load();
+  // 提交或拉取进行中不删暂存，理由同 cancelManualRefresh。
+  const bool busy = committing.load() || workerBusy.load();
   unlockState();
-  // 手动重拉退出时丢掉旁边的新文件，已有评论不动。正在换上时由那一侧退回。
-  if (hold && !commitBusy) WeReadComment::discardStagedChapter(abandonedId, abandonedUid);
+  if (hold && !busy) WeReadComment::discardStagedChapter(abandonedId, abandonedUid);
   moreState.store(kMoreIdle);
   markPanel(false);
   underlayReady = true;
