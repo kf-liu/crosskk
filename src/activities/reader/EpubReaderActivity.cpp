@@ -2269,9 +2269,10 @@ void EpubReaderActivity::serviceWhileCovered() {
 
 void EpubReaderActivity::pollLiveReading() {
   commitLiveReportedMs();
-  // 弹层在等评论内容时心跳让位：两条 TLS 握手会在 C3 上抢 CPU，评论请求被拖慢。
+  // 弹层开着、整章重拉，或评论连接还没断开时，心跳让位，避免再开一条 TLS。
   if (WeReadCommentOverlay::manualRefreshState() == WeReadCommentOverlay::ManualRefresh::Running ||
-      WeReadCommentOverlay::panelFetchActive()) {
+      WeReadCommentOverlay::panelOpen() || WeReadCommentOverlay::panelFetchActive() ||
+      WeReadCommentOverlay::commentConnectionHeld()) {
     liveReadingPaused.store(true);
     noteReadingTime(false);
     return;

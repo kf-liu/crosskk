@@ -743,13 +743,18 @@ std::atomic<bool> committing{false};
 // 后台任务正在发请求或收尾（索引、评论内容、按段提交）。取消/退出据此不删它正写的暂存文件。
 std::atomic<bool> workerBusy{false};
 std::atomic<bool> panelShown{false};
+std::atomic<bool> commentTlsHeld{false};
 std::atomic<uint8_t> moreState{kMoreIdle};
 TaskHandle_t worker = nullptr;
 
-void markPanel(const bool open) { panelShown.store(open); }
-
 void notifyWorker() {
   if (worker) xTaskNotifyGive(worker);
+}
+
+void markPanel(const bool open) {
+  panelShown.store(open);
+  // 关上弹层就叫醒任务去断开连接。连接只在任务里关，避免和正在写的请求抢同一条 TLS。
+  if (!open) notifyWorker();
 }
 
 bool readerLoggedIn() {
@@ -1061,8 +1066,6 @@ bool pickWork(Assignment& work) {
 
 void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult result, const uint32_t totalCount,
                       const uint32_t markCount) {
-  // 工作项到这里已收尾，请求不在途。评论翻页共用的 TLS 到此断开，不跨段常驻。
-  WeReadClient::closeCommentPageSession();
   const bool hasMore = result == WeReadComment::CollectResult::Stored &&
                        rangeHasMore(work.bookId, work.chapterUid, work.start, work.end, work.keepStaged);
   lockState();
@@ -1127,7 +1130,9 @@ bool stepOnce() {
     return false;
   }
   static bool deferredLogged = false;
-  if (!WeReadHttpClient::heapAllowsNewTls()) {
+  // 已经连着的评论翻页不需要再开一条 TLS，堆紧也不推迟。索引请求仍是新连接。
+  const bool needsNewTls = work.kind == WorkKind::Underlines || !WeReadClient::commentPageSessionOpen();
+  if (needsNewTls && !WeReadHttpClient::heapAllowsNewTls()) {
     // 底线之下不开新 TLS（PHY PLL 定时器分配贴地板会 assert 重启）。工作留在队列里，
     // 200ms 后重试；只在进入低堆时记一次日志，避免刷屏。
     if (!deferredLogged) {
@@ -1219,6 +1224,8 @@ bool stepOnce() {
   uint32_t totalCount = 0;
   uint32_t markCount = 0;
   // 一次只拉一页。弹层写完就显示；整章重拉也是一页一页往后走，不攒三页。
+  // 这一页的连接先占上，避免请求返回前心跳再开一条。
+  commentTlsHeld.store(true);
   auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
                                             work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
                                             &markCount, work.stage, work.keepStaged);
@@ -1233,14 +1240,36 @@ bool stepOnce() {
 #endif
 }
 
+// 弹层还开着，或整章重拉还没结束时留着连接，下一页不用重新握手。
+// 两边都停了就断开，阅读翻页不和这条 TLS 挤在一起。
+void releaseCommentConnection() {
+  if (panelShown.load() || moreState.load() == kMoreWanted) {
+    commentTlsHeld.store(WeReadClient::commentPageSessionOpen());
+    return;
+  }
+  bool refreshing = false;
+  if (stateLock) {
+    lockState();
+    refreshing = round().holdCommit || round().manual == ManualRefresh::Running;
+    unlockState();
+  }
+  if (refreshing) {
+    commentTlsHeld.store(WeReadClient::commentPageSessionOpen());
+    return;
+  }
+  WeReadClient::closeCommentPageSession();
+  commentTlsHeld.store(false);
+}
+
 void workerMain(void*) {
   for (;;) {
-    if (!stepOnce()) {
-      workerBusy.store(false);
+    const bool didWork = stepOnce();
+    workerBusy.store(false);
+    releaseCommentConnection();
+    if (!didWork) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
-    workerBusy.store(false);
     // 手动重拉一段一段爬，段与段之间留空隙给翻页。弹层正等着评论内容时不拖这 300ms。
     uint32_t pauseMs = moreState.load() == kMoreWanted ? 20 : 300;
     if (stateLock) {
@@ -1470,10 +1499,13 @@ void cancelManualRefresh() {
   unlockState();
   if (hold && !busy && bookId[0] != '\0') WeReadComment::discardStagedChapter(bookId, chapterUid);
   dirty.store(false);
+  notifyWorker();
 }
 
 // 弹层的评论内容请求已排队或在途（moreState 在请求结束才离开 Wanted）。
 bool panelFetchActive() { return moreState.load() == kMoreWanted; }
+
+bool commentConnectionHeld() { return commentTlsHeld.load(); }
 
 const char* chapterStatus() {
   Phase phase = Phase::Idle;

@@ -24,6 +24,8 @@ void cancelManualRefresh();
 
 // 弹层的评论内容请求已排队或在途。心跳等其它后台网络让位，别和它抢。
 bool panelFetchActive();
+// 评论这条 TLS 还留着（弹层开着，或刚关上还没断开）。心跳不要再开一条。
+bool commentConnectionHeld();
 
 // 后台写入了新评论。阅读循环用来刷新画面，本身不发请求。
 bool takeDirty();

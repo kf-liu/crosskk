@@ -532,7 +532,9 @@ static_assert(sizeof(Operation) <= 8 * 1024, "WeRead operation exceeds its fixed
 bool fetchCommentUnderlines(const char* bookId, uint32_t chapterUid, bool stage = false);
 bool fetchCommentReviewPage(const char* bookId, uint32_t chapterUid, const char* rangeText, uint32_t maxIdx,
                             uint64_t syncKey, WeReadComment::RangeFile& file, WeReadComment::Cursor& cursor);
-// 释放评论翻页共用的 TLS 连接。每个翻页工作项结束时调用，不把连接留到下一次交互。
+// 评论翻页已经连着时，下一页直接复用，不必再等一次握手。
+bool commentPageSessionOpen();
+// 这一轮评论请求结束再断开：弹层关上，或整章重拉结束。阅读翻页时不留着。
 void closeCommentPageSession();
 
 }  // namespace WeReadClient

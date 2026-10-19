@@ -4849,6 +4849,8 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   return true;
 }
 
+bool commentPageSessionOpen() { return commentPageSession.reusable(); }
+
 void closeCommentPageSession() { commentPageSession.reset(); }
 
 }  // namespace WeReadClient
