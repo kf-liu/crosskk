@@ -390,6 +390,24 @@ bool CandidateFile::add(const uint32_t start, const uint32_t end, const uint32_t
       }
     }
   }
+  if (record.query == static_cast<uint32_t>(CandidateQuery::Unknown)) {
+    // 重建期间旧索引还完好（先写 .part，finish 才原子替换）。把上次点开确认无评论的
+    // 判定搬过来，否则 48 小时后索引一刷新，已确认空段的虚线会复活。
+    HalFile previous;
+    CandidateHeader old;
+    if (Storage.openFileForRead("WR", finalPath_, previous) &&
+        previous.read(&old, sizeof(old)) == static_cast<int>(sizeof(old)) && old.magic == kCandidateMagic &&
+        old.version == kCandidateVersion && old.headerSize == kCandidateHeaderSize && old.chapterUid == chapterUid_ &&
+        previous.fileSize() == kCandidateHeaderSize + static_cast<size_t>(old.count) * sizeof(DiskCandidate)) {
+      for (uint32_t i = 0; i < old.count; ++i) {
+        DiskCandidate prior;
+        if (!readDisk(previous, i, prior)) break;
+        if (prior.start != start || prior.end != end) continue;
+        if (prior.query == static_cast<uint32_t>(CandidateQuery::Empty)) record.query = prior.query;
+        break;
+      }
+    }
+  }
   if (!writeDisk(file_, count_, record)) return false;
   ++count_;
   return true;
@@ -744,39 +762,6 @@ bool commitStagedChapter(const char* bookId, const uint32_t chapterUid, bool (*s
   // 索引已经是新的。备份清不掉也算换上了，下次再清，不能把已经换上的说成失败。
   if (!dropBackups(directory)) LOG_ERR("WR", "本章评论备份没有删掉");
   discardStagedChapter(bookId, chapterUid);
-  return true;
-}
-
-bool visitStoredRanges(const char* bookId, const uint32_t chapterUid,
-                       bool (*visit)(void* ctx, uint32_t start, uint32_t end), void* ctx) {
-  if (!visit || !isStandardBook(bookId)) return false;
-  std::string directory;
-  if (!chapterDirectory(bookId, chapterUid, directory, false)) return false;
-  if (!Storage.exists(directory.c_str())) return true;
-  HalFile folder = Storage.open(directory.c_str());
-  if (!folder || !folder.isDirectory()) return true;
-  while (true) {
-    HalFile entry = folder.openNextFile();
-    if (!entry) break;
-    char name[64];
-    const size_t nameLen = entry.getName(name, sizeof(name));
-    if (nameLen == 0 || nameLen >= sizeof(name)) continue;
-    name[nameLen] = '\0';
-    uint32_t start = 0;
-    uint32_t end = 0;
-    if (!parseRangeFileName(name, start, end)) continue;
-    const std::string path = directory + "/" + baseName(name);
-    HalFile file;
-    Header header;
-    if (!Storage.openFileForRead("WR", path, file) ||
-        file.read(&header, sizeof(header)) != static_cast<int>(sizeof(header)) || header.magic != kMagic ||
-        header.version != kVersion || header.headerSize != sizeof(header) || header.chapterUid != chapterUid ||
-        header.rangeStart != start || header.rangeEnd != end || header.commentCount == 0 ||
-        header.commentCount > kMaxStoredComments) {
-      continue;
-    }
-    if (!visit(ctx, start, end)) return true;
-  }
   return true;
 }
 

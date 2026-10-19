@@ -29,7 +29,6 @@
 #include "WeReadStore.h"
 #include "WeReadXhtmlCodec.h"
 #include "fontIds.h"
-#include "util/BackgroundWork.h"
 #include "util/TimeUtils.h"
 
 #include <Memory.h>
@@ -54,14 +53,12 @@ struct Round {
   bool underlinesReady = false;
   bool underlinesFailed = false;
   bool sessionMissing = false;
-  // 过期后重拉时，已经存过的片段也要再请求一遍。
+  // 手动重拉时，已经存过的片段也要再请求一遍。
   bool refreshStored = false;
   // 菜单里的重拉先写到旁边，整章成功才替换。
   bool holdCommit = false;
   ManualRefresh manual = ManualRefresh::Idle;
   Phase phase = Phase::Idle;
-  int settledSpine = -1;
-  int settledPage = -1;
 };
 
 Round& round() {
@@ -235,8 +232,6 @@ void markPanel(bool open);
 void beginChapter(Round& state, const char* bookId, const uint32_t chapterUid) {
   const bool sessionMissing = state.sessionMissing;
   state = {};
-  state.settledSpine = -1;
-  state.settledPage = -1;
   state.sessionMissing = sessionMissing;
   strncpy(state.bookId, bookId, sizeof(state.bookId) - 1);
   state.chapterUid = chapterUid;
@@ -590,33 +585,31 @@ bool ensureOffsets(PageComments& comments, const size_t pairs) {
   return true;
 }
 
-bool takeStored(void* raw, const uint32_t start, const uint32_t end) {
-  auto* comments = static_cast<PageComments*>(raw);
-  if (comments->count >= comments->capacity) return false;
-  DrawRange& range = comments->ranges[comments->count++];
-  range.nativeStart = start;
-  range.nativeEnd = end;
-  range.start = start;
-  range.end = end;
-  return true;
+// 点线直接按候选索引画：索引一到，本章哪里可能有讨论整章可见，不用等每段内容都下载。
+// 点开拉过并确认没有评论的段（Empty）不再画。评论数只有打开拉取后才知道，
+// 所以索引阶段宁可多画，打开一次空段就会收敛掉。
+bool candidateDrawable(const WeReadComment::Candidate& item) {
+  return item.end > item.start && item.query != WeReadComment::CandidateQuery::Empty;
 }
 
-bool hideEmptyStored(void* raw, const uint32_t, const WeReadComment::Candidate& item) {
-  if (item.query != WeReadComment::CandidateQuery::Empty) return true;
-  auto* comments = static_cast<PageComments*>(raw);
-  for (size_t i = 0; i < comments->count; ++i) {
-    if (comments->ranges[i].nativeStart != item.start || comments->ranges[i].nativeEnd != item.end) continue;
-    comments->ranges[i].nativeEnd = 0;
-  }
-  return true;
-}
-
-struct StoredCount {
+struct CandidateCount {
   size_t count = 0;
 };
 
-bool countStored(void* raw, const uint32_t, const uint32_t) {
-  ++static_cast<StoredCount*>(raw)->count;
+bool countCandidates(void* raw, const uint32_t, const WeReadComment::Candidate& item) {
+  if (candidateDrawable(item)) ++static_cast<CandidateCount*>(raw)->count;
+  return true;
+}
+
+bool takeCandidate(void* raw, const uint32_t, const WeReadComment::Candidate& item) {
+  auto* comments = static_cast<PageComments*>(raw);
+  if (!candidateDrawable(item)) return true;
+  if (comments->count >= comments->capacity) return false;
+  DrawRange& range = comments->ranges[comments->count++];
+  range.nativeStart = item.start;
+  range.nativeEnd = item.end;
+  range.start = item.start;
+  range.end = item.end;
   return true;
 }
 
@@ -638,37 +631,30 @@ void loadPageComments(const char* bookId, const Epub& epub, const int spineIndex
   comments.chapterUid = chapterUid;
   memcpy(comments.chapterPath, path.c_str(), path.size() + 1);
 
-  StoredCount stored;
-  if (!WeReadComment::visitStoredRanges(bookId, chapterUid, countStored, &stored)) return;
-  if (stored.count > 0 && !ensureDrawRanges(comments, stored.count)) return;
-  if (!WeReadComment::visitStoredRanges(bookId, chapterUid, takeStored, &comments)) return;
-  WeReadComment::visitCandidates(bookId, chapterUid, hideEmptyStored, &comments);
-  size_t kept = 0;
-  for (size_t i = 0; i < comments.count; ++i) {
-    if (comments.ranges[i].nativeEnd <= comments.ranges[i].nativeStart) continue;
-    comments.ranges[kept++] = comments.ranges[i];
-  }
-  comments.count = kept;
-  if (kept == 0) {
+  CandidateCount candidates;
+  if (!WeReadComment::visitCandidates(bookId, chapterUid, countCandidates, &candidates)) return;
+  if (candidates.count > 0 && !ensureDrawRanges(comments, candidates.count)) return;
+  WeReadComment::visitCandidates(bookId, chapterUid, takeCandidate, &comments);
+  if (comments.count == 0) {
     comments.valid = true;
     return;
   }
-  if (!ensureOffsets(comments, kept)) {
+  if (!ensureOffsets(comments, comments.count)) {
     comments.count = 0;
     return;
   }
-  for (size_t i = 0; i < kept; ++i) {
+  for (size_t i = 0; i < comments.count; ++i) {
     comments.nativeOffsets[i * 2] = comments.ranges[i].nativeStart;
     comments.nativeOffsets[i * 2 + 1] = comments.ranges[i].nativeEnd;
   }
   if (!WeReadXhtmlCodec::nativeOffsetsToVisible(path, comments.nativeOffsets.get(), comments.visibleOffsets.get(),
-                                                kept * 2)) {
+                                                comments.count * 2)) {
     LOG_ERR("WR", "评论范围无法对到章节");
     comments.count = 0;
     return;
   }
   size_t visibleCount = 0;
-  for (size_t i = 0; i < kept; ++i) {
+  for (size_t i = 0; i < comments.count; ++i) {
     const uint32_t start = comments.visibleOffsets[i * 2];
     const uint32_t end = comments.visibleOffsets[i * 2 + 1];
     if (start == UINT32_MAX || end == UINT32_MAX || end <= start) continue;
@@ -804,7 +790,7 @@ bool rangeHasMore(const char* bookId, const uint32_t chapterUid, const uint32_t 
   return (header.flags & WeReadComment::kFlagHasMore) != 0;
 }
 
-// 整章拉完后 48 小时内不再请求。覆盖两天内的反复打开；过期后再进章会在后台更新。
+// 「哪里有评论」的索引拉完后 48 小时内不再请求。覆盖两天内的反复打开；过期后再进章会在后台刷新索引。
 constexpr uint32_t kCommentFreshSeconds = 48 * 60 * 60;
 
 enum class WorkKind : uint8_t { None, Underlines, Range, More };
@@ -984,7 +970,8 @@ bool pickWork(Assignment& work) {
     work.holdCommit = state.holdCommit;
     if (!state.underlinesReady && !state.underlinesFailed) {
       work.kind = WorkKind::Underlines;
-    } else if (state.underlinesReady) {
+    } else if (state.underlinesReady && work.holdCommit) {
+      // 自动进章到索引为止。按段爬完整章内容只发生在手动重拉。
       scanChapterWork = true;
       refreshStored = state.refreshStored;
     }
@@ -1009,11 +996,11 @@ bool pickWork(Assignment& work) {
       work.copyExisting = hit.item.query == WeReadComment::CandidateQuery::Partial || staging;
     } else if (visited && !hit.found) {
       lockState();
-      const bool live = work.generation == job().generation && (!work.holdCommit || round().holdCommit);
+      const bool live = work.generation == job().generation && round().holdCommit;
       unlockState();
       if (!live) {
-        if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
-      } else if (work.holdCommit) {
+        WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
+      } else {
         lockState();
         const bool liveNow = work.generation == job().generation && round().holdCommit;
         if (liveNow) committing.store(true);
@@ -1055,25 +1042,6 @@ bool pickWork(Assignment& work) {
           if (commitOk) LOG_INF("WR", "本章评论已拉完");
           else LOG_INF("WR", "本章评论没有替换");
         }
-      } else {
-        const uint32_t now = TimeUtils::getCurrentValidTimestamp();
-        const bool marked = !hit.anyFailed && now != 0 &&
-                            WeReadComment::markChapterFetched(work.bookId, work.chapterUid, now);
-        // 没拉完不算这次成功。去掉完成时间，评论文件留下，下次进章再试。
-        if (hit.anyFailed) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
-        lockState();
-        if (work.generation != job().generation) {
-          unlockState();
-          if (marked) WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
-        } else {
-          job().fetch = false;
-          round().refreshStored = false;
-          // 这一轮已经结束。失败只留下文件，底部回到章节名，不把「加载失败」停在状态栏。
-          round().phase = Phase::Idle;
-          dirty.store(true);
-          unlockState();
-          if (!hit.anyFailed) LOG_INF("WR", "本章评论已拉完");
-        }
       }
     }
   }
@@ -1089,12 +1057,6 @@ bool pickWork(Assignment& work) {
   return work.kind != WorkKind::None;
 }
 
-#ifdef ENABLE_CHINESE_VERSION
-void noteCommentFetch(bool on);
-#else
-inline void noteCommentFetch(bool) {}
-#endif
-
 void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult result, const uint32_t totalCount,
                       const uint32_t markCount) {
   const bool hasMore = result == WeReadComment::CollectResult::Stored &&
@@ -1103,7 +1065,6 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   if (work.generation != job().generation) {
     unlockState();
     if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
-    noteCommentFetch(false);
     return;
   }
   unlockState();
@@ -1137,7 +1098,6 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   if (work.generation != job().generation) {
     unlockState();
     if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
-    noteCommentFetch(false);
     return;
   }
   if (work.kind == WorkKind::More) {
@@ -1150,21 +1110,10 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   unlockState();
 }
 
-#ifdef ENABLE_CHINESE_VERSION
-void noteCommentFetch(const bool on) {
-  static bool noted = false;
-  if (on == noted) return;
-  if (on) BackgroundWork::begin(BackgroundWork::Kind::FetchComments);
-  else BackgroundWork::end(BackgroundWork::Kind::FetchComments);
-  noted = on;
-}
-#endif
-
 bool stepOnce() {
 #ifdef ENABLE_CHINESE_VERSION
   Assignment work;
   if (!pickWork(work) || work.generation != job().generation) {
-    noteCommentFetch(false);
     lockState();
     Round& state = round();
     if (state.underlinesReady && !state.underlinesFailed && !state.sessionMissing && job().fetch) {
@@ -1173,15 +1122,12 @@ bool stepOnce() {
     unlockState();
     return false;
   }
-  // 整章要拉很多段，不把「正在拉取评论」停在控制中心里。
-  noteCommentFetch(false);
   if (work.kind == WorkKind::Underlines) {
     const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid, work.holdCommit);
     lockState();
     if (work.generation != job().generation) {
       unlockState();
       if (work.holdCommit) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
-      noteCommentFetch(false);
       return true;
     }
     Round& state = round();
@@ -1207,13 +1153,33 @@ bool stepOnce() {
       unlockState();
       if (hold) WeReadComment::discardStagedChapter(work.bookId, work.chapterUid);
       else WeReadComment::clearChapterFetched(work.bookId, work.chapterUid);
-      noteCommentFetch(false);
       dirty.store(!hold);
       return false;
     }
     state.underlinesReady = true;
-    state.phase = Phase::Loading;
+    const bool hold = state.holdCommit;
+    char bookId[64];
+    strncpy(bookId, work.bookId, sizeof(bookId) - 1);
+    bookId[sizeof(bookId) - 1] = '\0';
+    const uint32_t chapterUid = work.chapterUid;
     unlockState();
+    if (hold) {
+      // 手动重拉接着按段爬，整章成功才一起换上。
+      lockState();
+      if (work.generation == job().generation) state.phase = Phase::Loading;
+      unlockState();
+      return true;
+    }
+    // 自动进章到索引为止：哪里有评论已完整落盘，具体内容点开弹层再按页拉。
+    const uint32_t now = TimeUtils::getCurrentValidTimestamp();
+    if (now != 0) WeReadComment::markChapterFetched(bookId, chapterUid, now);
+    lockState();
+    if (work.generation == job().generation) {
+      job().fetch = false;
+      state.phase = Phase::Idle;
+    }
+    unlockState();
+    // 索引换上了，阅读页重画点线。
     dirty.store(true);
     return true;
   }
@@ -1255,7 +1221,7 @@ void workerMain(void*) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
-    // 后台一段一段拉，留给翻页。手动重拉时人在空白页上等，只留一点空隙。
+    // 手动重拉一段一段爬，段与段之间留空隙给翻页。自动进章只有一次索引请求，拉完就空闲。
     uint32_t pauseMs = 300;
     if (stateLock) {
       lockState();
@@ -1292,13 +1258,11 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   Round& state = round();
   Job& current = job();
   const bool sessionMissing = state.sessionMissing;
-  // 同一章翻页不再发请求。换章才决定要不要在后台把整章拉完。
+  // 同一章翻页不再发请求。换章才决定要不要在后台刷新「哪里有评论」的索引。
   const bool sameChapter = current.active && current.spine == spineIndex &&
                            strncmp(current.bookId, bookId, sizeof(current.bookId)) == 0;
-  // 离线进来之后网络恢复，补一次本章拉取。翻页本身不再发请求。
+  // 离线进来之后网络恢复，补一次本章索引。翻页本身不再发请求。
   const bool resumeOffline = sameChapter && state.phase == Phase::Offline && online && !sessionMissing;
-  // 手动重拉时如果当时离线，网络恢复后仍要拉，不能因为 48 小时记录还在就跳过。
-  const bool honorStaleRefresh = resumeOffline && state.refreshStored;
   unlockState();
   if (sameChapter && !resumeOffline) return false;
 
@@ -1322,21 +1286,13 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   const bool haveCandidates = WeReadComment::candidatesReady(bookId, chapterUid);
   // 在线时以卡上的会话为准。未登录不发请求，也不把失败写进状态栏。
   bool noSession = sessionMissing;
-  if (online && (!fresh || honorStaleRefresh)) noSession = !readerLoggedIn();
+  if (online && !fresh) noSession = !readerLoggedIn();
   const bool blocked = !online || noSession;
 
-  char abandonedId[64] = {};
-  uint32_t abandonedUid = 0;
-  bool abandonRefresh = false;
   lockState();
   const Phase previous = state.phase;
   if (!state.haveChapter || state.chapterUid != chapterUid ||
       strncmp(state.bookId, bookId, sizeof(state.bookId)) != 0) {
-    if (state.refreshStored && state.haveChapter && state.bookId[0] != '\0') {
-      strncpy(abandonedId, state.bookId, sizeof(abandonedId) - 1);
-      abandonedUid = state.chapterUid;
-      abandonRefresh = true;
-    }
     beginChapter(state, bookId, chapterUid);
     current.generation++;
   }
@@ -1349,12 +1305,12 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   current.spine = spineIndex;
   current.page = pageNumber;
   current.active = true;
-  if (fresh && !honorStaleRefresh) {
+  if (fresh) {
     state.underlinesReady = true;
     state.refreshStored = false;
     current.fetch = false;
     state.phase = Phase::Idle;
-    LOG_INF("WR", "本章评论 48 小时内已拉完，跳过");
+    LOG_INF("WR", "本章评论索引 48 小时内已拉过，跳过");
   } else if (blocked) {
     state.sessionMissing = noSession;
     state.underlinesReady = haveCandidates;
@@ -1366,14 +1322,13 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
     state.sessionMissing = false;
     state.underlinesReady = false;
     state.underlinesFailed = false;
-    state.refreshStored = true;
+    state.refreshStored = false;
     current.fetch = true;
     state.phase = Phase::Loading;
   }
   const bool phaseChanged = state.phase != previous;
   const bool fetch = current.fetch;
   unlockState();
-  if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
   if (fetch) {
     reopenFailedRanges(bookId, chapterUid);
     notifyWorker();
@@ -1410,7 +1365,7 @@ void showRange(Panel& view) {
 
 bool syncPage(const char* bookId, const Epub& epub, const int spineIndex, const int pageNumber,
               const uint32_t pageStart, const uint32_t pageEnd) {
-  // 只登记当前章。underlines / readreviews 在 wrCmt 任务里，一次一段。
+  // 只登记当前章。underlines 索引在 wrCmt 任务里拉；评论内容点开弹层后按页在这里拉。
   return publishPage(bookId, epub, spineIndex, pageNumber, pageStart, pageEnd);
 }
 
@@ -1493,7 +1448,6 @@ void cancelManualRefresh() {
   unlockState();
   // 换文件进行中时由那一侧退回并删 .new。这里再删会把正在换上的文件拆掉。
   if (hold && !commitBusy && bookId[0] != '\0') WeReadComment::discardStagedChapter(bookId, chapterUid);
-  noteCommentFetch(false);
   dirty.store(false);
 }
 
@@ -1994,27 +1948,21 @@ void drawPanel(GfxRenderer& renderer) {
 void reset() {
   char abandonedId[64] = {};
   uint32_t abandonedUid = 0;
-  bool abandonRefresh = false;
   bool hold = false;
   lockState();
-  if ((round().refreshStored || round().holdCommit) && job().bookId[0] != '\0') {
+  if (round().holdCommit && job().bookId[0] != '\0') {
     strncpy(abandonedId, job().bookId, sizeof(abandonedId) - 1);
     abandonedUid = job().chapterUid;
-    hold = round().holdCommit;
-    abandonRefresh = round().refreshStored && !hold;
+    hold = true;
   }
   const uint32_t generation = job().generation + 1;
   round() = {};
-  round().settledSpine = -1;
-  round().settledPage = -1;
   job() = {};
   job().generation = generation;
   const bool commitBusy = committing.load();
   unlockState();
-  noteCommentFetch(false);
   // 手动重拉退出时丢掉旁边的新文件，已有评论不动。正在换上时由那一侧退回。
   if (hold && !commitBusy) WeReadComment::discardStagedChapter(abandonedId, abandonedUid);
-  else if (abandonRefresh) WeReadComment::clearChapterFetched(abandonedId, abandonedUid);
   moreState.store(kMoreIdle);
   markPanel(false);
   underlayReady = true;

@@ -284,6 +284,32 @@ TEST_F(WeReadCommentTest, StoresEveryCandidateWithoutACap) {
   EXPECT_EQ(seen, 70u);
 }
 
+TEST_F(WeReadCommentTest, RebuildingTheIndexKeepsConfirmedEmptyRanges) {
+  WeReadComment::CandidateFile first;
+  ASSERT_TRUE(first.begin("3300003224", 9));
+  ASSERT_TRUE(first.add(10, 40, 5));
+  ASSERT_TRUE(first.add(50, 80, 3));
+  ASSERT_TRUE(first.finish());
+  WeReadComment::Candidate item;
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 9, 0, item));
+  item.query = WeReadComment::CandidateQuery::Empty;
+  ASSERT_TRUE(WeReadComment::updateCandidate("3300003224", 9, 0, item));
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 9, 0, item));
+  ASSERT_EQ(item.query, WeReadComment::CandidateQuery::Empty);
+
+  WeReadComment::CandidateFile rebuilt;
+  ASSERT_TRUE(rebuilt.begin("3300003224", 9));
+  ASSERT_TRUE(rebuilt.add(10, 40, 7));
+  ASSERT_TRUE(rebuilt.add(50, 80, 3));
+  ASSERT_TRUE(rebuilt.finish());
+
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 9, 0, item));
+  EXPECT_EQ(item.query, WeReadComment::CandidateQuery::Empty);
+  EXPECT_EQ(item.markCount, 7u);
+  ASSERT_TRUE(WeReadComment::readCandidate("3300003224", 9, 1, item));
+  EXPECT_EQ(item.query, WeReadComment::CandidateQuery::Unknown);
+}
+
 TEST_F(WeReadCommentTest, StagedRefreshReplacesOnlyAfterCommit) {
   const std::string oldPage = reviewPage("10-40", false, 1, 5, 1, 1, "name");
   ScriptedPages oldScript;

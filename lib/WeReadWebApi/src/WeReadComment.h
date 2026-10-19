@@ -125,9 +125,6 @@ bool visitCandidates(const char* bookId, uint32_t chapterUid,
 bool readCandidate(const char* bookId, uint32_t chapterUid, uint32_t index, Candidate& item, bool staged = false);
 bool updateCandidate(const char* bookId, uint32_t chapterUid, uint32_t index, const Candidate& item,
                      bool staged = false);
-// 已经写过评论的片段，不设条数上限。
-bool visitStoredRanges(const char* bookId, uint32_t chapterUid, bool (*visit)(void* ctx, uint32_t start, uint32_t end),
-                       void* ctx);
 
 // 流式写入一个 range 的评论。失败时 abort，不替换已有文件。
 class RangeFile {
