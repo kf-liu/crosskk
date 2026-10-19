@@ -322,7 +322,8 @@ Error requestOnce(const char* method, const char* path, const uint8_t* body, con
                   WeReadStore::Session* session, const char* referer, ResponseSink& sink, int& status, char* cookie,
                   const size_t cookieSize, char* url, const size_t urlSize, uint8_t* readBuffer,
                   const size_t readBufferSize, WeReadHttpClient::Session* reusableSession = nullptr,
-                  const int timeoutMs = kRequestTimeoutMs) {
+                  const int timeoutMs = kRequestTimeoutMs, bool (*cancel)() = nullptr) {
+  if (cancel && cancel()) return Error::Cancelled;
   if (!method || !path || !cookie || cookieSize == 0 || !url || urlSize == 0 || !readBuffer || readBufferSize == 0) {
     return Error::Protocol;
   }
@@ -349,7 +350,10 @@ Error requestOnce(const char* method, const char* path, const uint8_t* body, con
   if (!sink.reset(sink.ctx)) return Error::SdCard;
   const int urlLength = snprintf(url, urlSize, "%s%s", kHost, path);
   if (urlLength <= 0 || static_cast<size_t>(urlLength) >= urlSize) return Error::Protocol;
-  const auto onData = [&sink](const uint8_t* data, const size_t len) { return sink.write(sink.ctx, data, len); };
+  const auto onData = [&sink, cancel](const uint8_t* data, const size_t len) {
+    if (cancel && cancel()) return false;
+    return sink.write(sink.ctx, data, len);
+  };
   bool cookiesOk = true;
   const auto onHeader = [session, cookie, cookieSize, &cookiesOk](const char* name, const char* value) {
     cookiesOk = absorbSetCookie(session, name, value, cookie, cookieSize) && cookiesOk;
@@ -361,7 +365,10 @@ Error requestOnce(const char* method, const char* path, const uint8_t* body, con
     if (!sink.finish(sink.ctx)) return sink.writeError;
     return cookiesOk ? Error::Ok : Error::Protocol;
   }
-  if (result == WeReadHttpClient::Result::Aborted) return sink.writeError;
+  if (result == WeReadHttpClient::Result::Aborted) {
+    if (cancel && cancel()) return Error::Cancelled;
+    return sink.writeError;
+  }
   return Error::Network;
 }
 
@@ -4774,7 +4781,7 @@ WeReadHttpClient::Session commentPageSession;
 
 bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const char* rangeText,
                             const uint32_t maxIdx, const uint64_t syncKey, WeReadComment::RangeFile& file,
-                            WeReadComment::Cursor& cursor) {
+                            WeReadComment::Cursor& cursor, bool (*cancel)()) {
   cursor = {};
   if (!commentIdSafe(bookId) || !rangeJsonSafe(rangeText) || !file.active()) return false;
   if (!WeReadHttpClient::networkReady()) return false;
@@ -4813,6 +4820,10 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   const uint32_t startMs = millis();
   const uint32_t connectionsBefore = commentPageSession.newConnections();
   for (int attempt = 0; attempt < 2; ++attempt) {
+    if (cancel && cancel()) {
+      error = Error::Cancelled;
+      break;
+    }
     if (!parser->begin(&file, rangeText)) return false;
     cursor = {};
     ReviewHttp review;
@@ -4825,8 +4836,8 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
     ResponseSink sink{&http, commentReset, commentFeed, commentFinish, Error::Protocol};
     error = requestOnce("POST", "/web/book/readreviews", reinterpret_cast<const uint8_t*>(body),
                         static_cast<size_t>(bodyLength), &session, referer, sink, http.status, cookie, kCookieSize, url,
-                        kUrlSize, readBuffer, kReadSize, &commentPageSession);
-    if (error == Error::Ok) break;
+                        kUrlSize, readBuffer, kReadSize, &commentPageSession, kRequestTimeoutMs, cancel);
+    if (error == Error::Ok || error == Error::Cancelled) break;
     if (attempt == 0 && cursor.errorCode == -2012 &&
         renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
       LOG_INF("WR", "评论翻页请求已续期会话");
@@ -4835,6 +4846,12 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
     LOG_ERR("WR", "评论翻页请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),
             cursor.errorCode);
     commentPageSession.reset();
+    return false;
+  }
+  if (error == Error::Cancelled) {
+    // 正文读到一半连接已经废了。还没发出去时原来的连接可以留给下一页。
+    if (!commentPageSession.reusable()) commentPageSession.reset();
+    LOG_INF("WR", "评论页请求已取消");
     return false;
   }
   if (error != Error::Ok) {

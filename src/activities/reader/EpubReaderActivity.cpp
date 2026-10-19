@@ -1205,6 +1205,9 @@ void EpubReaderActivity::loop() {
     uint32_t pageEnd = UINT32_MAX;
     if (page + 1 < static_cast<int>(section->pageCount)) {
       if (const auto next = section->getVisibleTextOffsetForPage(static_cast<uint16_t>(page + 1))) pageEnd = *next;
+    } else if (section->isBuilding()) {
+      // 下一页还没分出来。空窗口先不预取，避免把本章剩下的评论都拉掉。
+      pageEnd = pageStart;
     }
     if (WeReadCommentOverlay::syncPage(wereadBookId_, *epub, currentSpineIndex, page, pageStart, pageEnd)) {
       requestUpdate();
@@ -2740,10 +2743,12 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
   }
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1 || section->isBuilding()) {
+      WeReadCommentOverlay::interruptPagePrefetch();
       section->currentPage++;
       lastPageTurnTime = millis();
       return true;
     } else if (currentSpineIndex + 1 < epub->getSpineItemsCount()) {
+      WeReadCommentOverlay::interruptPagePrefetch();
       RenderLock lock;
       nextPageNumber = 0;
       currentSpineIndex++;
@@ -2751,16 +2756,19 @@ bool EpubReaderActivity::pageTurn(bool isForwardTurn) {
       lastPageTurnTime = millis();
       return true;
     } else {
+      WeReadCommentOverlay::interruptPagePrefetch();
       currentSpineIndex = epub->getSpineItemsCount();
       lastPageTurnTime = millis();
       return true;
     }
   } else {
     if (section->currentPage > 0) {
+      WeReadCommentOverlay::interruptPagePrefetch();
       section->currentPage--;
       lastPageTurnTime = millis();
       return true;
     } else if (currentSpineIndex > 0) {
+      WeReadCommentOverlay::interruptPagePrefetch();
       RenderLock lock;
       nextPageNumber = 0;
       pendingPageJump = std::numeric_limits<uint16_t>::max();
@@ -2777,6 +2785,7 @@ bool EpubReaderActivity::skipPages(int amount) {
   if (!section) return false;
   READING_STATS.noteActivity();
   if (amount > 0) {
+    WeReadCommentOverlay::interruptPagePrefetch();
     RenderLock lock;
     nextPageNumber = 0;
     currentSpineIndex++;
@@ -2784,9 +2793,11 @@ bool EpubReaderActivity::skipPages(int amount) {
     return true;
   } else {
     if (section->currentPage > 0) {
+      WeReadCommentOverlay::interruptPagePrefetch();
       section->currentPage = 0;
       return true;
     } else if (currentSpineIndex > 0) {
+      WeReadCommentOverlay::interruptPagePrefetch();
       RenderLock lock;
       nextPageNumber = 0;
       currentSpineIndex--;

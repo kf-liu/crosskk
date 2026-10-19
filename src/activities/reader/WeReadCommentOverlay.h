@@ -11,10 +11,14 @@ class Page;
 namespace WeReadCommentOverlay {
 
 // 把当前章登记给后台任务：索引过期时在后台拉一次「哪里有评论」。
-// 评论正文不提前拉。点开弹层拉一页就显示，继续往下翻再拉下一页。
-// 翻页不发网络。返回 true 表示点线需要重画。
+// 翻页停稳约 1 秒后，当页还没有正文的评论各拉一页（5 条）。翻页一开始就停。
+// 点开弹层时这一页已经在就直接显示，没有再拉一页；继续往下翻再拉下一页。
+// 返回 true 表示点线需要重画。
 bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumber, uint32_t pageStart,
               uint32_t pageEnd);
+
+// 翻页一开始就停掉当页评论预取。不读卡、不发请求。
+void interruptPagePrefetch();
 
 // 手动重拉当前章。没有章节时是 Idle。成功前不替换已有评论。
 enum class ManualRefresh : uint8_t { Idle, Running, Succeeded, Failed, LoginRequired, Offline };

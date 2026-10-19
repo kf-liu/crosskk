@@ -207,15 +207,26 @@ struct FetchCtx {
   const char* bookId = nullptr;
   uint32_t chapterUid = 0;
   const char* rangeText = nullptr;
+  uint32_t generation = 0;
+  bool prefetch = false;
+  bool (*cancel)() = nullptr;
 };
+
+bool chapterStillCurrent(uint32_t generation);
 
 bool fetchPage(void* raw, const uint32_t maxIdx, const uint64_t syncKey, WeReadComment::RangeFile& file,
                WeReadComment::Cursor& cursor) {
 #ifdef ENABLE_CHINESE_VERSION
   const auto* ctx = static_cast<const FetchCtx*>(raw);
   if (!ctx) return false;
-  return WeReadClient::fetchCommentReviewPage(ctx->bookId, ctx->chapterUid, ctx->rangeText, maxIdx, syncKey, file,
-                                              cursor);
+  if (ctx->cancel && ctx->cancel()) return false;
+  if (ctx->prefetch && !chapterStillCurrent(ctx->generation)) return false;
+  const bool ok = WeReadClient::fetchCommentReviewPage(ctx->bookId, ctx->chapterUid, ctx->rangeText, maxIdx, syncKey,
+                                                       file, cursor, ctx->cancel);
+  if (!ok) return false;
+  // 翻页取消时正文已经到了就留下来。换章或整章重拉则不要把这一页写进去。
+  if (ctx->prefetch && !chapterStillCurrent(ctx->generation)) return false;
+  return true;
 #else
   (void)raw;
   (void)maxIdx;
@@ -715,6 +726,14 @@ struct Job {
   int spine = -1;
   int page = -1;
   uint32_t generation = 0;
+  uint32_t visibleStart = 0;
+  uint32_t visibleEnd = 0;
+  uint32_t pageEpoch = 0;
+  uint32_t boundsEpoch = 0;
+  char chapterPath[128] = {};
+  bool prefetchLatched = false;
+  bool prefetchDone = false;
+  bool boundsFailed = false;
 };
 
 struct MoreRequest {
@@ -732,6 +751,13 @@ Job& job() {
   return state;
 }
 
+bool chapterStillCurrent(const uint32_t generation) {
+  lockState();
+  const bool same = job().generation == generation;
+  unlockState();
+  return same;
+}
+
 MoreRequest& moreRequest() {
   static MoreRequest state;
   return state;
@@ -745,11 +771,32 @@ std::atomic<bool> workerBusy{false};
 std::atomic<bool> panelShown{false};
 std::atomic<bool> commentTlsHeld{false};
 std::atomic<uint8_t> moreState{kMoreIdle};
+// 翻页把这个加上。正在读的预取对不上就丢掉。
+std::atomic<uint32_t> pageEpoch{0};
+// 为 true 时读正文的回调立刻停。连接阶段停不掉，所以要等翻页停稳才开始预取。
+std::atomic<bool> prefetchCancel{false};
+// 这一页还有没拉过的段。为 true 时先留着 TLS，下一段不用重新握手。
+std::atomic<bool> prefetchMore{false};
+// 这一页被看见并且稳定之后，再过这么久才预取。
+std::atomic<uint32_t> settleAt{0};
+constexpr uint32_t kPrefetchSettleMs = 1000;
 TaskHandle_t worker = nullptr;
 
 void notifyWorker() {
   if (worker) xTaskNotifyGive(worker);
 }
+
+uint32_t nowMs() { return static_cast<uint32_t>(pdTICKS_TO_MS(xTaskGetTickCount())); }
+
+void interruptPagePrefetchImpl() {
+  prefetchCancel.store(true);
+  prefetchMore.store(false);
+  pageEpoch.fetch_add(1, std::memory_order_relaxed);
+  settleAt.store(nowMs() + kPrefetchSettleMs);
+  notifyWorker();
+}
+
+bool prefetchTurned() { return prefetchCancel.load(); }
 
 void markPanel(const bool open) {
   panelShown.store(open);
@@ -821,6 +868,8 @@ struct Assignment {
   // 整章重拉时，这一段拉完也先留在 .new。
   bool keepStaged = false;
   bool holdCommit = false;
+  bool prefetch = false;
+  uint32_t pageEpoch = 0;
 };
 
 struct PendingHit {
@@ -879,6 +928,134 @@ bool scanChapter(void* raw, const uint32_t index, const WeReadComment::Candidate
   hit->index = index;
   hit->item = item;
   return false;
+}
+
+// 当页还没有正文的段。已有一页、空、失败的都不自动再拉。
+bool takePagePrefetch(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
+  auto* hit = static_cast<PendingHit*>(raw);
+  if (item.query != WeReadComment::CandidateQuery::Unknown) return true;
+  if (item.end <= hit->pageStart || item.start >= hit->pageEnd) return true;
+  hit->found = true;
+  hit->index = index;
+  hit->item = item;
+  return false;
+}
+
+void markPrefetchDone(const uint32_t epoch) {
+  lockState();
+  if (job().pageEpoch == epoch) job().prefetchDone = true;
+  unlockState();
+  prefetchMore.store(false);
+}
+
+// 可见偏移换成原文偏移要扫章节文件，只在预取任务里、停稳之后做，并且一页只做一次。
+bool prefetchNativeWindow(const char* path, const uint32_t visStart, const uint32_t visEnd, const uint32_t epoch,
+                          uint32_t& nativeStart, uint32_t& nativeEnd) {
+  lockState();
+  Job& current = job();
+  if (current.pageEpoch == epoch && current.bounds && current.boundsEpoch == epoch) {
+    nativeStart = current.nativeStart;
+    nativeEnd = current.nativeEnd;
+    unlockState();
+    return nativeEnd > nativeStart || nativeEnd == UINT32_MAX;
+  }
+  if (current.pageEpoch == epoch && current.boundsFailed && current.boundsEpoch == epoch) {
+    unlockState();
+    return false;
+  }
+  unlockState();
+  // 取消标记会一直留到这次请求真正发出去。这里只看页代际，否则停稳后永远不会开始。
+  if (pageEpoch.load() != epoch) return false;
+  // visibleToNativeOffset 要 std::string。路径不到 128 字节，一页只分配一次。
+  const std::string xhtml(path);
+  uint32_t start = 0;
+  uint32_t end = 0;
+  const bool ok = pageNativeBounds(xhtml, visStart, visEnd, start, end);
+  if (pageEpoch.load() != epoch) return false;
+  lockState();
+  if (job().pageEpoch == epoch) {
+    job().boundsEpoch = epoch;
+    if (ok && (end > start || end == UINT32_MAX)) {
+      job().nativeStart = start;
+      job().nativeEnd = end;
+      job().bounds = true;
+      job().boundsFailed = false;
+    } else {
+      job().bounds = false;
+      job().boundsFailed = true;
+    }
+  }
+  unlockState();
+  if (!ok || (end <= start && end != UINT32_MAX)) return false;
+  nativeStart = start;
+  nativeEnd = end;
+  return true;
+}
+
+bool considerPrefetch(Assignment& work) {
+  if (work.kind != WorkKind::None) return false;
+  char path[128];
+  char bookId[64];
+  uint32_t visStart = 0;
+  uint32_t visEnd = 0;
+  uint32_t epoch = 0;
+  uint32_t chapterUid = 0;
+  uint32_t generation = 0;
+  bool ready = false;
+  lockState();
+  Job& current = job();
+  Round& state = round();
+  if (current.active && current.prefetchLatched && !current.prefetchDone && current.chapterPath[0] != '\0' &&
+      current.bookId[0] != '\0' && current.pageEpoch == pageEpoch.load() && state.underlinesReady &&
+      !state.underlinesFailed && !state.sessionMissing && !state.holdCommit) {
+    ready = true;
+    strncpy(path, current.chapterPath, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    strncpy(bookId, current.bookId, sizeof(bookId) - 1);
+    bookId[sizeof(bookId) - 1] = '\0';
+    visStart = current.visibleStart;
+    visEnd = current.visibleEnd;
+    epoch = current.pageEpoch;
+    chapterUid = current.chapterUid;
+    generation = current.generation;
+  }
+  unlockState();
+  if (!ready) return false;
+  if (static_cast<int32_t>(settleAt.load() - nowMs()) > 0) return false;
+  if (pageEpoch.load() != epoch) return false;
+  if (!WeReadHttpClient::networkReady()) return false;
+  if (visEnd != UINT32_MAX && visEnd <= visStart) {
+    markPrefetchDone(epoch);
+    return false;
+  }
+  uint32_t nativeStart = 0;
+  uint32_t nativeEnd = 0;
+  if (!prefetchNativeWindow(path, visStart, visEnd, epoch, nativeStart, nativeEnd)) {
+    if (pageEpoch.load() == epoch) markPrefetchDone(epoch);
+    return false;
+  }
+  if (pageEpoch.load() != epoch) return false;
+  PendingHit hit;
+  hit.pageStart = nativeStart;
+  hit.pageEnd = nativeEnd;
+  if (!WeReadComment::visitCandidates(bookId, chapterUid, takePagePrefetch, &hit)) return false;
+  if (pageEpoch.load() != epoch) return false;
+  if (!hit.found) {
+    markPrefetchDone(epoch);
+    return false;
+  }
+  prefetchMore.store(true);
+  work.kind = WorkKind::Range;
+  work.prefetch = true;
+  work.pageEpoch = epoch;
+  work.generation = generation;
+  strncpy(work.bookId, bookId, sizeof(work.bookId) - 1);
+  work.bookId[sizeof(work.bookId) - 1] = '\0';
+  work.chapterUid = chapterUid;
+  work.rangeIndex = hit.index;
+  work.start = hit.item.start;
+  work.end = hit.item.end;
+  return true;
 }
 
 bool chapterFetchFresh(const char* bookId, const uint32_t chapterUid) {
@@ -1052,6 +1229,7 @@ bool pickWork(Assignment& work) {
       }
     }
   }
+  if (work.kind == WorkKind::None) considerPrefetch(work);
   if (work.kind == WorkKind::Range && work.copyExisting && !work.stage) {
     char scratch[2] = {};
     WeReadComment::StoredComment comment;
@@ -1113,7 +1291,22 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
     markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
   }
   // 手动重拉还没整章换上。阅读页继续用旧缓存，成功后再丢掉。
-  if (!work.holdCommit) dirty.store(true);
+  // 预取写完不重画阅读页。弹层正等这一段的第一页时，让它直接读已经落盘的结果。
+  if (work.prefetch) {
+    const bool pageLeft = pageEpoch.load() != work.pageEpoch;
+    bool panelWaiting = false;
+    if (!pageLeft &&
+        (result == WeReadComment::CollectResult::Stored || result == WeReadComment::CollectResult::Empty) &&
+        moreState.load() == kMoreWanted) {
+      const MoreRequest& request = moreRequest();
+      panelWaiting = request.generation == job().generation && request.start == work.start &&
+                     request.end == work.end && request.maxIdx == 0 && request.syncKey == 0;
+      if (panelWaiting) moreState.store(kMoreIdle);
+    }
+    if (panelWaiting) dirty.store(true);
+  } else if (!work.holdCommit) {
+    dirty.store(true);
+  }
   unlockState();
 }
 
@@ -1128,6 +1321,18 @@ bool stepOnce() {
     }
     unlockState();
     return false;
+  }
+  if (work.prefetch && pageEpoch.load() != work.pageEpoch) {
+    prefetchMore.store(false);
+    return false;
+  }
+  if (work.prefetch) {
+    prefetchCancel.store(false);
+    if (pageEpoch.load() != work.pageEpoch) {
+      prefetchCancel.store(true);
+      prefetchMore.store(false);
+      return false;
+    }
   }
   static bool deferredLogged = false;
   // 已经连着的评论翻页不需要再开一条 TLS，堆紧也不推迟。索引请求仍是新连接。
@@ -1192,7 +1397,7 @@ bool stepOnce() {
       unlockState();
       return true;
     }
-    // 自动进章到索引为止：哪里有评论已完整落盘，具体内容点开弹层再按页拉。
+    // 索引落盘后，翻页停稳再预取当页正文。点开弹层时还没有的，再拉一页。
     const uint32_t now = TimeUtils::getCurrentValidTimestamp();
     if (now != 0) WeReadComment::markChapterFetched(bookId, chapterUid, now);
     lockState();
@@ -1214,21 +1419,29 @@ bool stepOnce() {
       rememberCandidate(work.bookId, work.chapterUid, static_cast<uint32_t>(work.rangeIndex), work.start, work.end,
                         WeReadComment::CandidateQuery::Failed, 0, 0, work.holdCommit);
     }
-    dirty.store(true);
+    if (!work.prefetch) dirty.store(true);
     return true;
   }
   FetchCtx ctx;
   ctx.bookId = work.bookId;
   ctx.chapterUid = work.chapterUid;
   ctx.rangeText = rangeText;
+  ctx.generation = work.generation;
+  ctx.prefetch = work.prefetch;
+  ctx.cancel = work.prefetch ? prefetchTurned : nullptr;
   uint32_t totalCount = 0;
   uint32_t markCount = 0;
-  // 一次只拉一页。弹层写完就显示；整章重拉也是一页一页往后走，不攒三页。
+  // 一次只拉一页。弹层写完就显示；整章重拉和当页预取也是一页一页往后走。
   // 这一页的连接先占上，避免请求返回前心跳再开一条。
+  if (work.prefetch) LOG_INF("WR", "当页评论预取 %u-%u", work.start, work.end);
   commentTlsHeld.store(true);
   auto result = WeReadComment::collectRange(work.bookId, work.chapterUid, work.start, work.end, work.maxIdx,
                                             work.syncKey, work.copyExisting, fetchPage, &ctx, 1, &totalCount,
                                             &markCount, work.stage, work.keepStaged);
+  if (work.prefetch && pageEpoch.load() != work.pageEpoch && result != WeReadComment::CollectResult::Stored) {
+    prefetchMore.store(false);
+    return true;
+  }
   // 后台重拉没成功时不要把已有评论标成空。整章重拉由提交时再决定换不换。
   if (work.stage && !work.keepStaged && result != WeReadComment::CollectResult::Stored) {
     result = WeReadComment::CollectResult::Failed;
@@ -1240,10 +1453,9 @@ bool stepOnce() {
 #endif
 }
 
-// 弹层还开着，或整章重拉还没结束时留着连接，下一页不用重新握手。
-// 两边都停了就断开，阅读翻页不和这条 TLS 挤在一起。
+// 弹层、整章重拉，或当页预取还没做完时留着连接。都停了就断开，阅读翻页不和这条 TLS 挤在一起。
 void releaseCommentConnection() {
-  if (panelShown.load() || moreState.load() == kMoreWanted) {
+  if (panelShown.load() || moreState.load() == kMoreWanted || prefetchMore.load()) {
     commentTlsHeld.store(WeReadClient::commentPageSessionOpen());
     return;
   }
@@ -1270,8 +1482,9 @@ void workerMain(void*) {
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
       continue;
     }
-    // 手动重拉一段一段爬，段与段之间留空隙给翻页。弹层正等着评论内容时不拖这 300ms。
-    uint32_t pauseMs = moreState.load() == kMoreWanted ? 20 : 300;
+    // 手动重拉、弹层翻页、当页预取都一段接一段。普通间隔留给翻页。
+    uint32_t pauseMs = 300;
+    if (moreState.load() == kMoreWanted || prefetchMore.load()) pauseMs = 20;
     if (stateLock) {
       lockState();
       if (round().holdCommit) pauseMs = 20;
@@ -1307,13 +1520,53 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   Round& state = round();
   Job& current = job();
   const bool sessionMissing = state.sessionMissing;
-  // 同一章翻页不再发请求。换章才决定要不要在后台刷新「哪里有评论」的索引。
+  // 换章才刷新「哪里有评论」。同一章只更新可见窗口，正文等停稳后再预取。
   const bool sameChapter = current.active && current.spine == spineIndex &&
                            strncmp(current.bookId, bookId, sizeof(current.bookId)) == 0;
-  // 离线进来之后网络恢复，补一次本章索引。翻页本身不再发请求。
+  // 离线进来之后网络恢复，补一次本章索引。
   const bool resumeOffline = sameChapter && state.phase == Phase::Offline && online && !sessionMissing;
+  const int previousPage = current.page;
+  const uint32_t previousStart = current.visibleStart;
+  const uint32_t previousEnd = current.visibleEnd;
+  const bool havePath = current.chapterPath[0] != '\0';
   unlockState();
-  if (sameChapter && !resumeOffline) return false;
+  if (sameChapter && !resumeOffline) {
+    const bool windowChanged = previousPage != pageNumber || previousStart != pageStart || previousEnd != pageEnd;
+    if (windowChanged) {
+      interruptPagePrefetchImpl();
+      lockState();
+      Job& turned = job();
+      if (turned.active && turned.spine == spineIndex &&
+          strncmp(turned.bookId, bookId, sizeof(turned.bookId)) == 0) {
+        turned.page = pageNumber;
+        turned.visibleStart = pageStart;
+        turned.visibleEnd = pageEnd;
+        turned.bounds = false;
+        turned.boundsFailed = false;
+        turned.prefetchLatched = false;
+        turned.prefetchDone = false;
+        turned.pageEpoch = pageEpoch.load();
+      }
+      unlockState();
+    } else if (havePath) {
+      bool arm = false;
+      lockState();
+      Job& held = job();
+      if (held.page == pageNumber && held.spine == spineIndex && !held.prefetchLatched && held.chapterPath[0] != '\0' &&
+          strncmp(held.bookId, bookId, sizeof(held.bookId)) == 0) {
+        held.prefetchLatched = true;
+        arm = true;
+      }
+      unlockState();
+      if (arm) {
+        settleAt.store(nowMs() + kPrefetchSettleMs);
+        notifyWorker();
+      }
+    }
+    return false;
+  }
+
+  interruptPagePrefetchImpl();
 
   uint32_t tocIndex = 0;
   uint32_t chapterUid = 0;
@@ -1324,13 +1577,13 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
     job().spine = spineIndex;
     job().page = pageNumber;
     job().active = true;
+    job().chapterPath[0] = '\0';
+    job().prefetchLatched = false;
+    job().prefetchDone = true;
     round().phase = Phase::Idle;
     unlockState();
     return false;
   }
-  uint32_t nativeStart = 0;
-  uint32_t nativeEnd = 0;
-  const bool bounds = pageNativeBounds(path, pageStart, pageEnd, nativeStart, nativeEnd);
   const bool fresh = chapterFetchFresh(bookId, chapterUid);
   const bool haveCandidates = WeReadComment::candidatesReady(bookId, chapterUid);
   // 在线时以卡上的会话为准。未登录不发请求，也不把失败写进状态栏。
@@ -1348,9 +1601,17 @@ bool publishPage(const char* bookId, const Epub& epub, const int spineIndex, con
   strncpy(current.bookId, bookId, sizeof(current.bookId) - 1);
   current.bookId[sizeof(current.bookId) - 1] = '\0';
   current.chapterUid = chapterUid;
-  current.nativeStart = nativeStart;
-  current.nativeEnd = nativeEnd;
-  current.bounds = bounds;
+  strncpy(current.chapterPath, path.c_str(), sizeof(current.chapterPath) - 1);
+  current.chapterPath[sizeof(current.chapterPath) - 1] = '\0';
+  current.visibleStart = pageStart;
+  current.visibleEnd = pageEnd;
+  current.nativeStart = 0;
+  current.nativeEnd = 0;
+  current.bounds = false;
+  current.boundsFailed = false;
+  current.prefetchLatched = false;
+  current.prefetchDone = false;
+  current.pageEpoch = pageEpoch.load();
   current.spine = spineIndex;
   current.page = pageNumber;
   current.active = true;
@@ -1412,9 +1673,11 @@ void showRange(Panel& view) {
 
 }  // namespace
 
+void interruptPagePrefetch() { interruptPagePrefetchImpl(); }
+
 bool syncPage(const char* bookId, const Epub& epub, const int spineIndex, const int pageNumber,
               const uint32_t pageStart, const uint32_t pageEnd) {
-  // 只登记当前章。underlines 索引在 wrCmt 任务里拉；评论内容点开弹层后按页在这里拉。
+  // 登记当前章和可见窗口。索引在后台拉；当页正文等这一页停稳后再预取。
   return publishPage(bookId, epub, spineIndex, pageNumber, pageStart, pageEnd);
 }
 
@@ -1450,6 +1713,7 @@ ManualRefresh beginManualRefresh() {
     return outcome;
   }
 
+  interruptPagePrefetch();
   WeReadComment::discardStagedChapter(bookId, chapterUid);
   lockState();
   if (!state.haveChapter || state.chapterUid != chapterUid ||
@@ -1465,6 +1729,10 @@ ManualRefresh beginManualRefresh() {
   state.holdCommit = true;
   state.manual = ManualRefresh::Running;
   current.generation++;
+  current.pageEpoch = pageEpoch.load();
+  current.bounds = false;
+  current.boundsFailed = false;
+  current.prefetchDone = false;
   current.fetch = true;
   state.phase = Phase::Loading;
   unlockState();
@@ -2002,6 +2270,7 @@ void drawPanel(GfxRenderer& renderer) {
 }
 
 void reset() {
+  interruptPagePrefetch();
   char abandonedId[64] = {};
   uint32_t abandonedUid = 0;
   bool hold = false;

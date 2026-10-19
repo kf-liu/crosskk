@@ -530,11 +530,13 @@ static_assert(sizeof(Operation) <= 8 * 1024, "WeRead operation exceeds its fixed
 // 把这一章的全部候选写入 ranges.wri，不截断。
 // stage 时候选写到 ranges.wri.new，不替换已有索引。
 bool fetchCommentUnderlines(const char* bookId, uint32_t chapterUid, bool stage = false);
+// cancel 在读正文时返回 true 就停下。连接阶段停不掉。
 bool fetchCommentReviewPage(const char* bookId, uint32_t chapterUid, const char* rangeText, uint32_t maxIdx,
-                            uint64_t syncKey, WeReadComment::RangeFile& file, WeReadComment::Cursor& cursor);
+                            uint64_t syncKey, WeReadComment::RangeFile& file, WeReadComment::Cursor& cursor,
+                            bool (*cancel)() = nullptr);
 // 评论翻页已经连着时，下一页直接复用，不必再等一次握手。
 bool commentPageSessionOpen();
-// 这一轮评论请求结束再断开：弹层关上，或整章重拉结束。阅读翻页时不留着。
+// 弹层、整章重拉或当页预取还在进行时留着。这些都停了再断开，阅读翻页不留着。
 void closeCommentPageSession();
 
 }  // namespace WeReadClient
