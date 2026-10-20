@@ -93,6 +93,8 @@ struct PageComments {
   size_t count = 0;
   size_t segmentCount = 0;
   bool valid = false;
+  // 点线过滤规则变过。旧缓存可能把「没有评论」的段丢掉了，对不上就整章重读。
+  uint8_t drawRevision = 0;
   char chapterPath[128] = {};
   // 已落盘的评论段。按本章实际段数增长并复用，不设章上限。
   std::unique_ptr<DrawRange[]> ranges;
@@ -824,6 +826,9 @@ bool queueMore(const Panel& view) {
   request.syncKey = view.comment.syncKey;
   request.generation = job().generation;
   unlockState();
+  // 点开自己发请求。进行中的预取停掉，避免和这次请求写同一段正文。
+  prefetchCancel.store(true);
+  prefetchMore.store(false);
   moreState.store(kMoreWanted);
   notifyWorker();
   return true;
@@ -876,6 +881,8 @@ struct PendingHit {
   uint32_t pageStart = 0;
   uint32_t pageEnd = 0;
   bool found = false;
+  bool skipSettled = false;
+  uint32_t generation = 0;
   uint32_t index = 0;
   WeReadComment::Candidate item;
 };
@@ -931,8 +938,10 @@ bool scanChapter(void* raw, const uint32_t index, const WeReadComment::Candidate
 }
 
 // 当页还没有正文的段。已有一页、空、失败的都不自动再拉。
+// 这一轮预取已经确认过的段也跳过，但不能把「空」写进索引，否则点线会被拿掉。
 bool takePagePrefetch(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
   auto* hit = static_cast<PendingHit*>(raw);
+  if (hit->skipSettled && rangeSettled(hit->generation, index)) return true;
   if (item.query != WeReadComment::CandidateQuery::Unknown) return true;
   if (item.end <= hit->pageStart || item.start >= hit->pageEnd) return true;
   hit->found = true;
@@ -1038,6 +1047,8 @@ bool considerPrefetch(Assignment& work) {
   PendingHit hit;
   hit.pageStart = nativeStart;
   hit.pageEnd = nativeEnd;
+  hit.skipSettled = true;
+  hit.generation = generation;
   if (!WeReadComment::visitCandidates(bookId, chapterUid, takePagePrefetch, &hit)) return false;
   if (pageEpoch.load() != epoch) return false;
   if (!hit.found) {
@@ -1244,8 +1255,6 @@ bool pickWork(Assignment& work) {
 
 void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult result, const uint32_t totalCount,
                       const uint32_t markCount) {
-  const bool hasMore = result == WeReadComment::CollectResult::Stored &&
-                       rangeHasMore(work.bookId, work.chapterUid, work.start, work.end, work.keepStaged);
   lockState();
   if (work.generation != job().generation) {
     unlockState();
@@ -1253,6 +1262,16 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
     return;
   }
   unlockState();
+  // 预取只把正文写到文件里，不改「哪里有评论」的索引，也不重画点线。
+  // 点开仍按原来的规则拉一页，并由那次请求决定点线留不留。
+  if (work.prefetch) {
+    const bool pageLeft = pageEpoch.load() != work.pageEpoch;
+    const bool cancelled = prefetchCancel.load();
+    if (!pageLeft && !cancelled) markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
+    return;
+  }
+  const bool hasMore = result == WeReadComment::CollectResult::Stored &&
+                       rangeHasMore(work.bookId, work.chapterUid, work.start, work.end, work.keepStaged);
   WeReadComment::CandidateQuery query = WeReadComment::CandidateQuery::Stored;
   if (result == WeReadComment::CollectResult::Empty) query = WeReadComment::CandidateQuery::Empty;
   else if (result == WeReadComment::CollectResult::Failed) query = WeReadComment::CandidateQuery::Failed;
@@ -1291,27 +1310,107 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
     markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
   }
   // 手动重拉还没整章换上。阅读页继续用旧缓存，成功后再丢掉。
-  // 预取写完不重画阅读页。弹层正等这一段的第一页时，让它直接读已经落盘的结果。
-  if (work.prefetch) {
-    const bool pageLeft = pageEpoch.load() != work.pageEpoch;
-    bool panelWaiting = false;
-    if (!pageLeft &&
-        (result == WeReadComment::CollectResult::Stored || result == WeReadComment::CollectResult::Empty) &&
-        moreState.load() == kMoreWanted) {
-      const MoreRequest& request = moreRequest();
-      panelWaiting = request.generation == job().generation && request.start == work.start &&
-                     request.end == work.end && request.maxIdx == 0 && request.syncKey == 0;
-      if (panelWaiting) moreState.store(kMoreIdle);
-    }
-    if (panelWaiting) dirty.store(true);
-  } else if (!work.holdCommit) {
-    dirty.store(true);
+  if (!work.holdCommit) dirty.store(true);
+  unlockState();
+}
+
+// 上一版预取把没拉到正文的段写成了空，点线就被收掉。索引重建还会把这个空抄回去。
+// 每章只改一次，改回「还没点开」，点线按原来的规则再画。改完留下标记，
+// 之后只有点开并确认没有评论，才会再写成空。
+struct EmptyBits {
+  uint8_t bits[kSettledRangeCap / 8] = {};
+  bool overflow = false;
+};
+
+bool noteEmpty(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
+  if (item.query != WeReadComment::CandidateQuery::Empty) return true;
+  auto* scan = static_cast<EmptyBits*>(raw);
+  if (index >= kSettledRangeCap) {
+    scan->overflow = true;
+    return true;
+  }
+  scan->bits[index / 8] |= static_cast<uint8_t>(1u << (index % 8));
+  return true;
+}
+
+std::string hiddenDotMarker(const char* bookId, const uint32_t chapterUid) {
+  const std::string sample = WeReadComment::rangePath(bookId, chapterUid, 0, 1);
+  const auto slash = sample.rfind('/');
+  if (sample.empty() || slash == std::string::npos) return {};
+  return sample.substr(0, slash) + "/ranges.reopen";
+}
+
+void reopenEmpty(const char* bookId, const uint32_t chapterUid, const uint32_t index, bool& changed, bool& failed) {
+  WeReadComment::Candidate item;
+  if (!WeReadComment::readCandidate(bookId, chapterUid, index, item) ||
+      item.query != WeReadComment::CandidateQuery::Empty) {
+    return;
+  }
+  item.query = WeReadComment::CandidateQuery::Unknown;
+  if (WeReadComment::updateCandidate(bookId, chapterUid, index, item)) changed = true;
+  else failed = true;
+}
+
+void repairHiddenDots() {
+  char bookId[64];
+  uint32_t chapterUid = 0;
+  bool ready = false;
+  lockState();
+  Job& current = job();
+  Round& state = round();
+  if (current.active && current.bookId[0] != '\0' && state.underlinesReady && !state.holdCommit) {
+    ready = true;
+    strncpy(bookId, current.bookId, sizeof(bookId) - 1);
+    bookId[sizeof(bookId) - 1] = '\0';
+    chapterUid = current.chapterUid;
   }
   unlockState();
+  if (!ready) return;
+
+  static char doneBook[64] = {};
+  static uint32_t doneChapter = 0;
+  static bool done = false;
+  if (done && doneChapter == chapterUid && strncmp(doneBook, bookId, sizeof(doneBook)) == 0) return;
+
+  const std::string marker = hiddenDotMarker(bookId, chapterUid);
+  if (marker.empty()) return;
+  if (Storage.exists(marker.c_str())) {
+    done = true;
+    doneChapter = chapterUid;
+    strncpy(doneBook, bookId, sizeof(doneBook) - 1);
+    doneBook[sizeof(doneBook) - 1] = '\0';
+    return;
+  }
+  if (!WeReadComment::candidatesReady(bookId, chapterUid)) return;
+
+  EmptyBits scan;
+  if (!WeReadComment::visitCandidates(bookId, chapterUid, noteEmpty, &scan)) return;
+  bool changed = false;
+  bool failed = false;
+  for (uint32_t index = 0; index < kSettledRangeCap; ++index) {
+    if ((scan.bits[index / 8] & static_cast<uint8_t>(1u << (index % 8))) == 0) continue;
+    reopenEmpty(bookId, chapterUid, index, changed, failed);
+  }
+  if (scan.overflow) {
+    for (uint32_t index = kSettledRangeCap;; ++index) {
+      WeReadComment::Candidate item;
+      if (!WeReadComment::readCandidate(bookId, chapterUid, index, item)) break;
+      if (item.query == WeReadComment::CandidateQuery::Empty) reopenEmpty(bookId, chapterUid, index, changed, failed);
+    }
+  }
+  if (failed) return;
+  HalFile markerFile;
+  if (!Storage.openFileForWrite("WR", marker, markerFile)) return;
+  done = true;
+  doneChapter = chapterUid;
+  strncpy(doneBook, bookId, sizeof(doneBook) - 1);
+  doneBook[sizeof(doneBook) - 1] = '\0';
+  if (changed) dirty.store(true);
 }
 
 bool stepOnce() {
 #ifdef ENABLE_CHINESE_VERSION
+  repairHiddenDots();
   Assignment work;
   if (!pickWork(work) || work.generation != job().generation) {
     lockState();
@@ -1415,11 +1514,11 @@ bool stepOnce() {
   const int length = snprintf(rangeText, sizeof(rangeText), "%u-%u", work.start, work.end);
   if (length <= 0 || static_cast<size_t>(length) >= sizeof(rangeText)) {
     if (work.kind == WorkKind::More) moreState.store(kMoreFailed);
-    else {
+    else if (!work.prefetch) {
       rememberCandidate(work.bookId, work.chapterUid, static_cast<uint32_t>(work.rangeIndex), work.start, work.end,
                         WeReadComment::CandidateQuery::Failed, 0, 0, work.holdCommit);
+      dirty.store(true);
     }
-    if (!work.prefetch) dirty.store(true);
     return true;
   }
   FetchCtx ctx;

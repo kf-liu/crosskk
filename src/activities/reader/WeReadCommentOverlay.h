@@ -12,7 +12,8 @@ namespace WeReadCommentOverlay {
 
 // 把当前章登记给后台任务：索引过期时在后台拉一次「哪里有评论」。
 // 翻页停稳约 1 秒后，当页还没有正文的评论各拉一页（5 条）。翻页一开始就停。
-// 点开弹层时这一页已经在就直接显示，没有再拉一页；继续往下翻再拉下一页。
+// 预取只写正文文件，不改点线索引，也不重画阅读页。
+// 点开弹层时这一页已经在就直接显示，没有再拉一页；没有就按原来的规则拉一页。继续往下翻再拉下一页。
 // 返回 true 表示点线需要重画。
 bool syncPage(const char* bookId, const Epub& epub, int spineIndex, int pageNumber, uint32_t pageStart,
               uint32_t pageEnd);
