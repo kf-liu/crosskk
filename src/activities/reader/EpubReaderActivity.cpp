@@ -268,8 +268,30 @@ bool EpubReaderActivity::updateChapterBuild() {
   if (!lock.ownsLock()) return true;
   if (!section) return true;
 
+  // A low-heap network wake can reclaim the SD reader font mid-build (the
+  // WiFi retry path releases it under the render lock). The reclaim itself
+  // lifts free heap above the build's heap gate, so nothing else stops this
+  // tick: paginating with the evicted id misses fontMap on every glyph — a
+  // multi-second error-log storm that wedges the loop task into a watchdog
+  // reset — and would persist zero-width pagination into the section cache.
+  // Pause the build; the next foreground render reloads the font, and the
+  // deterministic id comes back unchanged so pagination resumes seamlessly.
+  if (renderer.getFontMap().count(sectionFontId_) == 0) {
+    if (!buildFontMissPaused_) {
+      buildFontMissPaused_ = true;
+      LOG_INF("ERS", "Section build paused: reading font %d reclaimed", sectionFontId_);
+    }
+    return true;
+  }
+  buildFontMissPaused_ = false;
+
   if (needsPartialRebuild() && buildViewportWidth > 0) {
     const ReaderRenderSpec buildSpec = effectiveRenderSpec(buildViewportWidth, buildViewportHeight);
+    // Only extend a partial section with the font its existing pages were
+    // laid out with. After a mid-build reclaim the resolver falls back to a
+    // built-in id; extending with it would mix two paginations into one
+    // cache file. renderBook() owns the font-change rebuild.
+    if (buildSpec.fontId != sectionFontId_) return true;
     prepareChapterBuild();
     if (!section->startBuild(buildSpec)) {
       if (!handleBuildFailure("deferred partial start", section->buildError())) requestUpdate();
@@ -332,9 +354,20 @@ void EpubReaderActivity::onEnter() {
   ReaderActivity::onEnter();
 #ifdef ENABLE_CHINESE_VERSION
   // 智能在线：进入阅读再关联，主页不保持连接。同一本书这一轮已经比较过也要连着，心跳还要报。
+  // join 不在这里发起：WiFi 初始化加关联的内部堆峰值如果和首渲染、字形预热并行，
+  // 驱动侧 connect 路径会撞 NO_MEM 直接 abort（ets_timer_setfn → ESP_ERROR_CHECK）。
+  // 未连上时只挂起标记，主循环等阅读器安定后再发起（见 onLoop）。
+  // / Smart-online joins on reader entry. The join is NOT armed here: the WiFi
+  // init + connect internal-heap peak, when racing the first render and glyph
+  // prewarm, drives the WiFi driver's connect path into an OOM abort. Arm a
+  // pending flag instead; onLoop fires the join once the reader has settled.
   if (wereadBookId_[0] != '\0' && NetworkStartup::smartOnlineReading()) {
-    NetworkStartup::holdReadingRadio(true);
-    if (!WeReadHttpClient::networkReady()) NetworkStartup::beginSavedNetwork(renderer);
+    if (WeReadHttpClient::networkReady()) {
+      NetworkStartup::holdReadingRadio(true);
+    } else {
+      entryJoinPending_ = true;
+      entryJoinArmedAtMs_ = millis();
+    }
   }
   if (!epub || wereadBookId_[0] == '\0') return;
   // 同一次打开里不再同步。退出或回首页会清掉这个标记。
@@ -1242,6 +1275,28 @@ void EpubReaderActivity::loop() {
     return;
   }
 
+#ifdef ENABLE_CHINESE_VERSION
+  // onEnter 挂起的 entry join 在这里发起（见 onEnter 注释）：等首渲染完成、FCM
+  // 扫描收尾（实测 ~600ms）、章节构建安静、当前没有渲染在跑，WiFi 驱动的
+  // connect 路径才有完整的内部堆可用。兜底超时从挂起时刻起算：从末次渲染起算
+  // 会被翻页不断重置（实测一章 40 秒翻页期从未触发）；而构建可能因堆闸门
+  // （max block 低于阈值）无限暂停，isBuilding 永远为真，settle 分支等不来。
+  // 到点就放行，别让这轮心跳和进度同步整场断网。join 发起后 readingRadioBusy
+  // 会挡住同拍及后续的闲置预热（见下方预热块）。
+  constexpr unsigned long kEntryJoinSettleMs = 1500;
+  constexpr unsigned long kEntryJoinBuildTimeoutMs = 30000;
+  if (entryJoinPending_ && lastRenderCompleteMs != 0 && !RenderLock::peek()) {
+    const bool settled =
+        (!section || !section->isBuilding()) && millis() - lastRenderCompleteMs > kEntryJoinSettleMs;
+    if (settled || millis() - entryJoinArmedAtMs_ > kEntryJoinBuildTimeoutMs) {
+      entryJoinPending_ = false;
+      LOG_INF("ERS", "entry join armed %lums after entry", millis() - entryJoinArmedAtMs_);
+      NetworkStartup::holdReadingRadio(true);
+      if (!WeReadHttpClient::networkReady()) NetworkStartup::beginSavedNetwork(renderer);
+    }
+  }
+#endif
+
 #if !FREEINK_DEVICE_READPICO
   constexpr unsigned long IDLE_PREWARM_DEBOUNCE_MS = 400;
   auto* fcm = renderer.getFontCacheManager();
@@ -1250,6 +1305,7 @@ void EpubReaderActivity::loop() {
     if (lock.ownsLock() && section && !section->isBuilding() && renderer.hasFrameBuffer() &&
         lastRenderCompleteMs != 0 && millis() - lastRenderCompleteMs > IDLE_PREWARM_DEBOUNCE_MS &&
         ESP.getFreeHeap() > RENDER_MIN_FREE_HEAP && ESP.getMaxAllocHeap() > BACKGROUND_BUILD_MIN_MAX_ALLOC && fcm &&
+        !NetworkStartup::readingRadioBusy() &&
         fcm->canIdlePrewarm(SETTINGS.getReaderFontId()) &&
         (idlePrewarmSpine != currentSpineIndex || idlePrewarmPage != section->currentPage)) {
       idlePrewarmSpine = currentSpineIndex;
@@ -3647,6 +3703,20 @@ bool EpubReaderActivity::buildPageCacheSlot(const int slot, const ReaderPageCach
     }
   }
   if (cancelled()) return false;
+
+  // The spec's font id was captured when this fill was queued; a low-heap
+  // network wake may have reclaimed the SD reader font in between. Rendering
+  // a whole page with the stale id misses fontMap on every text element (a
+  // multi-second error-log storm that wedges the render task into a watchdog
+  // reset). Reload once — the deterministic font id comes back identical —
+  // and skip this optional fill if the font still won't load.
+  if (renderer.getFontMap().count(key.spec.fontId) == 0) {
+    sdFontSystem.ensureLoaded(renderer);
+    if (renderer.getFontMap().count(key.spec.fontId) == 0) {
+      LOG_ERR("ERS", "Page cache: slot %d skip, page %d, font %d not loaded", slot, key.page, key.spec.fontId);
+      return false;
+    }
+  }
 
   uint8_t* const live = renderer.getFrameBuffer();
   auto* fcm = renderer.getFontCacheManager();

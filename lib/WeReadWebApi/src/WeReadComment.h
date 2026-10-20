@@ -18,7 +18,7 @@ constexpr uint16_t kCandidateHeaderSize = 16;
 constexpr uint32_t kMaxStoredComments = 200;
 constexpr uint16_t kMaxCommentBytes = 2048;
 constexpr uint8_t kMaxAuthorBytes = 47;
-constexpr uint32_t kReviewPageSize = 5;
+constexpr uint32_t kReviewPageSize = 20;
 constexpr int kMaxReviewPages = 16;
 
 constexpr uint32_t kFlagHasMore = 1U << 0;

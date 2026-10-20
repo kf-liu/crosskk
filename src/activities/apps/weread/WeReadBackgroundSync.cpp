@@ -16,6 +16,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "activities/reader/WeReadCommentOverlay.h"
 #include "util/BackgroundWork.h"
 #include "util/TimeUtils.h"
 
@@ -72,6 +73,15 @@ SemaphoreHandle_t jobMu = nullptr;
 TaskHandle_t worker = nullptr;
 std::atomic<IdleHook> idleHook{nullptr};
 bool clockRequestArmed = false;
+// 一拍进度同步独占 TLS 网络窗口（与评论拉取互斥，见 WeReadClient::tryClaimTlsWindow）。
+// 只在 jobMu 临界区里读写。
+bool tlsOwned = false;
+
+void releaseTlsClaim() {
+  if (!tlsOwned) return;
+  tlsOwned = false;
+  WeReadClient::releaseTlsWindow();
+}
 
 void rememberBook(const char* bookId) {
   job.bookId[0] = '\0';
@@ -90,6 +100,7 @@ void noteProgress(const bool on) {
 }
 
 void idle() {
+  releaseTlsClaim();
   noteProgress(false);
   if (job.operation && job.operation->active()) job.operation->reset();
   job.phase = Phase::Idle;
@@ -125,6 +136,7 @@ void queue(const WeReadClient::ProgressSyncMode mode, const bool exitJob) {
 }
 
 void parkChoice(const WeReadProtocol::RemoteProgress& remote) {
+  releaseTlsClaim();
   noteProgress(false);
   job.remote = remote;
   job.phase = Phase::Choice;
@@ -133,6 +145,7 @@ void parkChoice(const WeReadProtocol::RemoteProgress& remote) {
 }
 
 void parkApply(const WeReadProtocol::RemoteProgress& remote) {
+  releaseTlsClaim();
   job.remote = remote;
   job.phase = Phase::Apply;
 }
@@ -295,6 +308,18 @@ StepPace stepWork() {
   }
   job.clockSinceMs = 0;
   clockNeeded.store(false);
+
+  // 评论侧占着 TLS 窗口（拉取中，或弹层/预取停着的连接）时这一拍顺延。抢到窗口
+  // 才走，从这拍到 idle/finishOutcome 独占：两条 WeRead TLS 同时活着过一次，内部
+  // 堆掉到 WiFi 唤醒路径分配失败，PHY 定时器创建直接 abort 重启。
+  if (!tlsOwned) {
+    if (WeReadCommentOverlay::commentConnectionHeld() || !WeReadClient::tryClaimTlsWindow()) {
+      job.nextStepMs = millis() + 250;
+      unlockJob();
+      return StepPace::Wait;
+    }
+    tlsOwned = true;
+  }
 
   if (!job.operation->active()) {
     if (!job.operation->beginProgressSync(job.bookId, job.input, job.mode)) {

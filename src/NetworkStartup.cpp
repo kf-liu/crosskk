@@ -357,6 +357,8 @@ bool stationConnected() {
   return (mode & WIFI_MODE_STA) != 0 && WiFi.status() == WL_CONNECTED;
 }
 
+bool readingRadioBusy() { return readingPhase != ReadingRadioPhase::Idle; }
+
 bool stayConnected() { return readingHold; }
 
 void holdReadingRadio(const bool hold) { readingHold = hold; }

@@ -38,7 +38,7 @@ bool takeDirty();
 // 弹层还在加载、后台又空了出来时补一次排队。不发网络，阅读循环每圈调用。
 bool pumpPanel();
 
-// 有他人评论的片段画点状下划线。坐标和划线相同，灰阶各遍复用这一页的结果。
+// 划线的片段画点状下划线。有划线就画，拉过没拉到评论也不收。坐标和划线相同，灰阶各遍复用这一页的结果。
 void drawForBook(GfxRenderer& renderer, int fontId, const Page& page, int xOffset, int yOffset, const char* bookId,
                  const Epub& epub, int spineIndex);
 

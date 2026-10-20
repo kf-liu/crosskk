@@ -539,4 +539,11 @@ bool commentPageSessionOpen();
 // 弹层、整章重拉或当页预取还在进行时留着。这些都停了再断开，阅读翻页不留着。
 void closeCommentPageSession();
 
+// 后台两条网络任务（进度心跳、评论拉取）互斥开 TLS：两条 WeRead TLS 同时活过
+// 一次，内部堆掉到 WiFi 唤醒路径分配失败，PHY 定时器创建直接 abort 重启。
+// CAS 抢窗口，拿不到的一方 200-250ms 后重试。评论侧从取工作项到连接关闭，
+// 心跳侧从一拍开始到拍子结束，各持一次。
+bool tryClaimTlsWindow();
+void releaseTlsWindow();
+
 }  // namespace WeReadClient

@@ -93,8 +93,6 @@ struct PageComments {
   size_t count = 0;
   size_t segmentCount = 0;
   bool valid = false;
-  // 点线过滤规则变过。旧缓存可能把「没有评论」的段丢掉了，对不上就整章重读。
-  uint8_t drawRevision = 0;
   char chapterPath[128] = {};
   // 已落盘的评论段。按本章实际段数增长并复用，不设章上限。
   std::unique_ptr<DrawRange[]> ranges;
@@ -598,11 +596,10 @@ bool ensureOffsets(PageComments& comments, const size_t pairs) {
   return true;
 }
 
-// 点线直接按候选索引画：索引一到，本章哪里可能有讨论整章可见，不用等每段内容都下载。
-// 点开拉过并确认没有评论的段（Empty）不再画。评论数只有打开拉取后才知道，
-// 所以索引阶段宁可多画，打开一次空段就会收敛掉。
+// 点线直接按候选索引画：索引一到，本章的划线整章可见，不用等每段内容都下载。
+// 有划线就画。有没有评论只有打开拉取后才知道，拉空也不收线。
 bool candidateDrawable(const WeReadComment::Candidate& item) {
-  return item.end > item.start && item.query != WeReadComment::CandidateQuery::Empty;
+  return item.end > item.start;
 }
 
 struct CandidateCount {
@@ -772,6 +769,9 @@ std::atomic<bool> committing{false};
 std::atomic<bool> workerBusy{false};
 std::atomic<bool> panelShown{false};
 std::atomic<bool> commentTlsHeld{false};
+// 评论 worker 从取到工作项到连接关闭独占 TLS 网络窗口（与后台进度心跳互斥，
+// 见 WeReadClient::tryClaimTlsWindow）。只在评论 worker 任务里读写。
+bool tlsOwned = false;
 std::atomic<uint8_t> moreState{kMoreIdle};
 // 翻页把这个加上。正在读的预取对不上就丢掉。
 std::atomic<uint32_t> pageEpoch{0};
@@ -1263,7 +1263,7 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   }
   unlockState();
   // 预取只把正文写到文件里，不改「哪里有评论」的索引，也不重画点线。
-  // 点开仍按原来的规则拉一页，并由那次请求决定点线留不留。
+  // 点开仍按原来的规则拉一页；点线跟划线索引走，不随拉取结果收掉。
   if (work.prefetch) {
     const bool pageLeft = pageEpoch.load() != work.pageEpoch;
     const bool cancelled = prefetchCancel.load();
@@ -1314,103 +1314,8 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   unlockState();
 }
 
-// 上一版预取把没拉到正文的段写成了空，点线就被收掉。索引重建还会把这个空抄回去。
-// 每章只改一次，改回「还没点开」，点线按原来的规则再画。改完留下标记，
-// 之后只有点开并确认没有评论，才会再写成空。
-struct EmptyBits {
-  uint8_t bits[kSettledRangeCap / 8] = {};
-  bool overflow = false;
-};
-
-bool noteEmpty(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
-  if (item.query != WeReadComment::CandidateQuery::Empty) return true;
-  auto* scan = static_cast<EmptyBits*>(raw);
-  if (index >= kSettledRangeCap) {
-    scan->overflow = true;
-    return true;
-  }
-  scan->bits[index / 8] |= static_cast<uint8_t>(1u << (index % 8));
-  return true;
-}
-
-std::string hiddenDotMarker(const char* bookId, const uint32_t chapterUid) {
-  const std::string sample = WeReadComment::rangePath(bookId, chapterUid, 0, 1);
-  const auto slash = sample.rfind('/');
-  if (sample.empty() || slash == std::string::npos) return {};
-  return sample.substr(0, slash) + "/ranges.reopen";
-}
-
-void reopenEmpty(const char* bookId, const uint32_t chapterUid, const uint32_t index, bool& changed, bool& failed) {
-  WeReadComment::Candidate item;
-  if (!WeReadComment::readCandidate(bookId, chapterUid, index, item) ||
-      item.query != WeReadComment::CandidateQuery::Empty) {
-    return;
-  }
-  item.query = WeReadComment::CandidateQuery::Unknown;
-  if (WeReadComment::updateCandidate(bookId, chapterUid, index, item)) changed = true;
-  else failed = true;
-}
-
-void repairHiddenDots() {
-  char bookId[64];
-  uint32_t chapterUid = 0;
-  bool ready = false;
-  lockState();
-  Job& current = job();
-  Round& state = round();
-  if (current.active && current.bookId[0] != '\0' && state.underlinesReady && !state.holdCommit) {
-    ready = true;
-    strncpy(bookId, current.bookId, sizeof(bookId) - 1);
-    bookId[sizeof(bookId) - 1] = '\0';
-    chapterUid = current.chapterUid;
-  }
-  unlockState();
-  if (!ready) return;
-
-  static char doneBook[64] = {};
-  static uint32_t doneChapter = 0;
-  static bool done = false;
-  if (done && doneChapter == chapterUid && strncmp(doneBook, bookId, sizeof(doneBook)) == 0) return;
-
-  const std::string marker = hiddenDotMarker(bookId, chapterUid);
-  if (marker.empty()) return;
-  if (Storage.exists(marker.c_str())) {
-    done = true;
-    doneChapter = chapterUid;
-    strncpy(doneBook, bookId, sizeof(doneBook) - 1);
-    doneBook[sizeof(doneBook) - 1] = '\0';
-    return;
-  }
-  if (!WeReadComment::candidatesReady(bookId, chapterUid)) return;
-
-  EmptyBits scan;
-  if (!WeReadComment::visitCandidates(bookId, chapterUid, noteEmpty, &scan)) return;
-  bool changed = false;
-  bool failed = false;
-  for (uint32_t index = 0; index < kSettledRangeCap; ++index) {
-    if ((scan.bits[index / 8] & static_cast<uint8_t>(1u << (index % 8))) == 0) continue;
-    reopenEmpty(bookId, chapterUid, index, changed, failed);
-  }
-  if (scan.overflow) {
-    for (uint32_t index = kSettledRangeCap;; ++index) {
-      WeReadComment::Candidate item;
-      if (!WeReadComment::readCandidate(bookId, chapterUid, index, item)) break;
-      if (item.query == WeReadComment::CandidateQuery::Empty) reopenEmpty(bookId, chapterUid, index, changed, failed);
-    }
-  }
-  if (failed) return;
-  HalFile markerFile;
-  if (!Storage.openFileForWrite("WR", marker, markerFile)) return;
-  done = true;
-  doneChapter = chapterUid;
-  strncpy(doneBook, bookId, sizeof(doneBook) - 1);
-  doneBook[sizeof(doneBook) - 1] = '\0';
-  if (changed) dirty.store(true);
-}
-
 bool stepOnce() {
 #ifdef ENABLE_CHINESE_VERSION
-  repairHiddenDots();
   Assignment work;
   if (!pickWork(work) || work.generation != job().generation) {
     lockState();
@@ -1447,6 +1352,9 @@ bool stepOnce() {
     return false;
   }
   deferredLogged = false;
+  // 和后台进度心跳互斥开 TLS（CAS 网络窗口）。拿不到时工作留在队列里，下一轮再试。
+  if (!tlsOwned && !WeReadClient::tryClaimTlsWindow()) return false;
+  tlsOwned = true;
   workerBusy.store(true);
   if (work.kind == WorkKind::Underlines) {
     const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid, work.holdCommit);
@@ -1553,9 +1461,16 @@ bool stepOnce() {
 }
 
 // 弹层、整章重拉，或当页预取还没做完时留着连接。都停了就断开，阅读翻页不和这条 TLS 挤在一起。
+// 连接留着时 TLS 窗口也留着（心跳不开第二条）；连接不在了就把窗口还给心跳。
+// tlsOwned 守卫：没抢到窗口的一轮不能替心跳释放它的窗口。
 void releaseCommentConnection() {
   if (panelShown.load() || moreState.load() == kMoreWanted || prefetchMore.load()) {
-    commentTlsHeld.store(WeReadClient::commentPageSessionOpen());
+    const bool held = WeReadClient::commentPageSessionOpen();
+    commentTlsHeld.store(held);
+    if (!held && tlsOwned) {
+      tlsOwned = false;
+      WeReadClient::releaseTlsWindow();
+    }
     return;
   }
   bool refreshing = false;
@@ -1565,11 +1480,20 @@ void releaseCommentConnection() {
     unlockState();
   }
   if (refreshing) {
-    commentTlsHeld.store(WeReadClient::commentPageSessionOpen());
+    const bool held = WeReadClient::commentPageSessionOpen();
+    commentTlsHeld.store(held);
+    if (!held && tlsOwned) {
+      tlsOwned = false;
+      WeReadClient::releaseTlsWindow();
+    }
     return;
   }
   WeReadClient::closeCommentPageSession();
   commentTlsHeld.store(false);
+  if (tlsOwned) {
+    tlsOwned = false;
+    WeReadClient::releaseTlsWindow();
+  }
 }
 
 void workerMain(void*) {

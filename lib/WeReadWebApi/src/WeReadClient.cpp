@@ -17,6 +17,7 @@
 #include <strings.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -3118,6 +3119,10 @@ Error Operation::sendProgressOnce(const bool report) {
                         reinterpret_cast<char*>(ioBuffer_), sizeof(ioBuffer_), url_, sizeof(url_), bodySize)) {
     return Error::Clock;
   }
+  // report 请求曾整拍收不到一个字节而 enter 同连接秒回；先把发出去的正文留在
+  // 日志里，和 koplugin 的 make_read_payload 逐字段对。
+  LOG_INF("WR", "progress POST(%s): %.*s", report ? "report" : "enter", static_cast<int>(bodySize),
+          reinterpret_cast<const char*>(ioBuffer_));
   SimpleJsonContext context;
   // The SDK token buffer is 2 KiB; keep it off the shared network task stack.
   auto parser = makeUniqueNoThrow<StreamingJsonParser>(simpleCallbacks(&context));
@@ -4680,6 +4685,11 @@ bool commentFinish(void* raw) {
   return ctx && ctx->status == 200 && ctx->finish && ctx->finish(ctx->ctx);
 }
 
+// 预热连接只要握手和 200，回包内容直接丢掉。
+bool warmupFeed(void*, const uint8_t*, const size_t) { return true; }
+
+bool warmupFinish(void*) { return true; }
+
 bool underlineFeed(void* raw, const uint8_t* data, const size_t len) {
   return static_cast<WeReadComment::UnderlineParser*>(raw)->feed(data, len);
 }
@@ -4788,22 +4798,24 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   WeReadStore::Session session;
   if (!WeReadStore::loadSession(session) || !session.valid()) return false;
 
-  auto parser = makeUniqueNoThrow<WeReadComment::ReviewPageParser>();
-  if (!parser) return false;
-
   constexpr size_t kCookieSize = 896;
   constexpr size_t kUrlSize = 512;
   constexpr size_t kReadSize = 1024;
   constexpr size_t kBodySize = 384;
-  auto buffer = makeUniqueNoThrow<uint8_t[]>(kCookieSize + kUrlSize + kReadSize + kBodySize);
-  if (!buffer) {
-    LOG_ERR("WR", "内存不足：评论翻页请求缓冲 %u 字节",
-            static_cast<unsigned>(kCookieSize + kUrlSize + kReadSize + kBodySize));
+  // PSRAM 板优先把请求 scratch 放 PSRAM：TLS 会话加上阅读器驻留之后，内部堆的
+  // 连续块在响应窗口常收不下整页记录，这块 2.8KB 挪走后余量回到可用水平。
+  // 无 PSRAM 的板（C3 基线）退回内部堆，行为不变。
+  constexpr size_t kScratchSize = kCookieSize + kUrlSize + kReadSize + kBodySize;
+  memory::ByteBuffer psramScratch = memory::makePsramByteBufferUninitializedNoThrow(kScratchSize);
+  auto internalScratch = psramScratch ? nullptr : makeUniqueNoThrow<uint8_t[]>(kScratchSize);
+  uint8_t* const scratch = psramScratch ? psramScratch.get() : internalScratch.get();
+  if (!scratch) {
+    LOG_ERR("WR", "内存不足：评论翻页请求缓冲 %u 字节", static_cast<unsigned>(kScratchSize));
     return false;
   }
-  char* cookie = reinterpret_cast<char*>(buffer.get());
+  char* cookie = reinterpret_cast<char*>(scratch);
   char* url = cookie + kCookieSize;
-  uint8_t* readBuffer = buffer.get() + kCookieSize + kUrlSize;
+  uint8_t* readBuffer = scratch + kCookieSize + kUrlSize;
   char* body = reinterpret_cast<char*>(readBuffer + kReadSize);
   const int bodyLength =
       snprintf(body, kBodySize,
@@ -4815,6 +4827,65 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
 
   char referer[160];
   if (!readerReferer(bookId, referer, sizeof(referer))) return false;
+
+  // 冷连接先预热：不带解析状态发一个轻量 GET，把握手要的 ~10KB 堆开销放在只有
+  // 一块 scratch 的窗口里完成，真正的 POST 在温连接上几百毫秒内往返。
+  if (!commentPageSession.reusable()) {
+    char encodedBookId[192];
+    char warmPath[320];
+    if (!WeReadProtocol::urlEncode(bookId, encodedBookId, sizeof(encodedBookId))) return false;
+    // `_` 用和进度查询一样的 epoch-ms；先前误用 millis 被服务器 400。
+    const uint64_t cacheKey =
+        static_cast<uint64_t>(TimeUtils::getCurrentValidTimestamp()) * 1000ULL + millis() % 1000;
+    const int warmLength =
+        snprintf(warmPath, sizeof(warmPath), "/web/book/getProgress?bookId=%s&_=%llu", encodedBookId,
+                 static_cast<unsigned long long>(cacheKey));
+    if (warmLength <= 0 || static_cast<size_t>(warmLength) >= sizeof(warmPath)) return false;
+    CommentHttpCtx warm;
+    warm.feed = warmupFeed;
+    warm.finish = warmupFinish;
+    ResponseSink warmSink{&warm, commentReset, commentFeed, commentFinish, Error::Protocol};
+    const uint32_t warmStart = millis();
+    const Error warmError = requestOnce("GET", warmPath, nullptr, 0, &session, referer, warmSink, warm.status,
+                                        cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize,
+                                        &commentPageSession, kRequestTimeoutMs, cancel);
+    if (warmError == Error::Cancelled) return false;
+    if (warmError == Error::Network) {
+      LOG_ERR("WR", "评论连接预热失败：free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+              static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      commentPageSession.reset();
+      return false;
+    }
+    if (warmError == Error::Ok && (warm.status == 401 || warm.status == 403)) {
+      // 服务器拒了登录态：评论路径此前从不续期，先把磁盘上的会话换新再发真正的请求。
+      // renewal 自带一条独立 TLS，先断掉预热连接，避免两条 WeRead TLS 同时活着。
+      commentPageSession.reset();
+      if (renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
+        LOG_INF("WR", "评论请求前会话已续期");
+      } else {
+        LOG_INF("WR", "评论请求前续期失败 status=%d，继续请求", warm.status);
+      }
+    } else if (warmError == Error::Ok) {
+      LOG_INF("WR", "评论连接预热：%u ms free=%u", static_cast<unsigned>(millis() - warmStart),
+              static_cast<unsigned>(ESP.getFreeHeap()));
+    } else if (warm.status == 0) {
+      // status==0：这条连接没送回任何 HTTP 响应行（典型是握手/收包被堆压挤死），
+      // 它不是活的。接着发 POST 必然同样失败，直接丢弃，等下一次预取重建连接。
+      LOG_ERR("WR", "评论连接预热无响应，丢弃连接：free=%u largest=%u",
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      commentPageSession.reset();
+      return false;
+    } else {
+      // 握手成了但状态异常：连接是活的，接着发真正的请求。
+      LOG_INF("WR", "评论连接预热状态异常 status=%d，继续请求", warm.status);
+    }
+  }
+
+  auto parser = makeUniqueNoThrow<WeReadComment::ReviewPageParser>();
+  if (!parser) return false;
+
+  // 和心跳的 POST 一样把正文留在日志里：零响应超时只能靠比对请求内容排查。
+  LOG_INF("WR", "review POST: %.*s", static_cast<int>(bodyLength), body);
 
   Error error = Error::Protocol;
   const uint32_t startMs = millis();
@@ -4838,9 +4909,22 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
                         static_cast<size_t>(bodyLength), &session, referer, sink, http.status, cookie, kCookieSize, url,
                         kUrlSize, readBuffer, kReadSize, &commentPageSession, kRequestTimeoutMs, cancel);
     if (error == Error::Ok || error == Error::Cancelled) break;
-    if (attempt == 0 && cursor.errorCode == -2012 &&
-        renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
-      LOG_INF("WR", "评论翻页请求已续期会话");
+    if (attempt == 0 && cursor.errorCode == -2012) {
+      // renewal 自带一条独立 TLS，先断掉本连接再续，避免两条 WeRead TLS 同时活着。
+      commentPageSession.reset();
+      if (renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
+        LOG_INF("WR", "评论翻页请求已续期会话");
+        continue;
+      }
+    }
+    // 阅读页渲染会把内部堆瞬砸到 ~1KB，WiFi 收包路径拿不到内存，在飞的响应整个
+    // 丢失。读满超时表现为 Network；连接被对端掐断、零字节收包则解析出
+    // Protocol/status=0。堆在渲染结束后几百毫秒内回来，紧接着重试一次基本就过。
+    if (attempt == 0 &&
+        (error == Error::Network || (error == Error::Protocol && http.status == 0))) {
+      LOG_INF("WR", "评论页零响应（超时或空回包），重试一次：free=%u largest=%u",
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      commentPageSession.reset();
       continue;
     }
     LOG_ERR("WR", "评论翻页请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),
@@ -4869,6 +4953,18 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
 bool commentPageSessionOpen() { return commentPageSession.reusable(); }
 
 void closeCommentPageSession() { commentPageSession.reset(); }
+
+namespace {
+std::atomic<bool> tlsWindowClaimed{false};
+}
+
+bool tryClaimTlsWindow() {
+  bool expected = false;
+  return tlsWindowClaimed.compare_exchange_strong(expected, true);
+}
+
+void releaseTlsWindow() { tlsWindowClaimed.store(false); }
+
 
 }  // namespace WeReadClient
 

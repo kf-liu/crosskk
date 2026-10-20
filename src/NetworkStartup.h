@@ -22,6 +22,10 @@ bool smartOnlineReading();
 // STA 已经连上一个网络。与「在线阅读 / 离线阅读」无关，热点模式也不算。
 bool stationConnected();
 
+// 进书那条 join 或扫描还在走（尚未连上）。大块内部堆分配（字形预热等）此时让位，
+// 别和 WiFi 驱动的 connect 路径抢堆。
+bool readingRadioBusy();
+
 // 一次阅读会话还握着这条连接（含退出后的进度同步）。其它画面用完无线电就关掉。
 bool stayConnected();
 

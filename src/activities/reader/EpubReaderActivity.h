@@ -239,6 +239,8 @@ class EpubReaderActivity final : public ReaderActivity {
   int failedBuildSpine_ = -1;
   // 当前章节是用哪个字体排的。和设置不一致时整章重排，避免先用内置字号画上一页。
   int sectionFontId_ = -1;
+  // 章节构建因字体被网络回收而暂停的当前轮标记：转移时打一次日志，避免每拍刷屏。
+  bool buildFontMissPaused_ = false;
   unsigned long readerFontRetryAt_ = 0;
   uint8_t readerFontRetries_ = 0;
   void ensureReaderFont();
@@ -320,6 +322,10 @@ class EpubReaderActivity final : public ReaderActivity {
   void showProgressChoice(const WeReadBackgroundSync::Choice& choice);
   bool progressChoiceOpen_ = false;
   bool enterSyncWaiting_ = false;
+  // 进书的首个 WiFi join 挂起标记：主循环等首页渲染完成、章节构建空闲后再发起。
+  // 挂起时刻单独记账：兜底超时不能从末次渲染起算——翻页会不断刷新它，永不触发。
+  bool entryJoinPending_ = false;
+  unsigned long entryJoinArmedAtMs_ = 0;
   std::unique_ptr<WeReadClient::Operation> wereadHeartbeat_;
   unsigned long wereadHeartbeatDueMs_ = 0;
   // 心跳在后台任务里把这一拍标成已上报。毫秒先记在这里，阅读循环再写入统计。

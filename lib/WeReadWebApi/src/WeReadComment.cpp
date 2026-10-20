@@ -5,9 +5,16 @@
 #include <StreamingJsonParser.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <new>
 #include <string>
+
+#if defined(BOARD_HAS_PSRAM) && __has_include(<esp_heap_caps.h>)
+#include <esp_heap_caps.h>
+#define CROSSPOINT_REVIEW_STATE_PSRAM 1
+#endif
 
 #include "../../../src/util/StringUtils.h"
 #include "WeReadHighlight.h"
@@ -1099,6 +1106,8 @@ void reviewString(void* raw, const char* value, size_t len) {
   if (state.expect == Expect::Range) {
     WeReadProtocol::decodeJsonString(value, len, state.rangeText, sizeof(state.rangeText));
     state.skipGroup = state.rangeText[0] && strcmp(state.rangeText, state.expectedRange) != 0;
+    // 拉不到评论时用它区分「服务器没回这组」和「回包 range 对不上被整组丢弃」。
+    if (state.skipGroup) LOG_INF("WR", "评论组 range 不匹配：期望 %s 回包 %s", state.expectedRange, state.rangeText);
   } else if (state.expect == Expect::HasMore && !state.skipGroup) {
     // 组字段既有字符串编码的先例（bookMarkCount 按字符串收），hasMore 等游标两种编码都收。
     state.groupHasMore = !(len == 1 && value && value[0] == '0');
@@ -1316,8 +1325,42 @@ int UnderlineParser::errorCode() const {
   return state ? state->errorCode : 0;
 }
 
+#ifdef CROSSPOINT_REVIEW_STATE_PSRAM
+// 评论页解析状态约 2.3KB，主体是正文/作者缓冲。PSRAM 板放 PSRAM：TLS 会话加
+// 上阅读器驻留之后，内部堆的连续块在响应窗口收不下整页记录，这块挪走腾回来。
+namespace {
+
+ReviewState* allocReviewState() {
+  void* storage = heap_caps_malloc(sizeof(ReviewState), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return storage ? new (storage) ReviewState() : nullptr;
+}
+
+void freeReviewState(ReviewState* state) {
+  if (!state) return;
+  state->~ReviewState();
+  std::free(state);
+}
+
+}  // namespace
+#endif
+
 ReviewPageParser::ReviewPageParser() : state_(nullptr) {
   // 正文缓冲 2KB，加上解析器，不能放进 8KB 阅读栈。请求结束即释放。
+#ifdef CROSSPOINT_REVIEW_STATE_PSRAM
+  auto* raw = allocReviewState();
+  if (!raw) {
+    LOG_ERR("WR", "内存不足：评论页解析状态 %u 字节", static_cast<unsigned>(sizeof(ReviewState)));
+    return;
+  }
+  raw->parser = makeUniqueNoThrow<StreamingJsonParser>(reviewCallbacks(raw));
+  if (!raw->parser) {
+    LOG_ERR("WR", "内存不足：评论页 JSON 解析器 %u 字节",
+            static_cast<unsigned>(sizeof(StreamingJsonParser)));
+    freeReviewState(raw);
+    return;
+  }
+  state_ = raw;
+#else
   auto state = makeUniqueNoThrow<ReviewState>();
   if (!state) {
     LOG_ERR("WR", "内存不足：评论页解析状态 %u 字节", static_cast<unsigned>(sizeof(ReviewState)));
@@ -1330,9 +1373,16 @@ ReviewPageParser::ReviewPageParser() : state_(nullptr) {
     return;
   }
   state_ = state.release();
+#endif
 }
 
-ReviewPageParser::~ReviewPageParser() { delete static_cast<ReviewState*>(state_); }
+ReviewPageParser::~ReviewPageParser() {
+#ifdef CROSSPOINT_REVIEW_STATE_PSRAM
+  freeReviewState(static_cast<ReviewState*>(state_));
+#else
+  delete static_cast<ReviewState*>(state_);
+#endif
+}
 
 bool ReviewPageParser::begin(RangeFile* file, const char* rangeText) {
   auto* state = static_cast<ReviewState*>(state_);

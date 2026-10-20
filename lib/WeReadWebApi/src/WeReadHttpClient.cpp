@@ -607,8 +607,18 @@ bool heapAllowsNewTls() {
 #else
   // 底线 = 一次新握手的峰值（wolfSSL 上下文与缓冲，MFL 已压到 2KB）加上
   // WiFi 驱动与 PHY 的余量。低于它还硬开 TLS，就是 454a01f 之前两次重启的路径。
+  // f5926918 的 28KB/12KB 把 S3 板阅读态全部饿死；20KB/8KB 又太紧——wolfSSL
+  // 会话把 12KB 割掉后阅读态 largest 稳定在 7.1-7.9KB，重试被无限顺延。
+  // 实测单次 TLS 在 free=18.7KB/largest=7156 完整走通（20.1 当日 4 次握手全成，
+  // 互斥上线后再无双 TLS 重叠），PSRAM 板底线 16KB/6.5KB；
+  // 无 PSRAM 的 C3 基线维持原值。
+#if defined(BOARD_HAS_PSRAM)
+  constexpr size_t kMinFreeHeap = 16 * 1024;
+  constexpr size_t kMinLargestBlock = 6560;
+#else
   constexpr size_t kMinFreeHeap = 28 * 1024;
   constexpr size_t kMinLargestBlock = 12 * 1024;
+#endif
   return ESP.getFreeHeap() >= kMinFreeHeap && ESP.getMaxAllocHeap() >= kMinLargestBlock;
 #endif
 }
