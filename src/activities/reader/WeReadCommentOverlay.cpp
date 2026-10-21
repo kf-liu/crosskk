@@ -1477,11 +1477,16 @@ bool stepOnce() {
     prefetchMore.store(false);
     return true;
   }
-  if (work.kind == WorkKind::More && result == WeReadComment::CollectResult::Failed &&
+  if (result == WeReadComment::CollectResult::Failed &&
       !WeReadClient::commentPageSessionOpen() && !WeReadHttpClient::heapAllowsNewTls()) {
-    // 请求死在渲染/章节构建压堆的窗口里：起点过了地板，跑到一半堆被吃穿，连接已废。
-    // 按顺延处理——More 请求留在 kMoreWanted（弹层停在加载中），堆回升后 worker 自动
-    // 补拉。标失败会把弹层打成「加载失败」，用户只能干等手动重试，其实只差一个堆窗口。
+    // 请求死在渲染/章节构建压堆的窗口里，或握手前被地板拦下：连接已废、堆还贴着
+    // 地板，标失败只会把预取段打成 Failed、弹层打成「加载失败」。按顺延处理——
+    // 工作留在队列里，堆回升后 worker 自动补拉（弹层 More 停在加载中同理）。
+    if (!deferredLogged) {
+      LOG_INF("WR", "comment fetch deferred: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+              static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      deferredLogged = true;
+    }
     return true;
   }
   // 后台重拉没成功时不要把已有评论标成空。整章重拉由提交时再决定换不换。

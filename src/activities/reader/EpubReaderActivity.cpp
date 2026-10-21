@@ -1284,11 +1284,17 @@ void EpubReaderActivity::loop() {
   // 到点就放行，别让这轮心跳和进度同步整场断网。join 发起后 readingRadioBusy
   // 会挡住同拍及后续的闲置预热（见下方预热块）。
   constexpr unsigned long kEntryJoinSettleMs = 1500;
+  constexpr unsigned long kEntryJoinIdleMs = 8000;
   constexpr unsigned long kEntryJoinBuildTimeoutMs = 30000;
   if (entryJoinPending_ && lastRenderCompleteMs != 0 && !RenderLock::peek()) {
     const bool settled =
         (!section || !section->isBuilding()) && millis() - lastRenderCompleteMs > kEntryJoinSettleMs;
-    if (settled || millis() - entryJoinArmedAtMs_ > kEntryJoinBuildTimeoutMs) {
+    // 构建中的章节受堆闸门节流，几十秒都出不了 settle；30 秒兜底又常被短访问错过
+    // （实测第二次进章 27.8 秒退出，差 2.2 秒）。停在已缓存页上 8 秒没动就是安定
+    // 点：join 路径自带 BLE 停与字体重收、又查 RenderLock，不会和渲染撞堆。
+    const bool idleMidBuild =
+        section && section->isBuilding() && millis() - lastRenderCompleteMs > kEntryJoinIdleMs;
+    if (settled || idleMidBuild || millis() - entryJoinArmedAtMs_ > kEntryJoinBuildTimeoutMs) {
       entryJoinPending_ = false;
       LOG_INF("ERS", "entry join armed %lums after entry", millis() - entryJoinArmedAtMs_);
       NetworkStartup::holdReadingRadio(true);

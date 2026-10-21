@@ -4756,6 +4756,9 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, const
   if (!index.begin(bookId, chapterUid)) return false;
 
   Error error = Error::Protocol;
+  // 冷连接在 requestOnce 里重新握手，地板之下不开：理由同 fetchCommentReviewPage
+  // 的握手前检查——调用方的检查离这里隔着一个渲染窗口。
+  if (!commentPageSession.reusable() && !WeReadHttpClient::heapAllowsNewTls()) return false;
   for (int attempt = 0; attempt < 2; ++attempt) {
     if (!parser->begin(writeCandidate, &index)) {
       index.abort();
@@ -4850,6 +4853,10 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   // 冷连接先预热：不带解析状态发一个轻量 GET，把握手要的 ~10KB 堆开销放在只有
   // 一块 scratch 的窗口里完成，真正的 POST 在温连接上几百毫秒内往返。
   if (!commentPageSession.reusable()) {
+    // 调用方的地板检查到这里隔着一个渲染窗口：scratch、会话装载、cookie 合并期间
+    // 主任务随时把 largest 吃穿底线（364 章实测 6560→5620，预热成而 POST 20s 死）。
+    // 握手前最后一刻再查一次，false 由上层按顺延处理，不开注定超时的连接。
+    if (!WeReadHttpClient::heapAllowsNewTls()) return false;
     char encodedBookId[192];
     char warmPath[320];
     if (!WeReadProtocol::urlEncode(bookId, encodedBookId, sizeof(encodedBookId))) return false;
