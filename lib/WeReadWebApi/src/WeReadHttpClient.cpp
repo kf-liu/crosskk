@@ -601,7 +601,7 @@ bool networkReady() {
 #endif
 }
 
-bool heapAllowsNewTls() {
+bool heapAllowsNewTls(const bool relaxedLargest) {
 #ifdef CROSSPOINT_EMULATED
   return true;
 #else
@@ -615,11 +615,16 @@ bool heapAllowsNewTls() {
 #if defined(BOARD_HAS_PSRAM)
   constexpr size_t kMinFreeHeap = 16 * 1024;
   constexpr size_t kMinLargestBlock = 6560;
+  // 用户在弹层前等着时只看 16KB 空闲硬线：largest 贴线的失败是 MEMORY_E/超时这类
+  // 优雅失败，200ms 后自动重试；观测到的 abort 全部伴随并发第二条 TLS 或 join。
+  if (relaxedLargest) return ESP.getFreeHeap() >= kMinFreeHeap;
+  return ESP.getFreeHeap() >= kMinFreeHeap && ESP.getMaxAllocHeap() >= kMinLargestBlock;
 #else
+  (void)relaxedLargest;
   constexpr size_t kMinFreeHeap = 28 * 1024;
   constexpr size_t kMinLargestBlock = 12 * 1024;
-#endif
   return ESP.getFreeHeap() >= kMinFreeHeap && ESP.getMaxAllocHeap() >= kMinLargestBlock;
+#endif
 #endif
 }
 

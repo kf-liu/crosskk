@@ -4716,6 +4716,11 @@ bool writeCandidate(void* ctx, const uint32_t start, const uint32_t end, const u
   return static_cast<WeReadComment::CandidateFile*>(ctx)->add(start, end, markCount);
 }
 
+// 评论路径共用的一条 TLS：弹层翻页、章节索引、当页预取都走它。一次握手在 ESP32 上要 2-4 秒，
+// 而且阅读态碎片化后 largest 常年贴在握手地板之下，除了进章那一次几乎没有再握手的机会——
+// 这条连接从进章一直活到所有评论动作结束，由 closeCommentPageSession 释放。
+WeReadHttpClient::Session commentPageSession;
+
 bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, const bool stage) {
   if (!commentIdSafe(bookId)) return false;
   if (!WeReadHttpClient::networkReady()) return false;
@@ -4762,8 +4767,19 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, const
     http.ctx = parser.get();
     ResponseSink sink{&http, commentReset, commentFeed, commentFinish, Error::Protocol};
     error = requestOnce("GET", path, nullptr, 0, &session, referer, sink, http.status, cookie, kCookieSize, url,
-                        kUrlSize, readBuffer, kReadSize, nullptr);
+                        kUrlSize, readBuffer, kReadSize, &commentPageSession);
     if (error == Error::Ok) break;
+    if (attempt == 0) {
+      // 失败后这条连接已经废了，重试或续期都要重新握手。低堆时宁可这轮失败，把机会留给
+      // 堆回升后的下一轮，也不在地板下硬握。
+      commentPageSession.reset();
+      if (!WeReadHttpClient::heapAllowsNewTls()) {
+        LOG_ERR("WR", "评论候选重试被低堆顺延：free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        index.abort();
+        return false;
+      }
+    }
     if (attempt == 0 && parser->errorCode() == -2012 &&
         renewStoredSession(session, cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize)) {
       LOG_INF("WR", "评论候选请求已续期会话");
@@ -4784,10 +4800,6 @@ bool fetchCommentUnderlines(const char* bookId, const uint32_t chapterUid, const
   if (!WeReadStore::saveSession(session)) LOG_ERR("WR", "评论候选已解析，但会话没有写回");
   return true;
 }
-
-// 弹层连续翻页共用一条 TLS：一次握手的成本在 ESP32 上要 2-4 秒，每页都重连是评论加载
-// 慢的主因。窗口结束由 closeCommentPageSession 释放，不跨工作项常驻。
-WeReadHttpClient::Session commentPageSession;
 
 bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const char* rangeText,
                             const uint32_t maxIdx, const uint64_t syncKey, WeReadComment::RangeFile& file,
@@ -4919,12 +4931,14 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
     }
     // 阅读页渲染会把内部堆瞬砸到 ~1KB，WiFi 收包路径拿不到内存，在飞的响应整个
     // 丢失。读满超时表现为 Network；连接被对端掐断、零字节收包则解析出
-    // Protocol/status=0。堆在渲染结束后几百毫秒内回来，紧接着重试一次基本就过。
+    // Protocol/status=0。堆在渲染结束后几百毫秒内回来，紧接着重试一次基本就过；
+    // 回不来（碎片化贴地板）就别硬握新手，把这一页留给下一次加载。
     if (attempt == 0 &&
         (error == Error::Network || (error == Error::Protocol && http.status == 0))) {
       LOG_INF("WR", "评论页零响应（超时或空回包），重试一次：free=%u largest=%u",
               static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
       commentPageSession.reset();
+      if (!WeReadHttpClient::heapAllowsNewTls()) return false;
       continue;
     }
     LOG_ERR("WR", "评论翻页请求失败：status=%d error=%u code=%d", http.status, static_cast<unsigned>(error),

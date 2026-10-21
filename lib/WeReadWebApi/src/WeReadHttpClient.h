@@ -74,7 +74,9 @@ bool extractHttpsHost(const char* url, char* host, size_t hostSize);
 bool networkReady();
 // 阅读期空闲堆贴着地板；低于底线再开新 TLS，WiFi 电源管理重建 PLL 跟踪定时器的
 // 分配会失败并 assert 重启（esp_phy phy_track_pll_init）。调用方用它把请求顺延到堆回升。
-bool heapAllowsNewTls();
+// relaxedLargest 给用户正在等着的请求（弹层翻页）：largest 贴线顶多让这次握手优雅失败，
+// 真正的 abort 都来自并发第二条 TLS 或 WiFi join，16KB 空闲硬线仍然把住。
+bool heapAllowsNewTls(bool relaxedLargest = false);
 Result request(const char* url, const RequestOptions& options, const DataCallback& onData,
                const HeaderCallback& onHeader, int& status);
 Result request(Session& session, const char* url, const RequestOptions& options, const DataCallback& onData,

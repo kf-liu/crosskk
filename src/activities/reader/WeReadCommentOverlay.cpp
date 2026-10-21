@@ -1339,17 +1339,22 @@ bool stepOnce() {
     }
   }
   static bool deferredLogged = false;
-  // 已经连着的评论翻页不需要再开一条 TLS，堆紧也不推迟。索引请求仍是新连接。
-  const bool needsNewTls = work.kind == WorkKind::Underlines || !WeReadClient::commentPageSessionOpen();
-  if (needsNewTls && !WeReadHttpClient::heapAllowsNewTls()) {
-    // 底线之下不开新 TLS（PHY PLL 定时器分配贴地板会 assert 重启）。工作留在队列里，
-    // 200ms 后重试；只在进入低堆时记一次日志，避免刷屏。
-    if (!deferredLogged) {
-      LOG_INF("WR", "comment fetch deferred: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
-              static_cast<unsigned>(ESP.getMaxAllocHeap()));
-      deferredLogged = true;
+  // 会话还连着就不用再开 TLS，堆紧也不推迟——索引、弹层翻页、当页预取共用这一条连接。
+  const bool needsNewTls = !WeReadClient::commentPageSessionOpen();
+  if (needsNewTls) {
+    // 用户在等着的请求（弹层翻页、手动整章重拉）：不论之前成功与否都发出去，只保住
+    // 16KB 硬线（abort 都来自并发第二条 TLS 或 join，不来自单次握手）。之后的段落走
+    // 温连接不再碰地板。索引、预取等后台动作维持全地板顺延。
+    if (!WeReadHttpClient::heapAllowsNewTls(work.kind == WorkKind::More || work.holdCommit)) {
+      // 底线之下不开新 TLS（PHY PLL 定时器分配贴地板会 assert 重启）。工作留在队列里，
+      // 200ms 后重试；只在进入低堆时记一次日志，避免刷屏。
+      if (!deferredLogged) {
+        LOG_INF("WR", "comment fetch deferred: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        deferredLogged = true;
+      }
+      return false;
     }
-    return false;
   }
   deferredLogged = false;
   // 和后台进度心跳互斥开 TLS（CAS 网络窗口）。拿不到时工作留在队列里，下一轮再试。
@@ -1358,6 +1363,11 @@ bool stepOnce() {
   workerBusy.store(true);
   if (work.kind == WorkKind::Underlines) {
     const bool ok = WeReadClient::fetchCommentUnderlines(work.bookId, work.chapterUid, work.holdCommit);
+    if (!ok && !WeReadClient::commentPageSessionOpen() && !WeReadHttpClient::heapAllowsNewTls()) {
+      // 请求失败时连接已废，重试要重新握手而堆贴着地板——按顺延处理，工作留在队列里
+      // 等堆回升再试。这里标失败会让整章评论报废，不能。
+      return false;
+    }
     lockState();
     if (work.generation != job().generation) {
       unlockState();
@@ -1460,7 +1470,10 @@ bool stepOnce() {
 #endif
 }
 
-// 弹层、整章重拉，或当页预取还没做完时留着连接。都停了就断开，阅读翻页不和这条 TLS 挤在一起。
+// 弹层、整章重拉，或当页预取还没做完时留着连接。都停了，或者堆还够重新握手，就断开，
+// 阅读翻页不和这条 TLS 挤在一起。低堆时例外：这条连接是本轮阅读里评论功能唯一的
+// 机会（新握手会被地板挡死），而心跳在同样的堆上也开不了 TLS，窗口留着没有代价——
+// 堆回升后走到关闭分支，心跳自然恢复。
 // 连接留着时 TLS 窗口也留着（心跳不开第二条）；连接不在了就把窗口还给心跳。
 // tlsOwned 守卫：没抢到窗口的一轮不能替心跳释放它的窗口。
 void releaseCommentConnection() {
@@ -1488,6 +1501,17 @@ void releaseCommentConnection() {
     }
     return;
   }
+  static bool parkLogged = false;
+  if (WeReadClient::commentPageSessionOpen() && !WeReadHttpClient::heapAllowsNewTls()) {
+    if (!parkLogged) {
+      parkLogged = true;
+      LOG_INF("WR", "comment TLS parked below heap floor: free=%u largest=%u",
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    }
+    commentTlsHeld.store(true);
+    return;
+  }
+  parkLogged = false;
   WeReadClient::closeCommentPageSession();
   commentTlsHeld.store(false);
   if (tlsOwned) {
