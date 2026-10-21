@@ -1089,6 +1089,22 @@ bool rememberCandidate(const char* bookId, const uint32_t chapterUid, const uint
   return WeReadComment::updateCandidate(bookId, chapterUid, index, item, staged);
 }
 
+// 预取成功后只把评论总数/划线人数抬进索引，query 保持不变——点线可见性只看索引里
+// 有没有这条，而弹层头部的「N 条评论」只能来自回包的 total，丢了就只能显示已存条数。
+void rememberCandidateCounts(const Assignment& work, const uint32_t totalCount, const uint32_t markCount) {
+  if (totalCount == 0 && markCount == 0) return;
+  WeReadComment::Candidate item;
+  if (!WeReadComment::readCandidate(work.bookId, work.chapterUid, static_cast<uint32_t>(work.rangeIndex), item,
+                                    work.holdCommit)) {
+    return;
+  }
+  if (item.start != work.start || item.end != work.end) return;
+  if (totalCount > item.commentTotal) item.commentTotal = totalCount;
+  if (markCount > item.markCount) item.markCount = markCount;
+  WeReadComment::updateCandidate(work.bookId, work.chapterUid, static_cast<uint32_t>(work.rangeIndex), item,
+                                 work.holdCommit);
+}
+
 uint8_t failedBits[kSettledRangeCap / 8] = {};
 
 bool noteFailedCandidate(void* raw, const uint32_t index, const WeReadComment::Candidate& item) {
@@ -1267,7 +1283,10 @@ void applyRangeResult(const Assignment& work, const WeReadComment::CollectResult
   if (work.prefetch) {
     const bool pageLeft = pageEpoch.load() != work.pageEpoch;
     const bool cancelled = prefetchCancel.load();
-    if (!pageLeft && !cancelled) markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
+    if (!pageLeft && !cancelled) {
+      rememberCandidateCounts(work, totalCount, markCount);
+      markRangeSettled(work.generation, static_cast<uint32_t>(work.rangeIndex));
+    }
     return;
   }
   const bool hasMore = result == WeReadComment::CollectResult::Stored &&

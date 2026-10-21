@@ -4829,12 +4829,15 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   char* url = cookie + kCookieSize;
   uint8_t* readBuffer = scratch + kCookieSize + kUrlSize;
   char* body = reinterpret_cast<char*>(readBuffer + kReadSize);
+  // synckey 是服务器版本水印（值≈回包时刻的 Unix 秒），不是页游标。续页带着它查会被
+  // 当成「此版本之后的增量」返回空组（设备日志 maxIdx=20+水印 → added=0 total=0）。
+  // 各页固定 0，续页只推进 maxIdx。
+  (void)syncKey;
   const int bodyLength =
       snprintf(body, kBodySize,
                "{\"bookId\":\"%s\",\"chapterUid\":%u,\"reviews\":[{\"range\":\"%s\",\"maxIdx\":%u,\"count\":%u,"
-               "\"synckey\":%llu}]}",
-               bookId, chapterUid, rangeText, maxIdx, WeReadComment::kReviewPageSize,
-               static_cast<unsigned long long>(syncKey));
+               "\"synckey\":0}]}",
+               bookId, chapterUid, rangeText, maxIdx, WeReadComment::kReviewPageSize);
   if (bodyLength <= 0 || static_cast<size_t>(bodyLength) >= kBodySize) return false;
 
   char referer[160];
@@ -4858,9 +4861,23 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
     warm.finish = warmupFinish;
     ResponseSink warmSink{&warm, commentReset, commentFeed, commentFinish, Error::Protocol};
     const uint32_t warmStart = millis();
-    const Error warmError = requestOnce("GET", warmPath, nullptr, 0, &session, referer, warmSink, warm.status,
-                                        cookie, kCookieSize, url, kUrlSize, readBuffer, kReadSize,
-                                        &commentPageSession, kRequestTimeoutMs, cancel);
+    // 预热 GET 撞上翻页渲染窗口时整包丢失，堆健康也会发生（机理同 POST 零响应注释）。
+    // 与 POST 的零响应重试对称：丢弃死连接立即重试一次，再败才放弃这次拉取。
+    Error warmError = Error::Protocol;
+    for (int warmAttempt = 0; warmAttempt < 2; ++warmAttempt) {
+      warmError = requestOnce("GET", warmPath, nullptr, 0, &session, referer, warmSink, warm.status, cookie,
+                              kCookieSize, url, kUrlSize, readBuffer, kReadSize, &commentPageSession,
+                              kRequestTimeoutMs, cancel);
+      if (warmAttempt == 0 &&
+          (warmError == Error::Network || (warmError == Error::Protocol && warm.status == 0))) {
+        LOG_INF("WR", "评论预热零响应，重试一次：free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        commentPageSession.reset();
+        if (!WeReadHttpClient::heapAllowsNewTls()) return false;
+        continue;
+      }
+      break;
+    }
     if (warmError == Error::Cancelled) return false;
     if (warmError == Error::Network) {
       LOG_ERR("WR", "评论连接预热失败：free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),

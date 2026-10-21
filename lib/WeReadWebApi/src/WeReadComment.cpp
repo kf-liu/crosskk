@@ -1448,7 +1448,6 @@ CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const 
   cursor.syncKey = file.carriedCursor() ? file.carriedSyncKey() : startSyncKey;
   bool hasMore = false;
   for (int page = 0; page < maxPages && file.count() < kMaxStoredComments; ++page) {
-    const uint32_t before = file.count();
     const uint32_t requestMax = cursor.maxIdx;
     const uint64_t requestSync = cursor.syncKey;
     Cursor pageCursor;
@@ -1457,8 +1456,9 @@ CollectResult collectRange(const char* bookId, const uint32_t chapterUid, const 
       file.discardStaging();
       return CollectResult::Failed;
     }
-    if (pageCursor.hasMore && pageCursor.maxIdx == requestMax && pageCursor.syncKey == requestSync &&
-        file.count() == before) {
+    // 有 hasMore 却没给前进的游标：再请求只会拿到同一窗口（或整页重复）。按失败丢弃，
+    // 不落盘——append 路径没有 reviewId 去重，重复页一旦提交用户会看到两遍。
+    if (pageCursor.hasMore && pageCursor.maxIdx == requestMax && pageCursor.syncKey == requestSync) {
       LOG_ERR("WR", "评论翻页游标没有前进：maxIdx=%u", requestMax);
       file.abort();
       file.discardStaging();
