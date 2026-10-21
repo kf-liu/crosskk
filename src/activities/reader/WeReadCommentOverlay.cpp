@@ -1361,12 +1361,11 @@ bool stepOnce() {
   // 会话还连着就不用再开 TLS，堆紧也不推迟——索引、弹层翻页、当页预取共用这一条连接。
   const bool needsNewTls = !WeReadClient::commentPageSessionOpen();
   if (needsNewTls) {
-    // 用户在等着的请求（弹层翻页、手动整章重拉）：不论之前成功与否都发出去，只保住
-    // 16KB 硬线（abort 都来自并发第二条 TLS 或 join，不来自单次握手）。之后的段落走
-    // 温连接不再碰地板。索引、预取等后台动作维持全地板顺延。
-    if (!WeReadHttpClient::heapAllowsNewTls(work.kind == WorkKind::More || work.holdCommit)) {
-      // 底线之下不开新 TLS（PHY PLL 定时器分配贴地板会 assert 重启）。工作留在队列里，
-      // 200ms 后重试；只在进入低堆时记一次日志，避免刷屏。
+    // 底线之下不开新 TLS（PHY PLL 定时器分配贴地板会 assert 重启）。工作留在队列里，
+    // 200ms 后重试；只在进入低堆时记一次日志，避免刷屏。
+    // 弹层翻页也走全地板：largest 贴线时握手吃掉 3-5KB，POST 回包分不出 RX 内存，
+    // 20s 超时必死（364 章 5/5），顺延到堆回升反而几秒内拉成。
+    if (!WeReadHttpClient::heapAllowsNewTls()) {
       if (!deferredLogged) {
         LOG_INF("WR", "comment fetch deferred: free=%u largest=%u", static_cast<unsigned>(ESP.getFreeHeap()),
                 static_cast<unsigned>(ESP.getMaxAllocHeap()));
@@ -1476,6 +1475,13 @@ bool stepOnce() {
                                             &markCount, work.stage, work.keepStaged);
   if (work.prefetch && pageEpoch.load() != work.pageEpoch && result != WeReadComment::CollectResult::Stored) {
     prefetchMore.store(false);
+    return true;
+  }
+  if (work.kind == WorkKind::More && result == WeReadComment::CollectResult::Failed &&
+      !WeReadClient::commentPageSessionOpen() && !WeReadHttpClient::heapAllowsNewTls()) {
+    // 请求死在渲染/章节构建压堆的窗口里：起点过了地板，跑到一半堆被吃穿，连接已废。
+    // 按顺延处理——More 请求留在 kMoreWanted（弹层停在加载中），堆回升后 worker 自动
+    // 补拉。标失败会把弹层打成「加载失败」，用户只能干等手动重试，其实只差一个堆窗口。
     return true;
   }
   // 后台重拉没成功时不要把已有评论标成空。整章重拉由提交时再决定换不换。

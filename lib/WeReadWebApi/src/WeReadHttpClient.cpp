@@ -601,7 +601,7 @@ bool networkReady() {
 #endif
 }
 
-bool heapAllowsNewTls(const bool relaxedLargest) {
+bool heapAllowsNewTls() {
 #ifdef CROSSPOINT_EMULATED
   return true;
 #else
@@ -612,15 +612,14 @@ bool heapAllowsNewTls(const bool relaxedLargest) {
   // 实测单次 TLS 在 free=18.7KB/largest=7156 完整走通（20.1 当日 4 次握手全成，
   // 互斥上线后再无双 TLS 重叠），PSRAM 板底线 16KB/6.5KB；
   // 无 PSRAM 的 C3 基线维持原值。
+  // largest 也必须查：largest 贴线时握手本身吃掉 3-5KB，POST 回包就再也分不出
+  // RX 连续内存（设备日志：起点 free 13-19KB 的请求 5/5 死在 20s 超时，起点
+  // largest≥7156 的全成），这不是「优雅失败」而是白烧一条 20s 的网络窗口。
 #if defined(BOARD_HAS_PSRAM)
   constexpr size_t kMinFreeHeap = 16 * 1024;
   constexpr size_t kMinLargestBlock = 6560;
-  // 用户在弹层前等着时只看 16KB 空闲硬线：largest 贴线的失败是 MEMORY_E/超时这类
-  // 优雅失败，200ms 后自动重试；观测到的 abort 全部伴随并发第二条 TLS 或 join。
-  if (relaxedLargest) return ESP.getFreeHeap() >= kMinFreeHeap;
   return ESP.getFreeHeap() >= kMinFreeHeap && ESP.getMaxAllocHeap() >= kMinLargestBlock;
 #else
-  (void)relaxedLargest;
   constexpr size_t kMinFreeHeap = 28 * 1024;
   constexpr size_t kMinLargestBlock = 12 * 1024;
   return ESP.getFreeHeap() >= kMinFreeHeap && ESP.getMaxAllocHeap() >= kMinLargestBlock;

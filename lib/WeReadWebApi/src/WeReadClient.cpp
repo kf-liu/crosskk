@@ -4829,6 +4829,10 @@ bool fetchCommentReviewPage(const char* bookId, const uint32_t chapterUid, const
   char* url = cookie + kCookieSize;
   uint8_t* readBuffer = scratch + kCookieSize + kUrlSize;
   char* body = reinterpret_cast<char*>(readBuffer + kReadSize);
+  // scratch 未初始化，PSRAM 复用块里常是上次请求的残留字节。cookie 在请求前会被
+  // mergeSessionCookies 先解析，垃圾段没有 '=' 就即时 Protocol 失败；失败路径不写
+  // 字节，脏块在重试间原样保留，表现为持续 30 秒以上的「零响应」假象。
+  cookie[0] = '\0';
   // synckey 是服务器版本水印（值≈回包时刻的 Unix 秒），不是页游标。续页带着它查会被
   // 当成「此版本之后的增量」返回空组（设备日志 maxIdx=20+水印 → added=0 total=0）。
   // 各页固定 0，续页只推进 maxIdx。
